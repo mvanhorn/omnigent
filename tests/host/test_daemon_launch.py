@@ -15,12 +15,100 @@ import click
 import httpx
 import pytest
 
+from omnigent.cli_auth import OMNIGENT_SLICE_KEY_HEADER
 from omnigent.host import daemon_launch
 from omnigent.host.daemon_launch import (
+    launch_or_reuse_daemon_runner,
+    open_daemon_client,
     runner_is_online,
     wait_for_host_online,
     wait_for_runner_online,
 )
+
+
+@pytest.mark.parametrize("online", [True, False])
+async def test_attachment_probes_owner_and_preserves_offline_recovery(
+    monkeypatch: pytest.MonkeyPatch, online: bool
+) -> None:
+    """Reuse checks reach the owner; offline recovery keeps the existing wire contract."""
+    import json
+
+    from omnigent.chat import _DatabricksTokenAuth
+    from omnigent.session_host import get_session_host, set_session_host
+
+    monkeypatch.setenv("OMNIGENT_HOST_SLICE_KEY_ENABLED", "1")
+    monkeypatch.setenv("OMNIGENT_RUNNER_SLICE_KEY", "caller")
+    monkeypatch.setenv("OMNIGENT_REMOTE_AUTH_TOKEN", "test")
+    seen = []
+    launch_ids: set[str] = set()
+    selected_host = "owner" if online else "caller"
+
+    async def handle(_transport, request):
+        seen.append((request.method, request.url.path))
+        assert request.headers["Authorization"] == "Bearer test"
+        if not request.url.path.endswith("/resources"):
+            launch_ids.add(request.headers["X-Omnigent-Launch-Id"])
+            assert request.headers["X-Omnigent-Caller-Host-Id"] == "caller"
+            assert request.headers["X-Omnigent-Launch-Mode"] == "ensure_existing"
+        if request.method == "GET" and request.url.path == "/v1/sessions/attached":
+            assert request.headers[OMNIGENT_SLICE_KEY_HEADER] == "caller"
+            return httpx.Response(
+                200, json={"runner_id": "original", "host_id": "owner", "workspace": "/owner/work"}
+            )
+        if request.url.path == "/v1/runners/original/status":
+            assert request.headers[OMNIGENT_SLICE_KEY_HEADER] == "owner"
+            return httpx.Response(200, json={"online": online})
+        assert request.headers[OMNIGENT_SLICE_KEY_HEADER] == selected_host
+        if request.method == "PATCH":
+            assert not online
+            assert request.url.path == "/v1/sessions/attached"
+            assert json.loads(request.content) == {"runner_id": ""}
+            return httpx.Response(200, json={})
+        if request.method == "POST":
+            assert not online
+            assert request.url.path == "/v1/hosts/caller/runners"
+            assert json.loads(request.content) == {
+                "session_id": "attached",
+                "workspace": "/caller/work",
+            }
+            return httpx.Response(200, json={"runner_id": "replacement"})
+        assert request.url.path == "/v1/sessions/attached/resources"
+        return httpx.Response(200, json={"data": []})
+
+    monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", handle)
+    url = "http://127.0.0.1"
+    set_session_host("attached", "owner")
+    try:
+        async with open_daemon_client(
+            url, {}, "caller", auth=_DatabricksTokenAuth(server_url=url, session_id=None)
+        ) as client:
+            runner = await launch_or_reuse_daemon_runner(
+                client, host_id="caller", session_id="attached", workspace="/caller/work"
+            )
+            assert runner == ("original" if online else "replacement")
+            await client.get("/v1/sessions/attached/resources")
+        assert len(launch_ids) == 1
+        assert get_session_host("attached") == selected_host
+        writes = [method for method, _ in seen if method in {"PATCH", "POST"}]
+        assert writes == ([] if online else ["PATCH", "POST"])
+    finally:
+        set_session_host("attached", None)
+
+
+@pytest.fixture(autouse=True)
+def _no_ambient_host(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Isolate the machine's own host identity and runner slice-key env.
+
+    ``databricks_request_headers`` (reached via ``open_daemon_client`` with no
+    explicit host) falls back to the CLI's own host_id, so on a machine that IS
+    a host (a persisted ``~/.omnigent/config.yaml`` ``host:`` section) the
+    "no slice key" assertions would pick up that ambient identity.
+    """
+    monkeypatch.setattr(
+        "omnigent.host.identity.load_host_identity_if_present",
+        lambda *a, **k: None,
+    )
+    monkeypatch.delenv("OMNIGENT_RUNNER_SLICE_KEY", raising=False)
 
 
 class _FlakyThenOnline:
@@ -128,12 +216,15 @@ class _AlwaysHtml:
 
 @pytest.fixture
 def fast_poll(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Shrink the poll interval so the wait loops iterate in milliseconds.
+    """Shrink the poll intervals so the wait loops iterate in milliseconds.
 
-    Patches the module's own constant (read at call time inside the
-    loops), keeping each test well under 100ms instead of multiples
-    of the real 0.5s cadence.
+    Patches the module's own constants (read at call time by
+    ``daemon_poll_intervals``), keeping each test well under 100ms
+    instead of multiples of the real cadence. Both the opening interval
+    and the steady-state cap are shrunk — leaving the opening one at its
+    real value would dominate these short loops.
     """
+    monkeypatch.setattr(daemon_launch, "DAEMON_POLL_INITIAL_INTERVAL_S", 0.01)
     monkeypatch.setattr(daemon_launch, "DAEMON_POLL_INTERVAL_S", 0.01)
 
 
@@ -344,3 +435,95 @@ async def test_wait_for_host_online_tolerates_html_fallback_then_online(
         await wait_for_host_online(client, "host_abc123", timeout_s=5.0)
     # 3 = 2 HTML-fallback polls + the one that observed JSON "online".
     assert handler.requests_seen == 3
+
+
+async def test_open_daemon_client_pins_slice_key_on_workspace_mount() -> None:
+    """On the workspace mount the client is pinned to the host's replica.
+
+    The host_id routing header is baked into the client's default headers, so
+    every request it makes — the launch, runner-status polls, and the
+    session/terminal ops (including a resume reattach check that runs before
+    the launch) — reaches the replica holding the host's tunnels. Base headers
+    are preserved.
+    """
+    async with open_daemon_client(
+        "https://ws.example.com/api/2.0/omnigent",
+        {"Authorization": "Bearer t"},
+        "host_abc123",
+    ) as client:
+        assert client.headers.get(OMNIGENT_SLICE_KEY_HEADER) == "host_abc123"
+        assert client.headers.get("Authorization") == "Bearer t"
+
+
+async def test_open_daemon_client_no_slice_key_off_workspace() -> None:
+    """An unsharded server has no sharding layer, so no key is baked."""
+    async with open_daemon_client("http://test", {}, "host_abc123") as client:
+        assert OMNIGENT_SLICE_KEY_HEADER not in client.headers
+
+
+async def test_open_daemon_client_no_slice_key_without_host() -> None:
+    """A hostless (local) session leaves routing to the default fallback."""
+    async with open_daemon_client("https://ws.example.com/api/2.0/omnigent", {}, None) as client:
+        assert OMNIGENT_SLICE_KEY_HEADER not in client.headers
+
+
+def test_daemon_poll_intervals_open_tight_then_hold_at_the_cadence() -> None:
+    """
+    Readiness probes start tight and ease off to the steady cadence.
+
+    These waits gate every native-harness launch and usually resolve in
+    the first probe or two, so the opening interval must be well under
+    the steady cadence — otherwise a resource that became ready
+    immediately still costs a full interval of dead time. The sequence
+    must also be monotonic and never exceed the cadence, so a long wait
+    does not hammer the server.
+    """
+    intervals = daemon_launch.daemon_poll_intervals()
+    first_ten = [next(intervals) for _ in range(10)]
+
+    assert first_ten[0] == daemon_launch.DAEMON_POLL_INITIAL_INTERVAL_S
+    assert first_ten[0] < daemon_launch.DAEMON_POLL_INTERVAL_S
+    assert first_ten == sorted(first_ten)
+    assert max(first_ten) == daemon_launch.DAEMON_POLL_INTERVAL_S
+    # Reaching "ready" on the third probe must cost less than the old flat
+    # cadence would have spent getting there.
+    assert sum(first_ten[:2]) < 2 * daemon_launch.DAEMON_POLL_INTERVAL_S
+
+
+def test_launch_audit_context_is_bounded_and_contains_no_arguments() -> None:
+    """Only diagnostic hints survive; separate invocations have distinct ids."""
+    from omnigent.host.launch_audit import launch_audit_headers, request_client_audit_attributes
+
+    with click.Context(click.Command("claude")) as context:
+        context.params = {"prompt": "private prompt", "token": "secret-token"}
+        first = launch_audit_headers(host_id="host_b", fresh=False)
+        second = launch_audit_headers(host_id="host_b", fresh=True)
+    assert first["X-Omnigent-Launch-Id"] != second["X-Omnigent-Launch-Id"]
+    assert first["X-Omnigent-Launch-Command"] == "claude"
+    assert first["X-Omnigent-Launch-Mode"] == "ensure_existing"
+    assert second["X-Omnigent-Launch-Mode"] == "fresh"
+    attrs = request_client_audit_attributes(
+        {
+            **first,
+            "Authorization": "Bearer secret-token",
+            "Cookie": "private-cookie",
+            "User-Agent": "python-httpx/test",
+            OMNIGENT_SLICE_KEY_HEADER: "host:host_b",
+        }
+    )
+    assert attrs["client_host_id"] == "host_b"
+    assert attrs["request_slice_key"] == "host:host_b"
+    assert attrs["client_user_agent"] == "python-httpx/test"
+    assert "private" not in str(attrs) and "secret" not in str(attrs)
+    assert (
+        request_client_audit_attributes(
+            {"User-Agent": "a" * 257, "X-Omnigent-Launch-Command": "claude\nforged", "Cookie": "x"}
+        )
+        == {}
+    )
+
+    with click.Context(click.Command("invalid\ncommand")):
+        assert (
+            launch_audit_headers(host_id="host_b", fresh=False)["X-Omnigent-Launch-Command"]
+            == "unknown"
+        )

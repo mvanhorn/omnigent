@@ -8,7 +8,7 @@ import { act, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Editor } from "@tiptap/core";
 import { Markdown } from "@tiptap/markdown";
-import StarterKit from "@tiptap/starter-kit";
+import { StarterKit } from "@tiptap/starter-kit";
 import { createRef } from "react";
 import type { RefObject } from "react";
 import { MarkdownSearchBar } from "./MarkdownSearchBar";
@@ -88,6 +88,22 @@ describe("MarkdownSearchBar", () => {
     const highlighted = editor!.view.dom.querySelectorAll(".md-search-match").length;
     expect(highlighted).toBe(2);
     expect(screen.getByText(`1 / ${highlighted}`)).toBeDefined();
+  });
+
+  it("recounts when another writer's update replaces the document", async () => {
+    renderBar();
+    await act(async () => {
+      type("the");
+    });
+    expect(screen.getByText("1 / 2")).toBeDefined();
+    // External updates are applied without an "update" event (see applyExternalMarkdown).
+    await act(async () => {
+      editor!.commands.setContent("A story about the end.", {
+        emitUpdate: false,
+        contentType: "markdown",
+      });
+    });
+    expect(screen.getByText("1 / 1")).toBeDefined();
   });
 
   it("shows 'No results' when nothing matches", async () => {

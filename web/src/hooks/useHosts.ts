@@ -1,5 +1,15 @@
-import { useQuery } from "@tanstack/react-query";
+import {
+  useMutation,
+  useMutationState,
+  useQuery,
+  useQueryClient,
+  type QueryClient,
+} from "@tanstack/react-query";
+import { useEffect, useLayoutEffect, useRef } from "react";
 import { authenticatedFetch } from "@/lib/identity";
+import { harnessAccountKey } from "@/lib/nativeHarnessModes";
+import { ApiError, apiErrorFromResponse } from "@/lib/sessionsApi";
+import type { NativeModelOption } from "@/lib/types";
 
 export interface Host {
   host_id: string;
@@ -19,13 +29,42 @@ export interface Host {
    * "nothing configured".
    */
   configured_harnesses?: Record<string, boolean | string> | null;
+  /** Non-secret account metadata reported by newer hosts. */
+  harness_accounts?: Record<string, HarnessAccount> | null;
+  /** Whether this connected host supports on-demand account probes. */
+  harness_accounts_supported?: boolean;
+  /** Whether this connected host supports the interactive login/logout routes. */
+  harness_login_supported?: boolean;
+  /**
+   * Whether each harness family's launch on this host resolves an
+   * AI-Gateway-backed inference config, e.g. `{"claude-native": true,
+   * "codex": false}`. Smart Routing's apply layer only works on gateway-backed
+   * inference. `null`/absent (or a missing key) means unknown — an older host
+   * or server — and must not gate anything away; only an explicit `false` does.
+   */
+  gateway_inference?: Record<string, boolean> | null;
+}
+
+export interface HarnessAccountProvider {
+  id: string;
+  label: string;
+  auth_type: string;
+}
+
+export interface HarnessAccount {
+  kind: "none" | "chatgpt" | "api_key" | "subscription" | "providers" | "unknown";
+  email?: string;
+  org?: string;
+  plan?: string;
+  providers?: HarnessAccountProvider[];
+  expired?: boolean;
 }
 
 interface HostsResponse {
   hosts: Host[];
 }
 
-async function fetchHosts(includeSandbox: boolean): Promise<Host[]> {
+export async function fetchHosts(includeSandbox: boolean): Promise<Host[]> {
   const res = await authenticatedFetch("/v1/hosts");
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   const body = (await res.json()) as HostsResponse;
@@ -42,11 +81,17 @@ async function fetchHosts(includeSandbox: boolean): Promise<Host[]> {
 interface UseHostsOptions {
   enabled?: boolean;
   includeSandbox?: boolean;
+  /** Refetch on every window refocus (paired with `staleTime: 0`) so returning
+   *  to the tab is a guaranteed readiness recovery. Only the setup flow needs
+   *  this; other consumers keep the 30 s stale window to avoid an app-wide bump
+   *  in `/v1/hosts` volume on refocus. */
+  refetchOnFocus?: boolean;
 }
 
 export function useHosts(options: UseHostsOptions = {}) {
   const enabled = options.enabled ?? true;
   const includeSandbox = options.includeSandbox ?? false;
+  const refetchOnFocus = options.refetchOnFocus ?? false;
   return useQuery({
     // Distinct cache key per filtering mode so the picker's filtered
     // list and the header's unfiltered list don't overwrite each other.
@@ -54,9 +99,514 @@ export function useHosts(options: UseHostsOptions = {}) {
     queryKey: ["hosts", { includeSandbox }],
     queryFn: () => fetchHosts(includeSandbox),
     enabled,
-    staleTime: 30_000,
-    // Host status is pushed via WS (hosts_changed frame in SessionUpdatesProvider).
-    // 60 s fallback poll catches any missed events (tab backgrounded, reconnect gap).
+    // Readiness is pushed live via WS (hosts_changed → invalidate in
+    // SessionUpdatesProvider), so the badge normally clears within seconds of
+    // `omni setup` finishing. The refocus recovery settles the case that push
+    // misses: a user typically runs setup in a terminal with the tab
+    // backgrounded, which pauses the interval poll AND is when a reconnect gap
+    // can drop the frame. Refetching on refocus makes returning to the tab a
+    // guaranteed recovery — paired with staleTime 0 so refocus always refires
+    // rather than serving a stale "needs setup" from cache. Scoped to the setup
+    // flow via `refetchOnFocus` so the other ~8 consumers don't pay it. The 60 s
+    // interval remains the in-tab fallback.
+    staleTime: refetchOnFocus ? 0 : 30_000,
+    refetchOnWindowFocus: refetchOnFocus,
     refetchInterval: enabled ? 60_000 : false,
+  });
+}
+
+async function fetchHostModelOptions(
+  hostId: string,
+  harness: string,
+): Promise<NativeModelOption[]> {
+  const res = await authenticatedFetch(
+    `/v1/hosts/${encodeURIComponent(hostId)}/harnesses/${encodeURIComponent(harness)}/model-options`,
+  );
+  if (!res.ok) {
+    let detail = `${res.status} ${res.statusText}`;
+    try {
+      const body = (await res.json()) as { detail?: unknown };
+      if (typeof body.detail === "string" && body.detail) detail = body.detail;
+    } catch {
+      // Non-JSON error body — keep the status-line detail.
+    }
+    throw new Error(detail);
+  }
+  const body = (await res.json()) as { models?: NativeModelOption[]; error?: string };
+  const models = body.models ?? [];
+  // Backward compatibility with servers that encoded probe failure in a 200.
+  if (models.length === 0 && body.error) throw new Error(body.error);
+  return models;
+}
+
+// A shared request may start from an inactive observer while another needs retries.
+const modelCatalogPollers = new WeakMap<QueryClient, Map<string, number>>();
+
+/** Model choices available before launch, resolved on the selected host. */
+export function useHostModelOptions(
+  hostId: string | null,
+  harness: string,
+  enabled = true,
+  { poll = true }: { poll?: boolean } = {},
+) {
+  const queryClient = useQueryClient();
+  const canRefresh = enabled && hostId !== null && poll;
+  const pollerKey = JSON.stringify([hostId, harness]);
+  // Only committed selections participate; suspended renders leave retries alone.
+  useLayoutEffect(() => {
+    if (!canRefresh) return;
+    let pollers = modelCatalogPollers.get(queryClient);
+    if (!pollers) {
+      pollers = new Map();
+      modelCatalogPollers.set(queryClient, pollers);
+    }
+    pollers.set(pollerKey, (pollers.get(pollerKey) ?? 0) + 1);
+    return () => {
+      const remaining = (pollers.get(pollerKey) ?? 1) - 1;
+      if (remaining > 0) pollers.set(pollerKey, remaining);
+      else pollers.delete(pollerKey);
+      if (pollers.size === 0) modelCatalogPollers.delete(queryClient);
+    };
+  }, [queryClient, pollerKey, canRefresh]);
+  const query = useQuery({
+    queryKey: ["host-model-options", hostId, harness],
+    queryFn: () => fetchHostModelOptions(hostId as string, harness),
+    enabled: enabled && hostId !== null,
+    // Poll the active picker for provider changes; inactive harnesses can
+    // fetch eagerly without periodic refreshes or background retries.
+    staleTime: 15_000,
+    refetchInterval: canRefresh ? 15_000 : false,
+    ...(!poll && { refetchOnWindowFocus: false, refetchOnReconnect: false }),
+    // Retry boot-probe races while any picker uses this catalog. Persistent
+    // failures surface after bounded backoff (~22 s).
+    retry: (failureCount) =>
+      (modelCatalogPollers.get(queryClient)?.get(pollerKey) ?? 0) > 0 && failureCount < 6,
+    retryDelay: (attempt) => Math.min(5_000, 1_000 * 2 ** attempt),
+  });
+  const previouslyRefreshing = useRef(canRefresh);
+  const { isError, isFetching, refetch } = query;
+  useEffect(() => {
+    const becameSelected = canRefresh && !previouslyRefreshing.current;
+    previouslyRefreshing.current = canRefresh;
+    // Retry failed prefetches on selection without restarting exhausted retries.
+    if (becameSelected && isError && !isFetching) void refetch();
+  }, [canRefresh, isError, isFetching, refetch]);
+  return query;
+}
+
+export interface InstallHarnessResult {
+  object: "harness_install";
+  harness: string;
+  configured_harnesses: Record<string, boolean | string>;
+  version: string | null;
+  gateway_inference: Record<string, boolean> | null;
+  harness_accounts?: Record<string, HarnessAccount> | null;
+}
+
+async function responseDetail(res: Response): Promise<string> {
+  let detail = `${res.status} ${res.statusText}`;
+  try {
+    const body = (await res.json()) as { detail?: unknown };
+    if (typeof body.detail === "string" && body.detail) detail = body.detail;
+  } catch {
+    // Non-JSON error body — keep the status-line detail.
+  }
+  return detail;
+}
+
+export interface RefreshHarnessesResult {
+  configured_harnesses: Record<string, boolean | string>;
+  gateway_inference: Record<string, boolean> | null;
+  harness_accounts?: Record<string, HarnessAccount> | null;
+}
+
+export interface RefreshHarnessAccountsResult {
+  harness_accounts: Record<string, HarnessAccount> | null;
+}
+
+/** Request one throttled account probe; old servers silently opt out. */
+export async function refreshHarnessAccountsOnHost(
+  hostId: string,
+): Promise<RefreshHarnessAccountsResult | null> {
+  const res = await authenticatedFetch(
+    `/v1/hosts/${encodeURIComponent(hostId)}/harnesses/accounts/refresh`,
+    { method: "POST" },
+  );
+  if (res.status === 404 || res.status === 405) return null;
+  if (!res.ok) throw await apiErrorFromResponse(res);
+  return (await res.json()) as RefreshHarnessAccountsResult;
+}
+
+/** Probe accounts once when Settings selects a capable host; never poll. */
+export function useRefreshHarnessAccounts(hostId: string | null, enabled: boolean) {
+  const queryClient = useQueryClient();
+  const query = useQuery({
+    queryKey: ["harness-accounts-refresh", hostId],
+    queryFn: () => refreshHarnessAccountsOnHost(hostId as string),
+    enabled: enabled && hostId !== null,
+    staleTime: 0,
+    refetchOnWindowFocus: false,
+    refetchInterval: false,
+    retry: false,
+  });
+  useEffect(() => {
+    if (hostId === null || query.data === undefined || query.data === null) return;
+    queryClient.setQueriesData<Host[]>({ queryKey: ["hosts"] }, (hosts) =>
+      hosts?.map((host) =>
+        host.host_id === hostId
+          ? { ...host, harness_accounts: query.data?.harness_accounts ?? null }
+          : host,
+      ),
+    );
+  }, [hostId, query.data, queryClient]);
+  return query;
+}
+
+/** Force the selected host to refresh harness readiness. */
+export async function refreshHarnessesOnHost(hostId: string): Promise<RefreshHarnessesResult> {
+  const res = await authenticatedFetch(
+    `/v1/hosts/${encodeURIComponent(hostId)}/harnesses/refresh`,
+    { method: "POST" },
+  );
+  if (!res.ok) throw await apiErrorFromResponse(res);
+  return (await res.json()) as RefreshHarnessesResult;
+}
+
+export async function installHarnessOnHost(
+  hostId: string,
+  harness: string,
+): Promise<InstallHarnessResult> {
+  const res = await authenticatedFetch(
+    `/v1/hosts/${encodeURIComponent(hostId)}/harnesses/${encodeURIComponent(harness)}/install`,
+    { method: "POST" },
+  );
+  if (!res.ok) throw await apiErrorFromResponse(res);
+  return (await res.json()) as InstallHarnessResult;
+}
+
+/**
+ * Install a missing harness onto a connected host from the UI.
+ *
+ * POSTs to the flag-gated install endpoint; the server drives the same
+ * installer `omni setup` uses and returns the host's refreshed readiness.
+ * On success we write that map straight into every cached host list so the
+ * "needs setup" badge flips to ready without waiting for the 60 s poll or a
+ * reconnect. The caller passes the harness id (e.g. `"codex"`); only ids in the
+ * server's `installable_harnesses` set should be offered (see
+ * `harnessInstallableOnHost`).
+ *
+ * Concurrent installs of different harnesses are supported: each `mutate()`
+ * call runs independently, and callers track per-harness in-flight state via
+ * the call's own `onSettled` (see `HarnessSetupDialog`) rather than the shared
+ * observer's `isPending`, which only reflects the latest call.
+ */
+/** Stable mutation key for harness-install mutations on a host. Lets the setup
+ *  dialog read per-harness in-flight state via {@link useInstallingHarnesses}
+ *  regardless of which install fired last (a shared observer only remembers the
+ *  latest call's callbacks — see the comment in {@link useInstallHarness}). */
+export function installHarnessMutationKey(hostId: string): readonly unknown[] {
+  return ["install-harness", hostId];
+}
+
+export function useInstallHarness(hostId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationKey: installHarnessMutationKey(hostId),
+    mutationFn: (harness: string) => installHarnessOnHost(hostId, harness),
+    onSuccess: (result) => {
+      // Patch the refreshed readiness into every ["hosts", …] cache entry
+      // (filtered + unfiltered) so the badge updates immediately. This lives at
+      // config level (not the per-call mutate() options) on purpose: config
+      // callbacks fire per-mutation from the Mutation object, so a concurrent
+      // second install can't orphan the first one's cache patch — unlike the
+      // observer's per-call callbacks, which the later mutate() overwrites.
+      queryClient.setQueriesData<Host[]>({ queryKey: ["hosts"] }, (hosts) =>
+        hosts?.map((h) =>
+          h.host_id === hostId
+            ? {
+                ...h,
+                configured_harnesses: result.configured_harnesses,
+                gateway_inference: result.gateway_inference,
+                ...(result.harness_accounts !== undefined
+                  ? { harness_accounts: result.harness_accounts }
+                  : {}),
+              }
+            : h,
+        ),
+      );
+    },
+  });
+}
+
+/**
+ * The set of harness ids with an install currently in flight on *hostId*.
+ *
+ * Reads React Query's global mutation state (filtered to this host's install
+ * mutations), so it reflects EVERY pending install regardless of which one
+ * fired last. The setup dialog is a single persistent instance sharing one
+ * install mutation observer; that observer only remembers the latest call's
+ * per-call callbacks, so tracking in-flight installs via a local set fed by
+ * mutate()'s onSettled loses any earlier install when a second one starts —
+ * leaving the first harness stuck showing "Installing…" forever. Deriving the
+ * set from mutation state instead is observer-independent and self-heals.
+ */
+export function useInstallingHarnesses(hostId: string): ReadonlySet<string> {
+  const pending = useMutationState({
+    filters: { mutationKey: installHarnessMutationKey(hostId), status: "pending" },
+    select: (mutation) => mutation.state.variables as string | undefined,
+  });
+  return new Set(pending.filter((h): h is string => typeof h === "string"));
+}
+
+/** Payload for {@link useStoreCredential}: an API key, a gateway, or adopt. */
+export interface StoreCredentialInput {
+  harness: string;
+  kind: "key" | "gateway" | "adopt";
+  /** The API key / gateway token for `key` / `gateway`; omitted for `adopt`. */
+  secret?: string;
+  /** Gateway base URL (required for `kind: "gateway"`). */
+  base_url?: string;
+  /** Family default model id to pin. Accepted by the backend but not yet
+   *  surfaced by the v1 form — reserved for a follow-up. */
+  default_model?: string;
+  /** OpenAI wire protocol (`"chat"` / `"responses"`), gateway/key openai only.
+   *  Reserved for a follow-up like {@link default_model}. */
+  wire_api?: string;
+  /** For `kind: "adopt"`, the host env var to reference. */
+  env_var?: string;
+}
+
+export interface StoreCredentialResult {
+  object: "harness_credential";
+  harness: string;
+  configured_harnesses: Record<string, boolean | string>;
+  harness_accounts?: Record<string, HarnessAccount> | null;
+}
+
+/**
+ * Write a harness provider credential onto a connected host from the UI.
+ *
+ * POSTs to the flag-gated credential endpoint; the server forwards the secret
+ * to the host daemon, which writes it (keychain + a `providers:` reference) and
+ * returns the host's refreshed readiness. On success we patch that map into
+ * every cached host list so the harness badge flips (yellow → green) without a
+ * reconnect. The secret rides in the request body and is never held server-side.
+ */
+export function useStoreCredential(hostId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (input: StoreCredentialInput): Promise<StoreCredentialResult> => {
+      const { harness, ...body } = input;
+      const res = await authenticatedFetch(
+        `/v1/hosts/${encodeURIComponent(hostId)}/harnesses/${encodeURIComponent(harness)}/credential`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        },
+      );
+      if (!res.ok) throw new Error(await responseDetail(res));
+      return (await res.json()) as StoreCredentialResult;
+    },
+    // This mutation-level onSuccess patches the ["hosts"] cache (badge flip) and
+    // invalidates the detect query so a just-adopted credential stops showing.
+    // Callers may ALSO pass a call-level onSuccess (toast + close the form);
+    // react-query fires both — don't consolidate them, or the cache patch here
+    // is lost.
+    onSuccess: (result) => {
+      queryClient.setQueriesData<Host[]>({ queryKey: ["hosts"] }, (hosts) =>
+        hosts?.map((h) =>
+          h.host_id === hostId
+            ? {
+                ...h,
+                configured_harnesses: result.configured_harnesses,
+                ...(result.harness_accounts !== undefined
+                  ? { harness_accounts: result.harness_accounts }
+                  : {}),
+              }
+            : h,
+        ),
+      );
+      // A written/adopted credential changes what's adoptable — refetch it.
+      void queryClient.invalidateQueries({ queryKey: ["detected-credentials", hostId] });
+    },
+  });
+}
+
+export interface HarnessLoginStart {
+  login_id: string;
+  verification_url: string;
+  user_code: string;
+  /** Unix epoch seconds. */
+  expires_at: number;
+}
+
+export type HarnessLoginStartResult =
+  ({ kind: "started" } & HarnessLoginStart) | { kind: "busy"; login_id: string };
+
+export interface HarnessLoginStatus {
+  status: "pending" | "succeeded" | "failed" | "cancelled" | "expired";
+  error?: string | null;
+  expired: boolean;
+  configured_harnesses?: Record<string, boolean | string>;
+  harness_accounts?: Record<string, HarnessAccount> | null;
+}
+
+export interface HarnessLogoutResult {
+  configured_harnesses: Record<string, boolean | string> | null;
+  harness_accounts: Record<string, HarnessAccount> | null;
+}
+
+function harnessAccountUrl(
+  hostId: string,
+  harness: string,
+  operation: "login" | "logout",
+  loginId?: string,
+): string {
+  const accountKey = harnessAccountKey(harness);
+  const base = `/v1/hosts/${encodeURIComponent(hostId)}/harnesses/${encodeURIComponent(accountKey)}/${operation}`;
+  return loginId === undefined ? base : `${base}/${encodeURIComponent(loginId)}`;
+}
+
+interface HarnessLoginErrorBody {
+  code?: string;
+  login_id?: string;
+  message?: string;
+  detail?: string;
+  error?: { code?: string; login_id?: string; message?: string };
+}
+
+export async function startHarnessLogin(
+  hostId: string,
+  harness: string,
+): Promise<HarnessLoginStartResult> {
+  const res = await authenticatedFetch(harnessAccountUrl(hostId, harness, "login"), {
+    method: "POST",
+  });
+  if (!res.ok) {
+    const errorResponse = res.clone();
+    let body: HarnessLoginErrorBody = {};
+    try {
+      body = (await res.json()) as HarnessLoginErrorBody;
+    } catch {
+      // Keep the status-line fallback for empty/non-JSON responses.
+    }
+    const code = body.error?.code ?? body.code ?? null;
+    const loginId = body.error?.login_id ?? body.login_id;
+    if (res.status === 409 && code === "login_busy" && loginId) {
+      return { kind: "busy", login_id: loginId };
+    }
+    throw await apiErrorFromResponse(errorResponse);
+  }
+  const login = (await res.json()) as HarnessLoginStart;
+  if (!isSecureVerificationUrl(login.verification_url)) {
+    throw new Error("The host returned an invalid sign-in link.");
+  }
+  return { kind: "started", ...login };
+}
+
+export function isSecureVerificationUrl(value: string): boolean {
+  try {
+    return new URL(value).protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
+export async function fetchHarnessLogin(
+  hostId: string,
+  harness: string,
+  loginId: string,
+  signal?: AbortSignal,
+): Promise<HarnessLoginStatus> {
+  const res = await authenticatedFetch(harnessAccountUrl(hostId, harness, "login", loginId), {
+    signal,
+  });
+  if (!res.ok) throw await apiErrorFromResponse(res);
+  return (await res.json()) as HarnessLoginStatus;
+}
+
+export async function cancelHarnessLogin(
+  hostId: string,
+  harness: string,
+  loginId: string,
+): Promise<void> {
+  const res = await authenticatedFetch(harnessAccountUrl(hostId, harness, "login", loginId), {
+    method: "DELETE",
+  });
+  if (!res.ok) throw await apiErrorFromResponse(res);
+}
+
+export async function logoutHarnessOnHost(
+  hostId: string,
+  harness: string,
+): Promise<HarnessLogoutResult> {
+  const res = await authenticatedFetch(harnessAccountUrl(hostId, harness, "logout"), {
+    method: "POST",
+  });
+  if (!res.ok) throw await apiErrorFromResponse(res);
+  return (await res.json()) as HarnessLogoutResult;
+}
+
+/** A credential already on the host, offered for one-click adopt (non-secret). */
+export interface DetectedCredential {
+  family: string;
+  source: string;
+  env_var: string | null;
+}
+
+/**
+ * Fetch the credentials already present on a host, for the adopt affordance.
+ *
+ * Hits the flag-gated detect endpoint; the server asks the host daemon for
+ * NON-secret descriptors (family + source label + env var name) of adoptable
+ * credentials. Enabled only when a host id is given and `enabled` is set (the
+ * dialog turns it on only for a harness whose credential the UI can write), so
+ * we don't probe hosts for closed dialogs.
+ */
+export function useDetectedCredentials(hostId: string | null | undefined, enabled: boolean) {
+  return useQuery({
+    queryKey: ["detected-credentials", hostId],
+    queryFn: async (): Promise<DetectedCredential[]> => {
+      const res = await authenticatedFetch(
+        `/v1/hosts/${encodeURIComponent(hostId ?? "")}/credentials/detected`,
+      );
+      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+      const body = (await res.json()) as { credentials?: DetectedCredential[] };
+      return Array.isArray(body.credentials) ? body.credentials : [];
+    },
+    enabled: enabled && !!hostId,
+    staleTime: 30_000,
+  });
+}
+
+export interface HarnessStartup {
+  command: string;
+  resolved_path: string | null;
+  command_source: "env" | "config" | "default";
+  arg_count: number;
+  /** Null when an older host reports only the count. */
+  args?: string[] | null;
+  configured_command?: string | null;
+  configured_args?: string[] | null;
+  environment?: {
+    inherit: boolean;
+    variables: Record<string, string>;
+    unset: string[];
+  } | null;
+}
+
+export function useHarnessStartup(hostId: string, harness: string) {
+  return useQuery({
+    queryKey: ["harness-startup", hostId, harness],
+    queryFn: async (): Promise<HarnessStartup> => {
+      const res = await authenticatedFetch(
+        `/v1/hosts/${encodeURIComponent(hostId)}/harnesses/${encodeURIComponent(harness)}/startup`,
+      );
+      if (!res.ok) throw new ApiError("Couldn't load launch settings", res.status, null);
+      return (await res.json()) as HarnessStartup;
+    },
+    retry: false,
+    staleTime: 30_000,
   });
 }

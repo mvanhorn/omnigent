@@ -19,6 +19,9 @@ export interface BaseItem {
   type: string;
   response_id: string;
   status: string;
+  /** Server-side creation time (unix epoch seconds). Drives the
+   *  completed-turn "Worked for" duration for reloaded history. */
+  created_at?: number;
 }
 
 export interface MessageItem extends BaseItem {
@@ -29,10 +32,26 @@ export interface MessageItem extends BaseItem {
   model?: string;
   /** Human author email; omitted for agent/tool/system items. */
   created_by?: string;
+  /** Human submission confirmed by the server, including anonymous input. */
+  user_authored?: boolean;
   /** Hidden durable context such as injected skill instructions. */
   is_meta?: boolean;
   /** Assistant-only marker for durable partial text from an interrupted turn. */
   interrupted?: boolean;
+  /** Native live-preview stream finalized by this persisted assistant message. */
+  stream_message_id?: string;
+  /** Assistant-only harness label as stored, e.g. Codex `commentary`; may be newer than this client. */
+  phase?: string;
+}
+
+/** Codex `MessagePhase`: progress narration vs. (partial or final) answer text. */
+export type AssistantMessagePhase = "commentary" | "partial_answer" | "final_answer";
+
+/** Narrow an untrusted wire value to a known phase. */
+export function assistantMessagePhase(value: unknown): AssistantMessagePhase | undefined {
+  return value === "commentary" || value === "partial_answer" || value === "final_answer"
+    ? value
+    : undefined;
 }
 
 export interface FunctionCallItem extends BaseItem {
@@ -59,6 +78,21 @@ export interface ErrorItem extends BaseItem {
   source: string;
   code: string;
   message: string;
+  /** `"info"` renders as a neutral notice pill instead of a destructive error. */
+  level?: "error" | "info";
+  /** Friendly headline for a classified failure. Present when the runner classified it. */
+  title?: string;
+  /** One/two-sentence explanation of why it failed. Paired with `title`. */
+  cause?: string;
+  /** Concrete next step to fix it, e.g. a command to run. */
+  remediation?: string;
+}
+
+export interface ReasoningItem extends BaseItem {
+  type: "reasoning";
+  model: string;
+  summary: { type: string; text: string }[];
+  content?: { type: string; text: string }[];
 }
 
 /** The provider-native tool item types the runtime persists today. */
@@ -158,6 +192,7 @@ export type ConversationItem =
   | FunctionCallItem
   | FunctionCallOutputItem
   | ErrorItem
+  | ReasoningItem
   | NativeToolItem
   | CompactionItem
   | SlashCommandItem
@@ -179,6 +214,10 @@ export function isFunctionCallOutputItem(item: ConversationItem): item is Functi
 
 export function isErrorItem(item: ConversationItem): item is ErrorItem {
   return item.type === "error";
+}
+
+export function isReasoningItem(item: ConversationItem): item is ReasoningItem {
+  return item.type === "reasoning";
 }
 
 export function isNativeToolItem(item: ConversationItem): item is NativeToolItem {

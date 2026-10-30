@@ -50,22 +50,25 @@ the secret and redeploy.
 
 The first boot runs DB migrations over the network (~1 minute on Neon).
 
-**Get the admin password:** the first boot prints it to the app log:
+**Create the first admin.** No credentials are auto-generated. First boot
+prints a "No admin yet" line pointing at your `*.modal.run` URL:
 
 ```bash
 modal app logs omnigent
 ```
 
-```
-✓ Created initial admin account (accounts auth provider).
-    password: <generated>
-```
+Open that URL and use the web Create-admin form to pick your own username +
+password, then invite teammates from **Members** in the web UI.
 
-Log in as the admin and invite teammates from **Members** in the web UI.
-
-> To set a known admin password instead, add
-> `OMNIGENT_ACCOUNTS_INIT_ADMIN_PASSWORD=<password>` to the
+> To create the admin directly instead of claiming it through the web form,
+> add `OMNIGENT_ACCOUNTS_INIT_ADMIN_PASSWORD=<password>` to the
 > `omnigent-deploy` secret before the first deploy.
+
+> **Security note for public deployments:** `POST /auth/setup` is
+> unauthenticated while no password-bearing account exists, so an instance
+> exposed before you reach the Create-admin form can be claimed by the first
+> visitor. Pre-seed `OMNIGENT_ACCOUNTS_INIT_ADMIN_PASSWORD`, or complete setup
+> promptly after the deploy goes live.
 
 ### Modal-specific caveats
 
@@ -260,6 +263,11 @@ for managed launches.)
 ### Server-managed sandboxes
 
 With managed hosts, the server does all of the above per session.
+When the server runs outside Modal, use
+`ghcr.io/omnigent-ai/omnigent-server-modal:latest`; this variant includes
+the Modal SDK required to provision sandboxes. For a custom server image,
+build with `--build-arg OMNIGENT_EXTRAS=modal`.
+
 Add a `sandbox:` section to the server config (`omnigent server -c
 config.yaml`, or `<data_dir>/config.yaml`):
 

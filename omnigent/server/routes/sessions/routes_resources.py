@@ -1,0 +1,4214 @@
+"""Resource routes: list/get/create/delete session resources, files, filesystem."""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import contextlib
+import functools
+import json
+import mimetypes
+import ntpath
+import re
+import time
+import urllib.parse
+import weakref
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from pathlib import Path
+from typing import TYPE_CHECKING, Annotated, Any, cast
+
+import httpx
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    Request,
+    UploadFile,
+)
+from fastapi.responses import JSONResponse, Response, StreamingResponse
+from starlette.types import Receive, Scope, Send
+
+from omnigent.debug_logging import debug_event
+from omnigent.entities import (
+    Conversation,
+    StoredFile,
+)
+from omnigent.entities.session_resources import session_resource_view_to_dict
+from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.native.native_coding_agents import (
+    native_coding_agent_for_agent_name,
+    native_coding_agent_for_terminal_name,
+)
+from omnigent.runner.routing import RunnerRouter, routing_host_id
+from omnigent.runtime.policies.approval import _ELICITATION_MODE
+from omnigent.server import session_pull_requests as server_prs
+from omnigent.server._elicitation_registry import (
+    _harness_elicitation_owners,
+    _harness_elicitation_registry,
+    _harness_parked_elicitations,
+    _harness_pre_resolved_elicitations,
+    _ParkedHarnessElicitation,
+    _PreResolvedHarnessElicitation,
+)
+from omnigent.server.auth import (
+    LEVEL_EDIT,
+    LEVEL_OWNER,
+    LEVEL_READ,
+    AuthProvider,
+)
+from omnigent.server.feature_flags import Feature, FeatureFlags
+from omnigent.server.host_registry import HostRegistry
+from omnigent.server.permissions import check_session_access
+from omnigent.server.routes._auth_helpers import (
+    get_user_id as _get_user_id,
+)
+from omnigent.server.routes._auth_helpers import (
+    require_access_and_level as _require_access_and_level,
+)
+from omnigent.server.routes._content_type import (
+    require_json_content_type,
+)
+from omnigent.server.routes._errors import session_not_found as _session_not_found
+from omnigent.server.routes._gzip_route import GZipFileContentRoute, skip_gzip
+from omnigent.server.routes._host_launch import resolve_host_owner
+from omnigent.server.routes._origin import require_trusted_origin
+from omnigent.server.routes._sessions.common import (
+    _logger,
+    get_server_runner_router,
+    host_interactive_shells_for_request,
+    set_server_runner_router,
+)
+from omnigent.server.routes._sessions.helpers import (
+    FILE_CONTENT_CACHE_CONTROL,
+    _ancestor_session_ids,
+    _attachment_disposition,
+    _await_settled_managed_launch,
+    _enforce_filesystem_attachment_policy,
+    _file_content_etag,
+    _filesystem_attachment_policy,
+    _get_runner_client_for_resource_access,
+    _if_none_match_matches,
+    _load_agent_spec_for_session,
+    _proxy_get_session_resources_to_runner,
+    _publish_and_persist_resource_event,
+    _publish_changed_files_invalidated,
+    _raise_if_runner_session_agent_missing,
+    _raise_if_session_agent_missing_payload,
+    _read_upload_capped,
+    _require_filesystem_attachment_harness,
+    _stored_file_to_resource,
+    require_filesystem_attachment_runtime,
+)
+from omnigent.server.routes._sessions.orchestration import (
+    ensure_runner_connected,
+)
+from omnigent.server.schemas import (
+    CopiedFile,
+    CopyFilesRequest,
+    CopyFilesResponse,
+    SessionPullRequestList,
+    SessionRepositoryBranchList,
+    SessionResourceObject,
+    SessionResourcePaginatedList,
+)
+from omnigent.stores import AgentStore, ConversationStore
+from omnigent.stores.artifact_store import ArtifactStore
+from omnigent.stores.file_store import FileStore
+from omnigent.stores.permission_store import PermissionStore
+from omnigent.stores.session_pull_request_store import SessionPullRequestLimitError
+
+if TYPE_CHECKING:
+    from omnigent.inner.native_attachments import FilesystemAttachmentPolicy
+
+
+def _runner_resource_write_payload(
+    response: httpx.Response, *, session_id: str, method: str
+) -> dict[str, Any]:
+    """Reject unreadable mutation replies without replaying an uncertain operation."""
+    try:
+        payload = response.json()
+    except (ValueError, RecursionError):
+        kind = "invalid_json" if response.content else "empty"
+    else:
+        if isinstance(payload, dict):
+            return payload
+        kind = "non_object"
+    content_type = response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    if content_type not in {"application/json", "text/plain", "text/html", ""}:
+        content_type = "other"
+    request_id = response.headers.get("x-request-id", "")
+    _logger.error(
+        "Runner resource mutation returned an unreadable response",
+        extra=debug_event(
+            "runner_resource_response_invalid",
+            session_id=session_id,
+            method=method,
+            http_status=response.status_code,
+            response_kind=kind,
+            response_bytes=len(response.content),
+            content_type=content_type or "missing",
+            server_request_id=request_id
+            if re.fullmatch(r"[0-9a-fA-F-]{16,64}", request_id)
+            else None,
+        ),
+    )
+    raise HTTPException(
+        status_code=response.status_code if response.is_error else 502,
+        detail="runner resource endpoint returned an invalid response; operation may have completed",
+    )
+
+
+class _RunnerStreamResponse(StreamingResponse):
+    """Stream a runner response body and close it however the send ends.
+
+    A generator ``finally`` only runs once the body is first pulled, so a
+    send that fails before that, or a client that disconnects (where
+    Starlette skips background tasks), would leak the tunnel request.
+    Closing in ``__call__`` covers every exit.
+
+    :param upstream: The runner's streamed response.
+    :param headers: Response headers to forward.
+    """
+
+    def __init__(self, upstream: httpx.Response, *, headers: Mapping[str, str]) -> None:
+        super().__init__(upstream.aiter_raw(), headers=headers)
+        self._upstream = upstream
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            await self._upstream.aclose()
+
+
+# Runner wait for a PR label, reviewer, or merge request, above the runner's 15-second
+# budget for all of its ``gh`` calls, so a slow edit that GitHub applied is not
+# reported as failed.
+_PR_EDIT_PROXY_TIMEOUT_S = 20.0
+# Runner wait for a PR attachment upload, above the runner's 110-second budget for it.
+_PR_ATTACHMENT_PROXY_TIMEOUT_S = 120.0
+# The largest PR attachment, a video; the runner checks each type's limit. Both
+# the runner and host tunnels carry it base64-encoded (a third larger) in one frame.
+_MAX_PR_ATTACHMENT_BYTES = 70 * 1024 * 1024
+
+# Admission gate bounding how many image uploads hold their raw bytes in memory
+# and decode/re-encode at once. Created lazily on first use so it binds to the
+# running server loop (not import time) and picks up the configured size. The
+# raw upload is already spooled to disk by the multipart parser before the
+# handler runs, so waiting here serializes only the in-memory materialize +
+# decode — the memory-heavy work — never the network transfer.
+_image_compression_gate: asyncio.Semaphore | None = None
+
+
+def _get_image_compression_gate() -> asyncio.Semaphore:
+    """Return the process-wide image-compression admission semaphore."""
+    global _image_compression_gate
+    if _image_compression_gate is None:
+        from omnigent.server.server_config import image_compression_concurrency
+
+        _image_compression_gate = asyncio.Semaphore(image_compression_concurrency())
+    return _image_compression_gate
+
+
+# custom-lint: disable-next=workspace-scoped-cache -- lock; collision only serializes
+_attachment_upload_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
+    weakref.WeakValueDictionary()
+)
+
+
+def _attachment_upload_lock(session_id: str) -> asyncio.Lock:
+    """Return the lock serializing one session's attachment quota check and store."""
+    lock = _attachment_upload_locks.get(session_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _attachment_upload_locks[session_id] = lock
+    return lock
+
+
+def _unsupported_attachment_detail(content_type: str, policy: FilesystemAttachmentPolicy) -> str:
+    """Explain a refused upload in terms of the types this server accepts."""
+    from omnigent.inner.native_attachments import DEFAULT_FILESYSTEM_ATTACHMENT_POLICY
+
+    detail = (
+        f"Unsupported attachment type '{content_type}'. Attach images, PDF, or text/code files"
+    )
+    if policy == DEFAULT_FILESYSTEM_ATTACHMENT_POLICY:
+        return (
+            f"{detail}, or use Claude Code or Codex for archives, Office documents, and databases."
+        )
+    if policy.extensions:
+        extensions = ", ".join(sorted(policy.extensions))
+        return f"{detail}, or use Claude Code or Codex for {extensions} files."
+    return f"{detail}."
+
+
+def register_resources_routes(
+    router: APIRouter,
+    *,
+    conversation_store: ConversationStore,
+    agent_store: AgentStore,
+    file_store: FileStore | None = None,
+    artifact_store: ArtifactStore | None = None,
+    runner_router: RunnerRouter | None = None,
+    auth_provider: AuthProvider | None = None,
+    permission_store: PermissionStore | None = None,
+    host_registry: HostRegistry | None = None,
+    register_initial_file_upload: Callable[..., None] | None = None,
+    pull_request_refresher: server_prs.PullRequestRefresher | None = None,
+) -> None:
+    """Register the resources routes on router."""
+    pull_request_store = server_prs.open_store(conversation_store)
+
+    async def _require_filesystem_attachment_support(
+        request: Request, conv: Conversation, filename: str, capability: str
+    ) -> None:
+        await _require_filesystem_attachment_harness(conv, filename)
+        tracker = getattr(request.app.state, "managed_launches", None)
+        launch = tracker.get(conv.id) if tracker is not None else None
+        if launch is not None and conv.host_id is None and conv.runner_id is None:
+            await _await_settled_managed_launch(launch)
+            refreshed = await asyncio.to_thread(conversation_store.get_conversation, conv.id)
+            if refreshed is None:
+                raise _session_not_found()
+            conv = refreshed
+        tunnel_registry = getattr(request.app.state, "tunnel_registry", None)
+        if (
+            conv.host_id is not None
+            and host_registry is not None
+            and host_registry.get(conv.host_id) is None
+            and (
+                conv.runner_id is None
+                or tunnel_registry is None
+                or tunnel_registry.get(conv.runner_id) is None
+            )
+            and not (
+                runner_router is not None
+                and await asyncio.to_thread(runner_router.host_is_on_another_replica, conv.host_id)
+            )
+        ):
+            # Upload can be the first action after a managed sandbox sleeps.
+            _, conv = await ensure_runner_connected(
+                session_id=conv.id,
+                conv=conv,
+                app_state=request.app.state,
+                conversation_store=conversation_store,
+                runner_router=runner_router,
+            )
+        await asyncio.to_thread(
+            require_filesystem_attachment_runtime,
+            host_id=conv.host_id,
+            runner_id=conv.runner_id,
+            host_registry=host_registry,
+            tunnel_registry=tunnel_registry,
+            runner_router=runner_router,
+            capability=capability,
+        )
+
+    @router.get(
+        "/sessions/{session_id}/resources",
+        response_model=SessionResourcePaginatedList,
+        response_model_exclude_none=True,
+    )
+    async def list_session_resources(
+        request: Request,
+        session_id: str,
+        # Shadows the ``type`` builtin deliberately: FastAPI maps the
+        # parameter name to the wire query param, which is ``?type=``.
+        type: str | None = Query(default=None),
+    ) -> SessionResourcePaginatedList:
+        """
+        Return the runner-authoritative resource inventory for a session.
+
+        Requires the session to be bound to a runner via
+        ``PATCH /v1/sessions/{id}``; raises ``conflict`` otherwise.
+        The server validates the session exists, then proxies to the
+        runner's ``GET /v1/sessions/{id}/resources`` endpoint. In
+        unit-test / in-process setups with no runner router/client, the
+        route falls back to adapting the local terminal registry.
+
+        :param request: The incoming FastAPI request (for auth).
+        :param session_id: Session/conversation identifier,
+            e.g. ``"conv_abc123"``.
+        :param type: Optional resource-type filter, e.g.
+            ``"environment"`` / ``"terminal"`` / ``"file"``. Forwarded
+            to the runner (its registry applies it) and honored by the
+            local-registry fallback and the file-store merge below.
+        """
+        user_id = _get_user_id(request, auth_provider)
+        access = await _require_access_and_level(
+            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+        )
+        conv = access.conversation
+        if conv is None:
+            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            if conv is None:
+                raise _session_not_found()
+        runner_client = await _get_runner_client_for_resource_access(
+            session_id,
+            conversation=conv,
+        )
+        if runner_client is not None:
+            page = await _proxy_get_session_resources_to_runner(
+                runner_client, session_id, resource_type=type
+            )
+        else:
+            from omnigent.entities.session_resources import (
+                list_session_resources_from_terminal_registry,
+            )
+            from omnigent.runtime import get_terminal_registry
+
+            try:
+                local_registry = get_terminal_registry()
+            except RuntimeError:
+                local_registry = None
+            resource_page = list_session_resources_from_terminal_registry(
+                session_id,
+                local_registry,
+            )
+            # Mirror the runner's ``?type=`` semantics on the fallback so
+            # both paths return the same shape for filtered queries.
+            local_data = [
+                SessionResourceObject.model_validate(
+                    session_resource_view_to_dict(resource),
+                )
+                for resource in resource_page.data
+                if type is None or resource.type == type
+            ]
+            page = SessionResourcePaginatedList(
+                data=local_data,
+                first_id=local_data[0].id if local_data else None,
+                last_id=local_data[-1].id if local_data else None,
+                has_more=resource_page.has_more,
+            )
+
+        # Files live in the server's file store, not on the runner, so a
+        # ``type`` filter for non-file resources must skip the merge.
+        if file_store is not None and type in (None, "file"):
+            file_page = await asyncio.to_thread(
+                file_store.list,
+                session_id=session_id,
+                limit=1000,
+            )
+            for stored in file_page.data:
+                resource_dict = _stored_file_to_resource(
+                    session_id,
+                    stored,
+                )
+                page.data.append(
+                    SessionResourceObject.model_validate(resource_dict),
+                )
+            if page.data:
+                page.last_id = page.data[-1].id
+                if not page.first_id:
+                    page.first_id = page.data[0].id
+
+        return page
+
+    # ── Phase 1b: typed resource collections & terminal lifecycle ──
+
+    async def _validate_session(
+        session_id: str,
+        request: Request | None = None,
+        required_level: int = LEVEL_READ,
+    ) -> Conversation:
+        """Validate session existence and enforce permission checks.
+
+        :param session_id: Session/conversation identifier.
+        :param request: The incoming FastAPI request (for auth).
+            When ``None``, permission checks are skipped (internal
+            calls only).
+        :param required_level: Minimum permission level needed.
+        :returns: The matching conversation.
+        :raises OmnigentError: 401/403/404 on auth or access failure.
+        """
+        if request is not None:
+            user_id = _get_user_id(request, auth_provider)
+            access = await _require_access_and_level(
+                user_id,
+                session_id,
+                required_level,
+                permission_store,
+                conversation_store,
+            )
+            # _require_access_and_level already fetched the conversation for
+            # non-admin callers — reuse it to avoid a second DB round-trip.
+            if access.conversation is not None:
+                return access.conversation
+        # Fallback: no-auth path, admin caller, or permissions disabled.
+        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if conv is None:
+            raise _session_not_found()
+        return conv
+
+    # Per-chunk read budget for a direct HTTP runner client; no total timeout,
+    # since a large file legitimately outlives any. The WebSocket tunnel
+    # transport ignores httpx timeouts: there, a runner that drops aborts the
+    # body iterator once the tunnel closes.
+    _download_timeout = httpx.Timeout(connect=5.0, read=45.0, write=None, pool=None)
+
+    async def _stream_download_from_runner(
+        request: Request,
+        session_id: str,
+        conversation: Conversation,
+        runner_path: str,
+    ) -> Response:
+        """Resume an idle runner if needed and stream a file without buffering it.
+
+        The runner serves the bytes straight from disk; forwarding them
+        chunk by chunk keeps the server's memory flat however large the
+        file is. There is no host fallback: the host tunnel's filesystem
+        op answers in a single message, so it cannot stream a file.
+
+        :param request: The incoming request, for the gzip opt-out.
+        :param session_id: Session/conversation identifier.
+        :param conversation: Conversation loaded during authorization.
+        :param runner_path: Runner-relative URL carrying ``download=true``.
+        :returns: The attachment, streamed as the runner sends it, or the
+            runner's own error body and status for a missing file, a
+            directory, or an out-of-grant path.
+        :raises OmnigentError: ``runner_unavailable`` when the runner
+            predates downloads.
+        :raises HTTPException: 502 when no runner can be reached.
+        """
+        try:
+            runner_client = await _get_runner_client_for_resource_access(
+                session_id,
+                conversation=conversation,
+            )
+        except OmnigentError as exc:
+            if exc.code != ErrorCode.RUNNER_UNAVAILABLE:
+                raise
+            # Restarting a runner needs edit access, even when its files are
+            # shared with read-only viewers. Live downloads keep the read gate.
+            conversation = await _validate_session(session_id, request, LEVEL_EDIT)
+            _, conversation = await ensure_runner_connected(
+                session_id=session_id,
+                conv=conversation,
+                app_state=request.app.state,
+                conversation_store=conversation_store,
+                runner_router=runner_router or get_server_runner_router(),
+                raise_host_refusal=True,
+            )
+            runner_client = await _get_runner_client_for_resource_access(
+                session_id,
+                conversation=conversation,
+            )
+        if runner_client is None:
+            raise HTTPException(
+                status_code=502,
+                detail="no runner available for resource access",
+            )
+        try:
+            resp = await runner_client.send(
+                runner_client.build_request("GET", runner_path, timeout=_download_timeout),
+                stream=True,
+            )
+        except (httpx.HTTPError, ConnectionError) as exc:
+            raise HTTPException(
+                status_code=502,
+                detail="runner download endpoint unavailable",
+            ) from exc
+        if resp.status_code == 200 and "content-disposition" in resp.headers:
+            skip_gzip(request)
+            forwarded = {
+                name: resp.headers[name]
+                for name in (
+                    "content-type",
+                    "content-length",
+                    "content-encoding",
+                    "content-disposition",
+                    "cache-control",
+                    "x-content-type-options",
+                )
+                if name in resp.headers
+            }
+            return _RunnerStreamResponse(resp, headers=forwarded)
+        try:
+            await resp.aread()
+        finally:
+            await resp.aclose()
+        if resp.status_code == 200:
+            # A runner that predates ``download=true`` ignores it and answers
+            # the capped JSON envelope; serving that would truncate silently.
+            raise OmnigentError(
+                "Session runner does not support file downloads; restart the session",
+                code=ErrorCode.RUNNER_UNAVAILABLE,
+            )
+        try:
+            payload = resp.json()
+        except ValueError:
+            payload = None
+        if not isinstance(payload, dict) or not isinstance(payload.get("error"), dict):
+            raise HTTPException(status_code=502, detail="runner download failed")
+        # Re-derive the typed session-lifecycle 410 (agent deleted or
+        # rebound) with its client-safe message instead of forwarding the
+        # runner's raw resolver text verbatim.
+        _raise_if_session_agent_missing_payload(payload)
+        return JSONResponse(status_code=resp.status_code, content=payload)
+
+    async def _proxy_get_to_runner(
+        session_id: str,
+        path: str,
+        conversation: Conversation,
+        params: dict[str, str] | None = None,
+        timeout: float = 10.0,
+        unsupported_endpoint_message: str | None = None,
+    ) -> dict[str, Any]:
+        """Proxy a GET request to the runner and return parsed JSON.
+
+        :param session_id: Session/conversation identifier.
+        :param path: Runner-relative URL path.
+        :param conversation: Conversation loaded during authorization.
+        :param params: Optional query params forwarded to the runner,
+            e.g. ``{"order": "asc"}``. ``None`` sends no query string.
+        :param timeout: Seconds to wait for the runner response.
+        :param unsupported_endpoint_message: Upgrade guidance for an unregistered runner route.
+        :returns: Parsed JSON response body.
+        :raises OmnigentError: ``runner_unavailable`` (503) for an unsupported endpoint;
+            typed ``not_found`` (404) or
+            ``session_agent_missing`` (410) re-derived from the runner body.
+        :raises HTTPException: 502 on any other runner failure.
+        """
+        runner_client = await _get_runner_client_for_resource_access(
+            session_id,
+            conversation=conversation,
+        )
+        if runner_client is None:
+            raise HTTPException(
+                status_code=502,
+                detail="no runner available for resource access",
+            )
+        try:
+            resp = await runner_client.get(path, params=params, timeout=timeout)
+        except (httpx.HTTPError, ConnectionError) as exc:
+            raise HTTPException(
+                status_code=502,
+                detail="runner resource endpoint unavailable",
+            ) from exc
+        try:
+            response_payload = resp.json()
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=502, detail="runner resource endpoint returned invalid JSON"
+            ) from exc
+        if resp.status_code == 404:
+            if unsupported_endpoint_message and response_payload == {"detail": "Not Found"}:
+                raise OmnigentError(
+                    unsupported_endpoint_message,
+                    code=ErrorCode.RUNNER_UNAVAILABLE,
+                )
+            message = "Resource not found"
+            if isinstance(response_payload, dict):
+                error = response_payload.get("error")
+                if isinstance(error, dict) and isinstance(error.get("message"), str):
+                    message = error["message"]
+            raise OmnigentError(
+                message,
+                code=ErrorCode.NOT_FOUND,
+            )
+        if resp.status_code != 200:
+            # Re-derive the typed session-lifecycle 410 (agent deleted or
+            # rebound) instead of flattening it to a generic 502.
+            _raise_if_runner_session_agent_missing(resp)
+            if isinstance(response_payload, dict):
+                error = response_payload.get("error", {})
+                msg = error.get("message") or "runner resource endpoint failed"
+            else:
+                msg = "runner resource endpoint failed"
+            raise HTTPException(status_code=502, detail=msg)
+        if not isinstance(response_payload, dict):
+            raise HTTPException(
+                status_code=502, detail="runner resource endpoint returned non-object JSON"
+            )
+        return cast(dict[str, Any], response_payload)
+
+    async def _fs_get_with_host_fallback(
+        session_id: str,
+        conversation: Conversation,
+        *,
+        op: str,
+        host_params: dict[str, Any],
+        runner_path: str,
+        runner_params: dict[str, str] | None = None,
+        host_workspace_resolver: Callable[[], Awaitable[str]] | None = None,
+        runner_timeout: float = 10.0,
+    ) -> dict[str, Any]:
+        """Serve a filesystem read, falling back to the host when offline.
+
+        Proxies the read to the session's runner as usual. When the
+        runner is offline (``RUNNER_UNAVAILABLE``) but the session's host
+        is still connected, the read is served from the workspace over
+        the host tunnel instead — the file panel stays live without
+        waking the agent. The host runs
+        :class:`omnigent.workspace_fs.WorkspaceReader` and returns the
+        same JSON the runner would, so the response shape is identical.
+
+        :param session_id: Session/conversation identifier.
+        :param conversation: Conversation loaded during authorization.
+        :param op: Host-side op name — ``"list_or_read"`` / ``"changes"``
+            / ``"diff"`` / ``"search"`` / ``"github_info"`` /
+            ``"github_changes"`` / ``"github_diff"`` / ``"github_pr_diff"`` /
+            ``"github_labels"`` / ``"github_merge_options"`` / ``"github_reviewers"`` /
+        ``"github_review_threads"`` / ``"github_review_thread_comments"``.
+            The ``github_*`` ops serve every git provider; their names are
+            stable wire ids.
+        :param host_params: Op-specific args for the host reader.
+        :param runner_path: Runner-relative URL for the live path.
+        :param runner_params: Optional query params for the runner path.
+        :param host_workspace_resolver: Resolves the absolute root the host
+            reader should be rooted at, for an absolute browse target.
+            Awaited ONLY when the fallback is actually taken: a live runner
+            authorizes the path itself against its own resolved policy, and
+            a runner-only session (no host, so no recorded ``workspace``)
+            has nothing for this to resolve against. Resolving it eagerly
+            would refuse absolute browsing on exactly those sessions even
+            though the online runner can serve them.
+        :param runner_timeout: Seconds to wait for the runner's response.
+        :returns: The runner-shaped filesystem result.
+        :raises OmnigentError: Re-raised runner-offline error when the
+            host cannot serve the read either.
+        :raises HTTPException: On host-reported filesystem failures.
+        """
+        try:
+            return await _proxy_get_to_runner(
+                session_id,
+                runner_path,
+                conversation,
+                params=runner_params,
+                timeout=runner_timeout,
+            )
+        except OmnigentError as exc:
+            # Only the runner-offline case is a candidate for the host
+            # fallback; a real 404 / git error from a live runner must
+            # surface unchanged.
+            if exc.code != ErrorCode.RUNNER_UNAVAILABLE:
+                raise
+            runner_offline = exc
+
+        host_workspace = await host_workspace_resolver() if host_workspace_resolver else None
+        payload = await _read_workspace_via_host(
+            session_id,
+            conversation,
+            op,
+            host_params,
+            workspace_override=host_workspace,
+        )
+        if payload is None:
+            # No reachable host either — surface the original offline
+            # error (503) so the client shows its reconnect affordance.
+            raise runner_offline
+        return payload
+
+    async def _environment_reach_for_session(
+        conversation: Conversation,
+    ) -> tuple[list[Any], bool, str] | None:
+        """Compute a session's browse reach without consulting the runner.
+
+        Lets the offline (host-served) path authorize an absolute target
+        with the same grants the runner would apply, so browsing behaves
+        identically whether or not the agent is awake. The host is never
+        trusted to enforce this — it reads whatever root it is handed, so
+        the decision has to be made here.
+
+        :param conversation: Conversation loaded during authorization.
+        :returns: ``(roots, unconfined, workspace)``, or ``None`` when the
+            session has no workspace or spec to resolve.
+        """
+        from omnigent.inner.sandbox import is_unconfined, reachable_roots, resolve_sandbox
+
+        if not conversation.workspace:
+            return None
+        spec = await asyncio.to_thread(
+            _load_agent_spec_for_session,
+            conversation,
+            agent_store,
+        )
+        spec_os_env = getattr(spec, "os_env", None) if spec is not None else None
+        if spec_os_env is None:
+            return None
+        root = Path(conversation.workspace)
+        policy = resolve_sandbox(spec_os_env, root)
+        return (
+            reachable_roots(root, policy),
+            is_unconfined(policy),
+            conversation.workspace,
+        )
+
+    def _runner_environment_segment(environment_id: str) -> str:
+        """Preserve an environment identifier as one runner URL segment."""
+        if environment_id in {".", ".."}:
+            raise OmnigentError("Invalid environment identifier", code=ErrorCode.INVALID_INPUT)
+        return urllib.parse.quote(environment_id, safe="")
+
+    def _runner_path_segment(relative_path: str, *, absolute: bool) -> str:
+        """Encode a browse path for the runner's ``{relative_path:path}`` segment.
+
+        Only the leading slash is encoded, since a literal "//" is what proxies
+        collapse; interior slashes travel fine and keep logs readable. Every
+        other character is quoted, so a literal "%" in a name is not decoded a
+        second time by the runner into a path the gate here never saw.
+
+        :param relative_path: Decoded path, with a leading slash iff *absolute*.
+        :param absolute: Whether the path is host-absolute.
+        :returns: The encoded segment.
+        """
+        if ".." in relative_path.split("/"):
+            raise OmnigentError(
+                "Parent path segments are not permitted",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        quoted = urllib.parse.quote(relative_path.lstrip("/"))
+        return "%2F" + quoted if absolute else quoted
+
+    def _mutating_runner_path(
+        session_id: str,
+        environment_id: str,
+        relative_path: str,
+    ) -> str:
+        """Build the runner URL for a write / edit / delete.
+
+        A leading slash means an absolute location rather than a path under
+        the workspace, and the runner refuses those unless the server vouches
+        for the caller. The caller's level is checked separately — see
+        :func:`_mutating_level`, which raises the bar to owner-only for an
+        absolute target.
+
+        :param session_id: Session/conversation identifier.
+        :param environment_id: Environment resource id.
+        :param relative_path: Client-supplied path.
+        :returns: The runner-relative URL.
+        """
+        encoded = _runner_path_segment(relative_path, absolute=relative_path.startswith("/"))
+        return (
+            f"/v1/sessions/{session_id}/resources/environments"
+            f"/{_runner_environment_segment(environment_id)}/filesystem/{encoded}"
+        )
+
+    def _browse_level(client_path: str, *, within_workspace: int) -> int:
+        """Permission level a filesystem request needs for *client_path*.
+
+        Inside the workspace, the caller's usual bar (``LEVEL_READ`` to read,
+        ``LEVEL_EDIT`` to mutate) — the workspace is the session's shared
+        context, so a collaborator granted the session gets it.
+
+        Outside it, ``LEVEL_OWNER``, for reads as much as writes. Everything
+        past the workspace is the owner's own machine, and the host-scoped
+        endpoint that already browses it (``/v1/hosts/{id}/filesystem``,
+        behind the workspace picker) is owner-scoped. Anything weaker here
+        would make a shared session a way around that check.
+
+        This is the ONLY place the boundary is decided. The runner is handed
+        the path and, for the owner, a ``scope=reach`` mark letting a
+        workspace symlink lead outside the workspace: it cannot see who is
+        asking, so it does not try to — it enforces the sandbox grants, this
+        enforces identity.
+
+        ``ntpath.isabs`` is used deliberately, and on every platform: it is
+        true for BOTH a POSIX leading slash (the wire form this API defines)
+        and a Windows drive or UNC root. A gate about identity has to fail
+        closed on anything that could be absolute *anywhere*, not just on the
+        shape the current deployment happens to send — otherwise a
+        ``C:\\Users\\...`` path would slip through at the collaborator level
+        and be stopped only by the runner rejecting it further down.
+
+        Note this is the AUTHORIZATION predicate, not the wire-format one.
+        Deciding how to encode the path for the runner stays
+        ``startswith("/")``, because that is a URL question and URLs use ``/``
+        on every platform. The two can disagree only for a Windows-style
+        path, where the result is a stricter gate plus a runner-side refusal
+        — closed on both counts.
+
+        :param client_path: Client-supplied path; a leading ``/`` is absolute.
+        :param within_workspace: Level required for a workspace-relative path.
+        :returns: The required permission level.
+        """
+        return LEVEL_OWNER if ntpath.isabs(client_path) else within_workspace
+
+    async def _authorize_browse_read(
+        session_id: str,
+        request: Request | None,
+        client_path: str = "",
+    ) -> Conversation:
+        """Authorize a workspace *content* read and return the conversation.
+
+        The read surfaces (file read/list, directory listing, changed files,
+        diffs, search, and the GitHub diff views) all serve the workspace's
+        own bytes or paths. An ABSOLUTE ``client_path`` is the owner's own
+        machine — owner-only, exactly as :func:`_browse_level` decides for a
+        mutation. A workspace-relative read needs ``LEVEL_EDIT`` *unless* the
+        session owner opted into ``share_workspace_files``, which lowers the
+        bar to ``LEVEL_READ``.
+
+        Fail-closed by default: a plain read grant shares the *conversation*,
+        not the raw filesystem — workspace files routinely hold secrets
+        (``.env`` / key files), so a read-only viewer sees nothing there until
+        the owner turns sharing on. The opt-in never widens absolute-path
+        browsing; that stays owner-only.
+
+        One :func:`require_access_and_level` round-trip resolves both the
+        caller's level and (via the conversation it returns) the session flag,
+        so the hot file-panel path pays no extra query in the common case.
+
+        :param session_id: Session/conversation identifier.
+        :param request: Incoming request; ``None`` for internal (no-auth)
+            calls, which are admitted at read level like ``_validate_session``.
+        :param client_path: Client-supplied path (``""`` for the whole-
+            workspace surfaces such as ``/changes``). A leading ``/`` — on any
+            platform — marks it absolute and forces the owner gate.
+        :returns: The authorized conversation.
+        :raises OmnigentError: 401/403/404 on auth failure.
+        """
+        conv, _owner = await _authorize_browse_read_with_owner(session_id, request, client_path)
+        return conv
+
+    async def _authorize_browse_read_with_owner(
+        session_id: str,
+        request: Request | None,
+        client_path: str = "",
+    ) -> tuple[Conversation, bool]:
+        """Authorize a workspace content read and say whether the caller is the owner.
+
+        The decision is :func:`_authorize_browse_read`'s. The flag reports
+        whether the caller also clears the owner bar :func:`_browse_level`
+        sets for anything past the workspace; it is ``True`` as well when no
+        identity gate applies (internal call, permissions disabled, admin).
+
+        :param session_id: Session/conversation identifier.
+        :param request: Incoming request, or ``None`` for internal calls.
+        :param client_path: Client-supplied path, as for
+            :func:`_authorize_browse_read`.
+        :returns: ``(conversation, owner)``.
+        :raises OmnigentError: 401/403/404 on auth failure.
+        """
+        if ntpath.isabs(client_path):
+            return await _validate_session(session_id, request, LEVEL_OWNER), True
+        if request is None:
+            return await _validate_session(session_id, request, LEVEL_READ), True
+        user_id = _get_user_id(request, auth_provider)
+        access = await _require_access_and_level(
+            user_id,
+            session_id,
+            LEVEL_READ,
+            permission_store,
+            conversation_store,
+        )
+        conv = access.conversation
+        if conv is None:
+            # Admin caller or permissions disabled: no conversation was fetched
+            # during authorization, so read it here (matching _validate_session).
+            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            if conv is None:
+                raise _session_not_found()
+        # ``level is None`` means permissions are disabled (single-user) or, on a
+        # child session, access inherited from the parent chain with no direct
+        # grant. Edit collaborators keep the workspace unconditionally; a
+        # view-only grant reaches it only once the owner shares its files.
+        if access.level is None or access.level >= LEVEL_EDIT or conv.share_workspace_files:
+            return conv, await _owns_session(user_id, conv, access.level)
+        raise OmnigentError(
+            f"{user_id!r} needs edit access to browse the workspace of session "
+            f"{session_id!r}, or the owner must enable file sharing",
+            code=ErrorCode.FORBIDDEN,
+        )
+
+    async def _owns_session(user_id: str | None, conv: Conversation, level: int | None) -> bool:
+        """Whether the caller clears the owner bar :func:`_browse_level` sets.
+
+        The same decision ``_validate_session(..., LEVEL_OWNER)`` makes, without
+        raising: permissions disabled, an admin or direct owner grant, or — on a
+        child session — ownership resolved through the parent chain, which is
+        the only case that costs a further lookup.
+
+        :param user_id: The authenticated user.
+        :param conv: The conversation already authorized for reading.
+        :param level: The caller's direct level from that authorization, or
+            ``None`` when permissions are disabled or no direct grant exists.
+        :returns: ``True`` for an effective owner.
+        """
+        if permission_store is None:
+            return True
+        if conv.parent_conversation_id is not None:
+            return await asyncio.to_thread(
+                check_session_access,
+                user_id,
+                conv.parent_conversation_id,
+                LEVEL_OWNER,
+                permission_store,
+                conversation_store,
+            )
+        return level is not None and level >= LEVEL_OWNER
+
+    def _resolve_browse_path(request: Request, client_path: str) -> tuple[bool, str]:
+        """Resolve a filesystem request path against its declared base.
+
+        The ``{path}`` segment names a location two ways can reach:
+
+        - **workspace-relative** (``base=workspace``, the default) — a path
+          under the session's workspace root, e.g. ``src/app.ts``.
+        - **host-absolute** (``base=host``) — an absolute path on the host,
+          sent WITHOUT its leading slash so the ``{path}`` converter carries
+          it, exactly as ``/v1/hosts/{id}/filesystem/{path}`` already does.
+          The leading slash is re-added here.
+
+        Naming the base in the query — rather than marking absolute paths with
+        a leading ``%2F`` in the segment — is what makes browsing outside the
+        workspace survive a reverse proxy. A leading ``%2F`` decodes to a
+        boundary ``//`` that proxies such as the Databricks Apps front door
+        merge back to a single ``/`` (``//x`` 301-redirects to ``/x``), which
+        silently turns ``/Users/me`` into a workspace-relative ``Users/me`` and
+        lists a nonexistent path. A query value rides through that merge
+        untouched, and a plain path segment never forms a ``//`` to begin with.
+
+        A genuine leading slash on ``{path}`` is still honored, so a direct
+        (unproxied) caller that sends ``%2F`` keeps working.
+
+        :param request: Incoming request, for the ``base`` query value.
+        :param client_path: Path captured from the route's ``{path}``.
+        :returns: ``(absolute, path)`` — ``path`` carries a leading slash iff
+            ``absolute``.
+        """
+        absolute = request.query_params.get("base") == "host" or client_path.startswith("/")
+        if absolute:
+            return True, "/" + client_path.lstrip("/")
+        return False, client_path
+
+    async def _authorize_absolute_browse(
+        conversation: Conversation,
+        absolute_path: str,
+    ) -> str:
+        """Authorize an absolute browse target for the host-served path.
+
+        :param conversation: Conversation loaded during authorization.
+        :param absolute_path: Absolute path the caller asked for.
+        :returns: The resolved, authorized absolute path.
+        :raises HTTPException: 403 when no grant covers it and the
+            environment is confined.
+        """
+        from omnigent.entities.environment_filesystem import PathUnreachable
+        from omnigent.runner.environment_filesystem import resolve_browse_target
+
+        reach = await _environment_reach_for_session(conversation)
+        if reach is None:
+            raise HTTPException(status_code=403, detail="session has no browsable environment")
+        roots, unconfined, _workspace = reach
+        try:
+            return str(resolve_browse_target(absolute_path, roots, unconfined=unconfined))
+        except PathUnreachable as exc:
+            raise HTTPException(status_code=403, detail=exc.message) from exc
+
+    async def _read_workspace_via_host(
+        session_id: str,
+        conversation: Conversation,
+        op: str,
+        host_params: dict[str, Any],
+        *,
+        workspace_override: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Read the session's workspace over its host tunnel.
+
+        :param session_id: Session/conversation identifier.
+        :param conversation: Conversation loaded during authorization.
+        :param op: Host-side op name.
+        :param host_params: Op-specific args for the host reader.
+        :returns: The runner-shaped result, or ``None`` when no host is
+            bound / connected / reachable (caller falls back to 503).
+        :raises HTTPException: On host-reported filesystem failures,
+            reproducing the runner's status.
+        """
+        from omnigent.server.routes._host_filesystem import (
+            HostFsError,
+            HostFsUnavailableError,
+            read_workspace_from_host,
+        )
+
+        if host_registry is None:
+            return None
+        if not conversation.host_id or not conversation.workspace:
+            return None
+        host_conn = host_registry.get(conversation.host_id)
+        if host_conn is None:
+            return None
+        try:
+            return await read_workspace_from_host(
+                host_registry=host_registry,
+                host_conn=host_conn,
+                op=op,
+                workspace=workspace_override or conversation.workspace,
+                session_id=session_id,
+                params=host_params,
+            )
+        except HostFsUnavailableError:
+            return None
+        except HostFsError as exc:
+            if exc.status == 404:
+                raise OmnigentError(exc.message, code=ErrorCode.NOT_FOUND) from exc
+            if exc.status == 400:
+                # Invalid path is a client error; surface it verbatim like the
+                # runner's 400 rather than collapsing it to a 502.
+                raise HTTPException(status_code=400, detail=exc.message) from exc
+            # Any other host FS failure (e.g. git_status_failed 500) mirrors the
+            # runner proxy, which wraps non-200/404 responses as a 502.
+            raise HTTPException(status_code=502, detail=exc.message) from exc
+
+    async def _write_workspace_via_host(
+        session_id: str,
+        conversation: Conversation,
+        op: str,
+        host_params: dict[str, Any],
+        timeout: float | None = None,
+        uncertain_failure_detail: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Serve a workspace-mutating op over the session's host tunnel.
+
+        The write counterpart of :func:`_read_workspace_via_host`, for when the
+        runner is offline but the host holding the workspace is connected.
+
+        :param op: Host-side write op — ``"github_set_preference"``,
+            ``"github_prs_update"``, ``"github_labels_update"``,
+            ``"github_reviewers_update"``, ``"github_details_update"``,
+            ``"github_comment_create"``, ``"github_attachment_upload"``, ``"github_merge"``, or
+            ``"github_disable_auto_merge"``.
+        :param host_params: Op-specific args for the host writer.
+        :param timeout: Seconds to wait for the host; the tunnel's default when ``None``.
+        :param uncertain_failure_detail: Report a dispatched write's unavailable result
+            as 502 with this detail instead of treating it as an offline host.
+        :returns: The refreshed payload, or ``None`` when no host is bound /
+            connected / reachable (caller re-raises the runner-offline error).
+        :raises HTTPException: On host-reported failures, reproducing the runner's
+            status.
+        """
+        from omnigent.server.routes._host_filesystem import (
+            HostFsError,
+            HostFsUnavailableError,
+            write_workspace_from_host,
+        )
+
+        if host_registry is None:
+            return None
+        if not conversation.host_id or not conversation.workspace:
+            return None
+        host_conn = host_registry.get(conversation.host_id)
+        if host_conn is None:
+            return None
+        try:
+            return await write_workspace_from_host(
+                host_registry=host_registry,
+                host_conn=host_conn,
+                op=op,
+                workspace=conversation.workspace,
+                session_id=session_id,
+                params=host_params,
+                **({"timeout": timeout} if timeout is not None else {}),
+            )
+        except HostFsUnavailableError as exc:
+            if uncertain_failure_detail is not None:
+                raise HTTPException(status_code=502, detail=uncertain_failure_detail) from exc
+            return None
+        except HostFsError as exc:
+            if exc.status == 400:
+                raise HTTPException(status_code=400, detail=exc.message) from exc
+            raise HTTPException(status_code=502, detail=exc.message) from exc
+
+    async def _post_pr_edit(
+        session_id: str,
+        conv: Conversation,
+        *,
+        runner_path: str,
+        host_op: str,
+        params: dict[str, Any],
+        failure_detail: str,
+        non_idempotent: bool = False,
+    ) -> dict[str, Any]:
+        """POST a PR edit to the runner, or to the host tunnel when the runner is offline.
+
+        :param host_op: Host-side write op, e.g. ``"github_merge"``.
+        :param failure_detail: Error detail when the runner's refusal carries none.
+        :param non_idempotent: Preserve uncertainty when the host loses a write result.
+        :returns: The runner's or host's result.
+        :raises HTTPException: With the runner's status and ``detail`` when it refuses.
+        """
+        params = await _github_params(session_id, params)
+        try:
+            status, result = await _proxy_post_to_runner(
+                session_id, runner_path, params, conv, timeout=_PR_EDIT_PROXY_TIMEOUT_S
+            )
+        except OmnigentError as exc:
+            if exc.code != ErrorCode.RUNNER_UNAVAILABLE:
+                raise
+            payload = await _write_workspace_via_host(
+                session_id,
+                conv,
+                op=host_op,
+                host_params=params,
+                uncertain_failure_detail=failure_detail if non_idempotent else None,
+            )
+            if payload is None:
+                raise
+            return payload
+        if status >= 400:
+            raise HTTPException(status_code=status, detail=result.get("detail", failure_detail))
+        return result
+
+    async def _proxy_post_to_runner(
+        session_id: str,
+        path: str,
+        body: dict[str, Any],
+        conversation: Conversation,
+        *,
+        timeout: float = 10.0,
+    ) -> tuple[int, dict[str, Any]]:
+        """Proxy a POST request to the runner and return status + JSON.
+
+        :param session_id: Session/conversation identifier.
+        :param path: Runner-relative URL path.
+        :param body: JSON body to forward.
+        :param conversation: Conversation loaded during authorization.
+        :param timeout: Seconds to wait for the runner's response.
+        :returns: Tuple of (status_code, parsed_json_body).
+        :raises HTTPException: On transport failure or an unreadable runner reply.
+        """
+        runner_client = await _get_runner_client_for_resource_access(
+            session_id,
+            conversation=conversation,
+        )
+        if runner_client is None:
+            raise HTTPException(
+                status_code=502,
+                detail="no runner available for resource access",
+            )
+        try:
+            resp = await runner_client.post(
+                path,
+                json=body,
+                timeout=timeout,
+            )
+        except (httpx.HTTPError, ConnectionError) as exc:
+            raise HTTPException(
+                status_code=502,
+                detail="runner resource endpoint unavailable",
+            ) from exc
+        return resp.status_code, _runner_resource_write_payload(
+            resp, session_id=session_id, method="POST"
+        )
+
+    async def _proxy_delete_to_runner(
+        session_id: str,
+        path: str,
+        conversation: Conversation,
+    ) -> tuple[int, dict[str, Any]]:
+        """Proxy a DELETE request to the runner and return status + JSON.
+
+        :param session_id: Session/conversation identifier.
+        :param path: Runner-relative URL path.
+        :param conversation: Conversation loaded during authorization.
+        :returns: Tuple of (status_code, parsed_json_body).
+        :raises HTTPException: On transport failure or an unreadable runner reply.
+        """
+        runner_client = await _get_runner_client_for_resource_access(
+            session_id,
+            conversation=conversation,
+        )
+        if runner_client is None:
+            raise HTTPException(
+                status_code=502,
+                detail="no runner available for resource access",
+            )
+        try:
+            resp = await runner_client.delete(path, timeout=10.0)
+        except (httpx.HTTPError, ConnectionError) as exc:
+            raise HTTPException(
+                status_code=502,
+                detail="runner resource endpoint unavailable",
+            ) from exc
+        return resp.status_code, _runner_resource_write_payload(
+            resp, session_id=session_id, method="DELETE"
+        )
+
+    async def _proxy_put_to_runner(
+        session_id: str,
+        path: str,
+        body: dict[str, Any],
+        conversation: Conversation,
+    ) -> tuple[int, dict[str, Any]]:
+        """Proxy a PUT request to the runner.
+
+        :param session_id: Session/conversation identifier.
+        :param path: Runner-relative URL path.
+        :param body: JSON body to forward.
+        :param conversation: Conversation loaded during authorization.
+        :returns: Tuple of (status_code, parsed_json_body).
+        :raises HTTPException: On transport failure or an unreadable runner reply.
+        """
+        runner_client = await _get_runner_client_for_resource_access(
+            session_id,
+            conversation=conversation,
+        )
+        if runner_client is None:
+            raise HTTPException(
+                status_code=502,
+                detail="no runner available for resource access",
+            )
+        try:
+            resp = await runner_client.put(
+                path,
+                json=body,
+                timeout=10.0,
+            )
+        except (httpx.HTTPError, ConnectionError) as exc:
+            raise HTTPException(
+                status_code=502,
+                detail="runner resource endpoint unavailable",
+            ) from exc
+        return resp.status_code, _runner_resource_write_payload(
+            resp, session_id=session_id, method="PUT"
+        )
+
+    async def _proxy_patch_to_runner(
+        session_id: str,
+        path: str,
+        body: dict[str, Any],
+        conversation: Conversation,
+    ) -> tuple[int, dict[str, Any]]:
+        """Proxy a PATCH request to the runner.
+
+        :param session_id: Session/conversation identifier.
+        :param path: Runner-relative URL path.
+        :param body: JSON body to forward.
+        :param conversation: Conversation loaded during authorization.
+        :returns: Tuple of (status_code, parsed_json_body).
+        :raises HTTPException: On transport failure or an unreadable runner reply.
+        """
+        runner_client = await _get_runner_client_for_resource_access(
+            session_id,
+            conversation=conversation,
+        )
+        if runner_client is None:
+            raise HTTPException(
+                status_code=502,
+                detail="no runner available for resource access",
+            )
+        try:
+            resp = await runner_client.patch(
+                path,
+                json=body,
+                timeout=10.0,
+            )
+        except (httpx.HTTPError, ConnectionError) as exc:
+            raise HTTPException(
+                status_code=502,
+                detail="runner resource endpoint unavailable",
+            ) from exc
+        return resp.status_code, _runner_resource_write_payload(
+            resp, session_id=session_id, method="PATCH"
+        )
+
+    # Typed collection routes registered BEFORE /{resource_id} so
+    # "environments", "terminals", "files" are not captured as ids.
+
+    @router.get(
+        "/sessions/{session_id}/resources/environments",
+        response_model=None,
+    )
+    async def list_session_environments(
+        request: Request,
+        session_id: str,
+    ) -> dict[str, Any]:
+        """
+        Return only environment resources for a session.
+
+        :param request: The incoming FastAPI request (for auth).
+        :param session_id: Session/conversation identifier.
+        :returns: ``PaginatedList`` of environment resources.
+        """
+        conv = await _validate_session(session_id, request, LEVEL_READ)
+        path = f"/v1/sessions/{session_id}/resources/environments"
+        return await _proxy_get_to_runner(session_id, path, conv)
+
+    @router.get(
+        "/sessions/{session_id}/resources/environments/{environment_id}",
+        response_model=None,
+    )
+    async def get_session_environment(
+        request: Request,
+        session_id: str,
+        environment_id: str,
+    ) -> dict[str, Any]:
+        """
+        Return a single environment resource by id.
+
+        :param request: The incoming FastAPI request (for auth).
+        :param session_id: Session/conversation identifier.
+        :param environment_id: Opaque environment resource id,
+            e.g. ``"default"``.
+        :returns: The environment resource object.
+        """
+        conv = await _validate_session(session_id, request, LEVEL_READ)
+        path = (
+            f"/v1/sessions/{session_id}/resources/environments"
+            f"/{_runner_environment_segment(environment_id)}"
+        )
+        try:
+            return await _proxy_get_to_runner(session_id, path, conv)
+        except OmnigentError as exc:
+            if exc.code != ErrorCode.RUNNER_UNAVAILABLE:
+                raise
+            # Runner offline but host-bound: synthesize the default
+            # environment so the file panel (which gates on this metadata)
+            # keeps browsing the host-served workspace at ``conv.workspace``.
+            synthesized = await _synthesize_offline_environment(conv, environment_id)
+            if synthesized is None:
+                raise
+            return synthesized
+
+    async def _synthesize_offline_environment(
+        conversation: Conversation,
+        environment_id: str,
+    ) -> dict[str, Any] | None:
+        """Build a default-environment resource from the bound workspace.
+
+        Used when the runner is offline but the session is host-bound, so
+        the file panel's environment probe resolves and browsing can
+        proceed against the host-served workspace.
+
+        :param conversation: Conversation loaded during authorization.
+        :param environment_id: Requested environment id; only the default
+            environment is synthesized.
+        :returns: An environment resource dict carrying ``metadata.root``
+            and (when the spec resolves) ``metadata.reachable``, or ``None``
+            when not applicable (non-default env, no host, no workspace).
+        """
+        if environment_id != "default" or host_registry is None:
+            return None
+        if not conversation.host_id or not conversation.workspace:
+            return None
+        if host_registry.get(conversation.host_id) is None:
+            return None
+
+        from omnigent.inner.sandbox import reach_payload
+
+        metadata: dict[str, Any] = {"root": conversation.workspace}
+        # Advertise the same reach the runner would. Without it the file
+        # panel reads "nothing else reachable" and silently drops its
+        # navigation affordance the moment the agent sleeps -- even though
+        # the host-served path authorizes and serves absolute browsing
+        # exactly as the live runner does.
+        reach = await _environment_reach_for_session(conversation)
+        if reach is not None:
+            roots, unconfined, _workspace = reach
+            metadata["reachable"] = reach_payload(roots, unconfined=unconfined)
+        return {
+            "id": environment_id,
+            "object": "session.resource",
+            "type": "environment",
+            "metadata": metadata,
+        }
+
+    @router.get(
+        "/sessions/{session_id}/resources/terminals",
+        response_model=None,
+    )
+    async def list_session_terminals(
+        request: Request,
+        session_id: str,
+    ) -> dict[str, Any]:
+        """
+        Return only terminal resources for a session.
+
+        The runner endpoint's pagination params (``limit`` / ``after`` /
+        ``before`` / ``order``) are forwarded from the incoming query
+        string — without this, a client-requested ``order=asc`` (the web
+        terminal tabs rely on creation order to keep the session's own
+        terminal first) would be silently dropped and the runner's
+        ``desc`` default would apply.
+
+        :param request: The incoming FastAPI request (for auth and the
+            forwarded query params).
+        :param session_id: Session/conversation identifier.
+        :returns: ``PaginatedList`` of terminal resources.
+        """
+        conv = await _validate_session(session_id, request, LEVEL_READ)
+        path = f"/v1/sessions/{session_id}/resources/terminals"
+        forwarded = {
+            key: value
+            for key, value in request.query_params.items()
+            if key in ("limit", "after", "before", "order")
+        }
+        page = await _proxy_get_to_runner(
+            session_id,
+            path,
+            conv,
+            params=forwarded or None,
+        )
+        await _annotate_direct_attach(page, session_id, request)
+        return page
+
+    async def _caller_owns_session(session_id: str, request: Request) -> bool:
+        """Return whether the requester holds owner-level access.
+
+        Non-raising variant of the owner gate used for optional
+        enrichment: an interactive (write) attach requires owner level
+        (see ``terminal_attach._authorize_terminal_attach``), so the
+        direct-attach token — which grants write attach without a
+        server-side check — may only be disclosed to owners. Mirrors
+        the relay's permissions-disabled behavior: no permission store
+        means single-user mode, where the caller is the owner.
+
+        :param session_id: Session/conversation identifier.
+        :param request: The incoming request carrying auth context.
+        :returns: ``True`` when disclosure is allowed.
+        """
+        if permission_store is None:
+            return True
+        user_id = _get_user_id(request, auth_provider)
+        if user_id is None:
+            return False
+        try:
+            await _require_access_and_level(
+                user_id,
+                session_id,
+                LEVEL_OWNER,
+                permission_store,
+                conversation_store,
+            )
+        except OmnigentError:
+            return False
+        return True
+
+    async def _annotate_direct_attach(
+        page: dict[str, Any],
+        session_id: str,
+        request: Request,
+    ) -> None:
+        """Add ``metadata.direct_attach_url`` to each terminal item.
+
+        Best-effort enrichment for browsers running on the same machine
+        as the session's runner: when the runner advertised a loopback
+        attach listener over its tunnel and the caller is the session
+        owner, each terminal gains a ``ws://127.0.0.1:...`` URL the
+        client may *try* before the relay path. Any miss — no resolver
+        installed, runner offline, no advert, non-owner caller — leaves
+        the payload untouched, so the relay path is unaffected.
+
+        :param page: The runner's ``PaginatedList`` JSON, mutated in place.
+        :param session_id: Session/conversation identifier.
+        :param request: The incoming request carrying auth context.
+        """
+        from omnigent.runtime import get_runner_direct_attach_resolver
+
+        resolver = get_runner_direct_attach_resolver()
+        if resolver is None:
+            return
+        endpoint = resolver(session_id)
+        if endpoint is None:
+            return
+        if not await _caller_owns_session(session_id, request):
+            return
+        items = page.get("data")
+        if not isinstance(items, list):
+            return
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            terminal_id = item.get("id")
+            if not isinstance(terminal_id, str) or not terminal_id:
+                continue
+            metadata = item.get("metadata")
+            if not isinstance(metadata, dict):
+                metadata = {}
+                item["metadata"] = metadata
+            metadata["direct_attach_url"] = (
+                f"ws://127.0.0.1:{endpoint.port}/v1/sessions/{session_id}"
+                f"/resources/terminals/{terminal_id}/attach?token={endpoint.token}"
+            )
+
+    @router.post(
+        "/sessions/{session_id}/resources/terminals",
+        response_model=None,
+        # CSRF hardening: body is parsed via request.json(); require a JSON
+        # Content-Type so a cross-site text/plain request can't reach it.
+        dependencies=[Depends(require_json_content_type)],
+    )
+    async def create_session_terminal(
+        session_id: str,
+        request: Request,
+    ) -> Any:
+        """
+        Launch or return an existing terminal resource.
+
+        Preserves ``sys_terminal_launch`` idempotency: an
+        already-running ``(terminal, session_key)`` returns the
+        existing resource.
+
+        User-initiated creates are gated on the agent's terminal
+        access: the requested ``terminal`` must be one of the names
+        declared in the agent spec's ``terminals:`` block. Native
+        harness bootstrap requests (marked ``ensure_native_terminal``
+        or ``bridge_inject_dir`` — the ``omnigent claude`` / ``codex``
+        wrappers launching the session's own CLI terminal) are exempt:
+        they launch undeclared names via the runner's
+        synthesize-from-body path and predate the gate. The markers
+        are client-controlled, so the exemption is narrowed to the
+        exact shape those wrappers send — a registered native terminal
+        name with ``session_key`` ``"main"`` — anything else carrying a
+        marker still goes through the declared-name gate (it would
+        otherwise be an arbitrary-terminal bypass).
+
+        :param session_id: Session/conversation identifier.
+        :param request: JSON body with ``terminal`` and
+            ``session_key``.
+        :returns: The terminal resource object.
+        :raises OmnigentError: 400 when the requested terminal is not
+            declared by the agent spec (or the agent has no
+            ``terminals:`` block at all).
+        """
+        conv = await _validate_session(session_id, request, LEVEL_EDIT)
+        body = await request.json()
+        is_native_bootstrap = (
+            bool(body.get("ensure_native_terminal") or body.get("bridge_inject_dir"))
+            and native_coding_agent_for_terminal_name(body.get("terminal")) is not None
+            and body.get("session_key") == "main"
+        )
+        if not is_native_bootstrap:
+            spec = await asyncio.to_thread(_load_agent_spec_for_session, conv, agent_store)
+            declared = list(spec.terminals or {}) if spec is not None else []
+            if (
+                spec is not None
+                and conv.host_id is not None
+                and host_registry is not None
+                and native_coding_agent_for_agent_name(spec.name) is not None
+            ):
+                reported = host_interactive_shells_for_request(
+                    conv.host_id,
+                    host_registry=host_registry,
+                    runner_router=runner_router or get_server_runner_router(),
+                )
+                if reported:
+                    declared = reported
+            if body.get("terminal") not in declared:
+                raise OmnigentError(
+                    (
+                        f"Terminal {body.get('terminal')!r} is not declared by this "
+                        f"agent. Terminals can only be created for agents whose spec "
+                        f"declares them; this agent declares: {declared or 'none'}."
+                    ),
+                    code=ErrorCode.INVALID_INPUT,
+                )
+        # A session whose runner merely went to sleep (host still up, or a
+        # resumable managed sandbox) is transparently reconnected here, so
+        # opening a shell from the web wakes it instead of dead-ending on a
+        # 502 — the same relaunch the next chat message would trigger. Only
+        # the wakeable states recover; a non-host-bound stranded session or an
+        # offline external host still falls through to the 502 below (the CLI
+        # reconnect path owns those).
+        # Reuse the refreshed row returned after any wake or relaunch because
+        # the runner binding may have changed.
+        _, conv = await ensure_runner_connected(
+            session_id=session_id,
+            conv=conv,
+            app_state=request.app.state,
+            conversation_store=conversation_store,
+            runner_router=runner_router or get_server_runner_router(),
+        )
+        path = f"/v1/sessions/{session_id}/resources/terminals"
+        router = runner_router or get_server_runner_router()
+        if router is not None:
+            await asyncio.to_thread(router.require_mcp_registry_support, conv)
+        status, payload = await _proxy_post_to_runner(
+            session_id,
+            path,
+            body,
+            conv,
+        )
+        if status >= 400:
+            error = payload.get("error", {})
+            # OmnigentError derives http_status from code; pass the runner's code, not a status.
+            raise OmnigentError(
+                error.get("message", f"Terminal launch failed (runner returned HTTP {status})"),
+                code=error.get("code", ErrorCode.INTERNAL_ERROR),
+            )
+        _publish_and_persist_resource_event(
+            session_id,
+            "session.resource.created",
+            resource_id=payload.get("id", ""),
+            resource_type="terminal",
+            conversation_store=conversation_store,
+            resource=payload,
+        )
+        return payload
+
+    @router.get(
+        "/sessions/{session_id}/resources/terminals/{terminal_id}",
+        response_model=None,
+    )
+    async def get_session_terminal(
+        request: Request,
+        session_id: str,
+        terminal_id: str,
+    ) -> dict[str, Any]:
+        """
+        Return a single terminal resource by id.
+
+        :param request: The incoming FastAPI request (for auth).
+        :param session_id: Session/conversation identifier.
+        :param terminal_id: Opaque terminal resource id.
+        :returns: The terminal resource object.
+        """
+        conv = await _validate_session(session_id, request, LEVEL_READ)
+        path = f"/v1/sessions/{session_id}/resources/terminals/{terminal_id}"
+        return await _proxy_get_to_runner(session_id, path, conv)
+
+    @router.get("/sessions/{session_id}/sign-in-link", response_model=None)
+    async def get_session_sign_in_link(request: Request, session_id: str) -> dict[str, Any]:
+        """
+        Return the sign-in link the session's terminal is waiting on right now.
+
+        Asked by the error card at click time, so the user opens the live
+        prompt rather than a link saved earlier that its launcher process has
+        since abandoned.
+
+        :param request: The incoming FastAPI request (for auth).
+        :param session_id: Session/conversation identifier.
+        :returns: The runner's ``{"pending", "url", "code", "terminal_id"}`` payload.
+        """
+        conv = await _validate_session(session_id, request, LEVEL_READ)
+        return await _proxy_get_to_runner(
+            session_id, f"/v1/sessions/{session_id}/sign-in-link", conv
+        )
+
+    @router.post(
+        "/sessions/{session_id}/resources/terminals/{terminal_id}/transfer",
+        # Internal terminal transfer — hidden from the public API reference.
+        include_in_schema=False,
+        response_model=None,
+        # CSRF hardening: body is parsed via request.json(); require a JSON
+        # Content-Type so a cross-site text/plain request can't reach it.
+        dependencies=[Depends(require_json_content_type)],
+    )
+    async def transfer_session_terminal(
+        request: Request,
+        session_id: str,
+        terminal_id: str,
+    ) -> Any:
+        """
+        Move a terminal resource to another session without closing it.
+
+        Used by native Claude ``/clear`` rotation: ownership changes
+        from the previous conversation to the fresh one while the tmux
+        pane keeps running. A successful transfer also carries the
+        source host, workspace, and git branch to the target because the
+        live terminal remains on that same placement. The caller must own
+        both sessions and the source host.
+
+        :param request: The incoming FastAPI request (for auth) with
+            JSON body ``{"target_session_id": "conv_new"}``.
+        :param session_id: Current owning session/conversation id,
+            e.g. ``"conv_old"``.
+        :param terminal_id: Opaque terminal resource id,
+            e.g. ``"terminal_claude_main"``.
+        :returns: The terminal resource object under the target session.
+        """
+        conv = await _validate_session(session_id, request, LEVEL_OWNER)
+        body = await request.json()
+        target_session_id = body.get("target_session_id") if isinstance(body, dict) else None
+        if not isinstance(target_session_id, str) or not target_session_id:
+            raise OmnigentError(
+                "'target_session_id' is required",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        await _validate_session(target_session_id, request, LEVEL_OWNER)
+
+        user_id = _get_user_id(request, auth_provider)
+        # Sub-agents inherit their parent's host; check the host the terminal runs on.
+        source_host_id = await asyncio.to_thread(routing_host_id, conv, conversation_store)
+        if source_host_id is not None and user_id is not None:
+            host_store = getattr(request.app.state, "host_store", None)
+            if host_store is None:
+                raise OmnigentError(
+                    "Host ownership cannot be verified",
+                    code=ErrorCode.FORBIDDEN,
+                )
+            await asyncio.to_thread(
+                resolve_host_owner,
+                user_id=user_id,
+                host_id=source_host_id,
+                host_store=host_store,
+            )
+
+        path = f"/v1/sessions/{session_id}/resources/terminals/{terminal_id}/transfer"
+        status, payload = await _proxy_post_to_runner(
+            session_id,
+            path,
+            {"target_session_id": target_session_id},
+            conv,
+        )
+        if status == 404:
+            error = payload.get("error", {})
+            raise OmnigentError(
+                error.get("message", "Terminal not found"),
+                code=ErrorCode.NOT_FOUND,
+            )
+        if status == 409:
+            error = payload.get("error", {})
+            # The target session already owns a terminal under this name, which
+            # is a state conflict and not a malformed request: INVALID_INPUT
+            # would surface it as a 400 and tell the caller to fix its input.
+            raise OmnigentError(
+                error.get("message", "Terminal transfer conflict"),
+                code=ErrorCode.CONFLICT,
+            )
+        if status >= 400:
+            error = payload.get("error", {})
+            # OmnigentError derives http_status from code; pass the runner's code, not a status.
+            raise OmnigentError(
+                error.get("message", "Terminal transfer failed"),
+                code=error.get("code", ErrorCode.INTERNAL_ERROR),
+            )
+
+        if conv.host_id is not None:
+            await asyncio.to_thread(
+                conversation_store.set_host_id,
+                target_session_id,
+                conv.host_id,
+                conv.workspace,
+                conv.git_branch,
+            )
+
+        _publish_and_persist_resource_event(
+            session_id,
+            "session.resource.deleted",
+            resource_id=terminal_id,
+            resource_type="terminal",
+            conversation_store=conversation_store,
+        )
+        _publish_and_persist_resource_event(
+            target_session_id,
+            "session.resource.created",
+            resource_id=payload.get("id", ""),
+            resource_type="terminal",
+            conversation_store=conversation_store,
+            resource=payload,
+        )
+        return payload
+
+    @router.delete(
+        "/sessions/{session_id}/resources/terminals/{terminal_id}",
+        response_model=None,
+    )
+    async def delete_session_terminal(
+        request: Request,
+        session_id: str,
+        terminal_id: str,
+    ) -> Any:
+        """
+        Close a terminal resource.
+
+        Delegates to ``TerminalRegistry.close()`` on the runner.
+        Returns 404 for unknown terminals.
+
+        :param request: The incoming FastAPI request (for auth).
+        :param session_id: Session/conversation identifier.
+        :param terminal_id: Opaque terminal resource id.
+        :returns: Deletion confirmation object.
+        """
+        conv = await _validate_session(session_id, request, LEVEL_EDIT)
+        path = f"/v1/sessions/{session_id}/resources/terminals/{terminal_id}"
+        status, payload = await _proxy_delete_to_runner(
+            session_id,
+            path,
+            conv,
+        )
+        if status == 404:
+            error = payload.get("error", {})
+            raise OmnigentError(
+                error.get("message", "Terminal not found"),
+                code=ErrorCode.NOT_FOUND,
+            )
+        if status >= 400:
+            raise HTTPException(
+                status_code=502,
+                detail="runner terminal delete failed",
+            )
+        _publish_and_persist_resource_event(
+            session_id,
+            "session.resource.deleted",
+            resource_id=terminal_id,
+            resource_type="terminal",
+            conversation_store=conversation_store,
+        )
+        return payload
+
+    # ── Phase 1c: session-scoped file endpoints ────────────────────
+
+    @router.get(
+        "/sessions/{session_id}/resources/files",
+        response_model=None,
+    )
+    async def list_session_files(
+        request: Request,
+        session_id: str,
+        limit: int = Query(default=20, ge=1, le=1000),
+        after: str | None = Query(default=None),
+        before: str | None = Query(default=None),
+        order: str = Query(default="desc", pattern="^(asc|desc)$"),
+    ) -> dict[str, Any]:
+        """
+        List files owned by a session.
+
+        :param session_id: Session/conversation identifier.
+        :param limit: Maximum number of files to return.
+        :param after: Cursor file ID for forward pagination.
+        :param before: Cursor file ID for backward pagination.
+        :param order: Sort direction, ``"desc"`` or ``"asc"``.
+        :returns: ``PaginatedList`` of session file resources.
+        """
+        await _validate_session(session_id, request, LEVEL_READ)
+        if file_store is None:
+            raise HTTPException(
+                status_code=501,
+                detail="file store not configured",
+            )
+        page = file_store.list(
+            session_id=session_id,
+            limit=limit,
+            after=after,
+            before=before,
+            order=order,
+        )
+        data = [_stored_file_to_resource(session_id, f) for f in page.data]
+        return {
+            "object": "list",
+            "data": data,
+            "first_id": page.first_id,
+            "last_id": page.last_id,
+            "has_more": page.has_more,
+        }
+
+    @router.post(
+        "/sessions/{session_id}/resources/files",
+        status_code=201,
+        response_model=None,
+        # CSRF hardening: this route only accepts multipart/form-data, which
+        # is CORS-safelisted, so a content-type guard can't stop a cross-site
+        # upload. require_trusted_origin closes the gap (allows absent Origin
+        # for the non-browser SDK/runner clients; in local mode a present
+        # Origin must be loopback).
+        dependencies=[Depends(require_trusted_origin)],
+    )
+    async def upload_session_file(
+        request: Request,
+        session_id: str,
+        file: Annotated[UploadFile, File(...)],
+    ) -> dict[str, Any]:
+        """
+        Upload a file into the session file namespace.
+
+        Accepts the multipart upload shape used by session file resources.
+
+        :param request: The incoming FastAPI request (for auth).
+        :param session_id: Session/conversation identifier.
+        :param file: The uploaded file (multipart form data).
+        :returns: The session file resource object.
+        """
+        return await _store_session_file(request, session_id, file)
+
+    async def _store_session_file(
+        request: Request, session_id: str, file: UploadFile, *, initial_input: bool = False
+    ) -> dict[str, Any]:
+        conv = await _validate_session(session_id, request, LEVEL_EDIT)
+        if file_store is None or artifact_store is None:
+            raise HTTPException(
+                status_code=501,
+                detail="file store not configured",
+            )
+        if not file.filename:
+            raise OmnigentError(
+                "filename is required",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        from omnigent.inner.native_attachments import (
+            DELIVERY_KEY,
+            FILESYSTEM_DELIVERY,
+            filesystem_attachment_capability,
+            requires_filesystem,
+        )
+        from omnigent.runtime.content_resolver import (
+            _COMPRESSIBLE_IMAGE_MIMES,
+            MAX_ATTACHMENT_UPLOAD_BYTES,
+            ImageCompressionError,
+            _resolve_content_type,
+            attachment_delivery,
+            attachment_text_type_for_extension,
+            attachment_upload_limit,
+            compress_image_attachment,
+            image_filename_for_content_type,
+            image_needs_compression,
+        )
+
+        # Validate the type and limits before buffering the file.
+        content_type = _resolve_content_type(
+            file.content_type,
+            file.filename,
+        )
+        # Listed extensions are checked by name first so a misleading MIME cannot
+        # skip the harness requirement or the quotas for files that need local tools.
+        policy = _filesystem_attachment_policy(request.app.state)
+        delivery = attachment_delivery(file.filename, file.content_type, policy)
+        filesystem_required = delivery == "filesystem"
+        if filesystem_required or requires_filesystem(file.filename):
+            # Drop the declared type so the file is never stored as text, even
+            # when the policy leaves its extension out.
+            content_type = _resolve_content_type("application/octet-stream", file.filename)
+        if filesystem_required:
+            if initial_input:
+                # The host does not exist yet; dispatch validates its runtime after provisioning.
+                await _require_filesystem_attachment_harness(conv, file.filename)
+            else:
+                await _require_filesystem_attachment_support(
+                    request,
+                    conv,
+                    file.filename,
+                    filesystem_attachment_capability([file.filename]),
+                )
+        # Hold the quota check through the store below, so parallel uploads can't
+        # all spend the same remaining allowance.
+        attachment_lock = (
+            _attachment_upload_lock(session_id)
+            if filesystem_required
+            else contextlib.nullcontext()
+        )
+        async with attachment_lock:
+            if filesystem_required:
+                read_limit = _enforce_filesystem_attachment_policy(
+                    [file.filename],
+                    session_id=session_id,
+                    file_store=file_store,
+                )
+            else:
+                type_limit = attachment_upload_limit(content_type)
+                if type_limit is None:
+                    # The browser/OS can mislabel a text/code file as binary (e.g. a
+                    # .csv reported as application/vnd.ms-excel on Windows). Fall back
+                    # to the extension — matching the web client's allowlist — and
+                    # normalize the type so the resolver inlines it as text.
+                    ext_type = attachment_text_type_for_extension(file.filename)
+                    if ext_type is not None:
+                        content_type = ext_type
+                        type_limit = attachment_upload_limit(content_type)
+                if type_limit is None:
+                    raise HTTPException(
+                        status_code=415,
+                        detail=_unsupported_attachment_detail(content_type, policy),
+                    )
+                read_limit = min(type_limit, MAX_ATTACHMENT_UPLOAD_BYTES)
+            filename = file.filename
+            # Persist original dimensions only after a downscale.
+            source_dims: tuple[int, int] | None = None
+            # An image delivered as a file keeps its original bytes.
+            if content_type in _COMPRESSIBLE_IMAGE_MIMES and not filesystem_required:
+                # Compressible images carry the large cap and the decode, so they are
+                # the server's peak upload memory. The body is already spooled to
+                # disk by the multipart parser, so gate the in-memory read + the
+                # decode/re-encode behind the admission semaphore: a burst of
+                # concurrent uploads waits (each holding only a disk-backed temp
+                # file), instead of every one buffering the full image in RAM and
+                # decoding at once. This bounds peak memory to the gate size × the
+                # per-upload cost, without serializing the network transfer.
+                async with _get_image_compression_gate():
+                    content = await _read_upload_capped(file, read_limit)
+                    if image_needs_compression(len(content), content_type):
+                        try:
+                            compressed, resolved_type, source_dims = await asyncio.to_thread(
+                                compress_image_attachment, content, content_type
+                            )
+                        except ImageCompressionError as exc:
+                            raise HTTPException(status_code=413, detail=str(exc)) from exc
+                        # A re-encode (e.g. PNG → JPEG) changes the type; realign the
+                        # filename extension so name, bytes, and MIME stay consistent.
+                        if resolved_type != content_type:
+                            filename = image_filename_for_content_type(
+                                file.filename, resolved_type
+                            )
+                        content, content_type = compressed, resolved_type
+            else:
+                # PDF/text/SVG and other non-compressed types use their smaller
+                # per-type caps and aren't decoded, so they read outside the gate.
+                content = await _read_upload_capped(file, read_limit)
+            source_metadata: dict[str, Any] | None = (
+                {"width": source_dims[0], "height": source_dims[1]} if source_dims else None
+            )
+            # Record the decision so delivery doesn't change if the policy does.
+            if filesystem_required:
+                source_metadata = {DELIVERY_KEY: FILESYSTEM_DELIVERY}
+            stored = file_store.create(
+                session_id=session_id,
+                filename=filename,
+                bytes=len(content),
+                content_type=content_type,
+                source_metadata=source_metadata,
+            )
+            try:
+                artifact_store.put(stored.id, content)
+            except Exception as exc:
+                # Release quota before another upload can acquire the session lock.
+                try:
+                    file_store.delete(stored.id, session_id=session_id)
+                except Exception:
+                    _logger.warning(
+                        "Failed to delete uploaded file row during rollback: session=%s file_id=%s",
+                        session_id,
+                        stored.id,
+                        exc_info=True,
+                    )
+                try:
+                    artifact_store.delete(stored.id)
+                except Exception:
+                    _logger.warning(
+                        "Failed to delete uploaded file blob during rollback: session=%s file_id=%s",
+                        session_id,
+                        stored.id,
+                        exc_info=True,
+                    )
+                raise OmnigentError(
+                    "Failed to upload file. Please try again.",
+                    code=ErrorCode.INTERNAL_ERROR,
+                ) from exc
+        resource = _stored_file_to_resource(session_id, stored)
+        _publish_and_persist_resource_event(
+            session_id,
+            "session.resource.created",
+            resource_id=stored.id,
+            resource_type="file",
+            conversation_store=conversation_store,
+            resource=resource,
+        )
+        return resource
+
+    async def _upload_initial_file(
+        request: Request, session_id: str, file: UploadFile
+    ) -> dict[str, Any]:
+        return await _store_session_file(request, session_id, file, initial_input=True)
+
+    if register_initial_file_upload is not None:
+        register_initial_file_upload(_upload_initial_file)
+
+    @router.get(
+        "/sessions/{session_id}/resources/files/{file_id}",
+        response_model=None,
+    )
+    async def get_session_file(
+        request: Request,
+        session_id: str,
+        file_id: str,
+    ) -> dict[str, Any]:
+        """
+        Retrieve metadata for a session file resource.
+
+        Verifies that ``file_id`` belongs to ``session_id``.
+
+        :param request: The incoming FastAPI request (for auth).
+        :param session_id: Session/conversation identifier.
+        :param file_id: Unique file identifier.
+        :returns: The session file resource object.
+        """
+        await _validate_session(session_id, request, LEVEL_READ)
+        if file_store is None:
+            raise HTTPException(
+                status_code=501,
+                detail="file store not configured",
+            )
+        stored = file_store.get(file_id, session_id=session_id)
+        if stored is None:
+            raise OmnigentError(
+                "File not found",
+                code=ErrorCode.NOT_FOUND,
+            )
+        return _stored_file_to_resource(session_id, stored)
+
+    @router.get(
+        "/sessions/{session_id}/resources/files/{file_id}/content",
+        response_model=None,
+    )
+    async def get_session_file_content(
+        request: Request,
+        session_id: str,
+        file_id: str,
+    ) -> Response:
+        """
+        Download raw content of a session file resource.
+
+        :param session_id: Session/conversation identifier.
+        :param file_id: Unique file identifier.
+        :returns: Response with file bytes and Content-Type.
+        """
+
+        await _validate_session(session_id, request, LEVEL_READ)
+        if file_store is None or artifact_store is None:
+            raise HTTPException(
+                status_code=501,
+                detail="file store not configured",
+            )
+        stored = await asyncio.to_thread(file_store.get, file_id, session_id=session_id)
+        if stored is None:
+            raise OmnigentError(
+                "File not found",
+                code=ErrorCode.NOT_FOUND,
+            )
+        # The bytes live under blob_key (== id for own uploads; the source's
+        # blob for a fork copy that shares it). Content is immutable per blob,
+        # so a still-valid cached copy can be answered before ever touching the
+        # artifact store — and keying the ETag on the blob lets a fork and its
+        # source share the browser cache for the same bytes. Transcripts
+        # re-render the same attachments on every load, and originals run to
+        # megabytes.
+        blob_key = stored.blob_key or stored.id
+        etag = _file_content_etag(blob_key)
+        if _if_none_match_matches(request.headers.get("if-none-match"), etag):
+            return Response(
+                status_code=304,
+                headers={
+                    "ETag": etag,
+                    "Cache-Control": FILE_CONTENT_CACHE_CONTROL,
+                },
+            )
+        content = await asyncio.to_thread(artifact_store.get, blob_key)
+        media_type = mimetypes.guess_type(stored.filename)[0] or "application/octet-stream"
+        # The filename and bytes are fully user-controlled. Serving the
+        # content inline lets a browser navigating directly to this URL
+        # render an uploaded ``evil.html`` as ``text/html`` and execute
+        # its script in the server's own origin (stored XSS — acute on
+        # the OSS/local server, which has no CSRF/apiproxy boundary).
+        # Force a download with ``Content-Disposition: attachment`` and
+        # disable MIME sniffing so the response cannot be reinterpreted
+        # as an active type.
+        return Response(
+            content=content,
+            media_type=media_type,
+            headers={
+                "Content-Disposition": _attachment_disposition(stored.filename),
+                "X-Content-Type-Options": "nosniff",
+                "ETag": etag,
+                "Cache-Control": FILE_CONTENT_CACHE_CONTROL,
+            },
+        )
+
+    @router.delete(
+        "/sessions/{session_id}/resources/files/{file_id}",
+        response_model=None,
+    )
+    async def delete_session_file(
+        request: Request,
+        session_id: str,
+        file_id: str,
+    ) -> dict[str, Any]:
+        """
+        Delete a session file resource and its artifact bytes.
+
+        :param session_id: Session/conversation identifier.
+        :param file_id: Unique file identifier.
+        :returns: Deletion confirmation object.
+        """
+        await _validate_session(session_id, request, LEVEL_EDIT)
+        if file_store is None or artifact_store is None:
+            raise HTTPException(
+                status_code=501,
+                detail="file store not configured",
+            )
+        # Learn the blob this row points at BEFORE deleting the row — a fork
+        # copy shares the source's blob (blob_key != id), so we can't assume
+        # the blob lives under file_id.
+        stored = await asyncio.to_thread(file_store.get, file_id, session_id=session_id)
+        if stored is None:
+            raise OmnigentError(
+                "File not found",
+                code=ErrorCode.NOT_FOUND,
+            )
+        blob_key = stored.blob_key or stored.id
+        if not await asyncio.to_thread(file_store.delete, file_id, session_id=session_id):
+            raise OmnigentError(
+                "File not found",
+                code=ErrorCode.NOT_FOUND,
+            )
+        # Delete the bytes only once no surviving row (e.g. a fork sharing this
+        # blob) still references them — otherwise the fork's attachment would
+        # 404 after the source deletes its copy.
+        if await asyncio.to_thread(file_store.is_blob_key_orphaned, blob_key):
+            await asyncio.to_thread(artifact_store.delete, blob_key)
+        _publish_and_persist_resource_event(
+            session_id,
+            "session.resource.deleted",
+            resource_id=file_id,
+            resource_type="file",
+            conversation_store=conversation_store,
+        )
+        return {
+            "id": file_id,
+            "object": "session.resource.deleted",
+            "deleted": True,
+        }
+
+    @router.post(
+        "/sessions/{session_id}/resources/files:copy",
+        response_model=None,
+    )
+    async def copy_session_files(
+        request: Request,
+        session_id: str,
+        body: CopyFilesRequest,
+    ) -> dict[str, Any]:
+        """
+        Copy lineage-owned files into this (destination) session.
+
+        Authorizes by spawn lineage: ``body.source_session_id`` must be a
+        STRICT ancestor of this session up the ``parent_conversation_id``
+        chain — the session may not name itself as the source. Each source
+        file is read and re-stored as a new child-scoped row owned by
+        ``session_id`` — this preserves the session-scoping invariant (the
+        child reads its OWN copy; no cross-session read grant is created).
+        Validation is all-or-nothing: an unauthorized source, a missing
+        file, or a request past the copy limits copies nothing.
+
+        The request is bounded before any blob is read: the file count and
+        the summed ``StoredFile.bytes`` are checked against the copy limits
+        during metadata validation, so an over-limit request is rejected
+        without buffering a single blob. Within the limits, files are copied
+        one at a time (read → create → put) so peak memory is a single blob,
+        not the whole batch.
+
+        :param request: The incoming FastAPI request (for auth).
+        :param session_id: Destination (child) session/conversation id.
+        :param body: Source session id plus the file ids to copy.
+        :returns: A ``session.files.copied`` object carrying the
+            ``{source_file_id: new_file_id}`` mapping.
+        """
+        from omnigent.server.server_config import (
+            copy_file_count_limit,
+            copy_total_bytes_limit,
+        )
+
+        conv = await _validate_session(session_id, request, LEVEL_EDIT)
+        if file_store is None or artifact_store is None:
+            raise HTTPException(
+                status_code=501,
+                detail="file store not configured",
+            )
+
+        # Lineage authorization: the source must be a STRICT ancestor up
+        # the parent_conversation_id chain. A session may not name itself
+        # as the source — the contract is "copy files down from a parent",
+        # and a top-level session has no lineage to copy from.
+        if body.source_session_id not in set(
+            _ancestor_session_ids(conversation_store, session_id)
+        ):
+            raise OmnigentError(
+                "Source session is not an ancestor of this session",
+                code=ErrorCode.FORBIDDEN,
+            )
+
+        # Validate every source file WITHOUT reading a blob, enforcing the copy
+        # limits before any blob is read. Summing StoredFile.bytes here means
+        # an over-count or over-size request is rejected without buffering a
+        # single blob — a rejected request never spikes memory. artifact_store
+        # .exists() is a cheap metadata probe (S3 HEAD / local stat / DB row),
+        # NOT a blob read, so checking it here preserves the original
+        # "missing blob surfaces before any child row is created" guarantee
+        # without reintroducing the batch prefetch. The blobs themselves are
+        # fetched one at a time in the write loop below.
+        max_files = copy_file_count_limit()
+        max_total_bytes = copy_total_bytes_limit()
+        if len(body.file_ids) > max_files:
+            raise OmnigentError(
+                f"Cannot copy {len(body.file_ids)} files: limit is {max_files}",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        if len(set(body.file_ids)) != len(body.file_ids):
+            raise OmnigentError(
+                "file_ids must not contain duplicates",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        sources: list[StoredFile] = []
+        total_bytes = 0
+        for file_id in body.file_ids:
+            stored = file_store.get(file_id, session_id=body.source_session_id)
+            # The source row may itself share a blob (blob_key != id), so probe
+            # existence under the effective blob key, not the row id.
+            if stored is None or not artifact_store.exists(stored.blob_key or stored.id):
+                raise OmnigentError(
+                    f"File '{file_id}' not found in source session",
+                    code=ErrorCode.NOT_FOUND,
+                )
+            total_bytes += stored.bytes
+            if total_bytes > max_total_bytes:
+                raise OmnigentError(
+                    f"Cannot copy files: total size exceeds limit of {max_total_bytes} bytes",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            sources.append(stored)
+
+        # Files requiring filesystem tools entering a session pass the same checks as an upload,
+        # held under the same lock, so a copy can't skip the harness or quotas.
+        from omnigent.inner.native_attachments import (
+            filesystem_attachment_capability,
+            uses_filesystem_delivery,
+        )
+
+        filesystem_sources = [
+            stored
+            for stored in sources
+            if stored.filename
+            and uses_filesystem_delivery(stored.filename, stored.source_metadata)
+        ]
+        if filesystem_sources:
+            await _require_filesystem_attachment_support(
+                request,
+                conv,
+                filesystem_sources[0].filename or "",
+                filesystem_attachment_capability(stored.filename for stored in filesystem_sources),
+            )
+        attachment_lock = (
+            _attachment_upload_lock(session_id) if filesystem_sources else contextlib.nullcontext()
+        )
+        async with attachment_lock:
+            if filesystem_sources:
+                _enforce_filesystem_attachment_policy(
+                    [stored.filename or "" for stored in filesystem_sources],
+                    session_id=session_id,
+                    file_store=file_store,
+                    sizes=[stored.bytes for stored in filesystem_sources],
+                )
+            # Commit the copies one file at a time (read → create → put) so peak
+            # memory is a single blob, not the whole batch. If any step fails
+            # mid-batch, roll back the rows/blobs already created.
+            mapping: dict[str, CopiedFile] = {}
+            created: list[str] = []
+            copied: list[StoredFile] = []
+            try:
+                for stored in sources:
+                    content = artifact_store.get(stored.blob_key or stored.id)
+                    new = file_store.create(
+                        session_id=session_id,
+                        filename=stored.filename,
+                        bytes=stored.bytes,
+                        content_type=stored.content_type,
+                        # Preserve transform metadata on copies.
+                        source_metadata=stored.source_metadata,
+                    )
+                    created.append(new.id)
+                    artifact_store.put(new.id, content)
+                    # Carry the preserved filename + content_type back so the
+                    # caller can attach the copy without a follow-up metadata GET.
+                    mapping[stored.id] = CopiedFile(
+                        new_id=new.id,
+                        filename=new.filename,
+                        content_type=new.content_type,
+                    )
+                    copied.append(new)
+            except Exception as exc:
+                for new_id in created:
+                    try:
+                        file_store.delete(new_id, session_id=session_id)
+                    except Exception:
+                        _logger.warning(
+                            "Failed to delete copied file row during rollback: session=%s file_id=%s",
+                            session_id,
+                            new_id,
+                            exc_info=True,
+                        )
+                    try:
+                        artifact_store.delete(new_id)
+                    except Exception:
+                        _logger.warning(
+                            "Failed to delete copied file blob during rollback: session=%s file_id=%s",
+                            session_id,
+                            new_id,
+                            exc_info=True,
+                        )
+                raise OmnigentError(
+                    "Failed to copy files into destination session",
+                    code=ErrorCode.INTERNAL_ERROR,
+                ) from exc
+
+        # Resource events fire only after every write lands. Publishing them
+        # inside the copy loop would emit (and persist as transcript items)
+        # ``session.resource.created`` for early files, then a later write
+        # failure would roll back the file rows/blobs without compensating
+        # those events — clients would see phantom files that no longer
+        # exist. Keep the create + event all-or-nothing together.
+        for new in copied:
+            _publish_and_persist_resource_event(
+                session_id,
+                "session.resource.created",
+                resource_id=new.id,
+                resource_type="file",
+                conversation_store=conversation_store,
+                resource=_stored_file_to_resource(session_id, new),
+            )
+
+        return CopyFilesResponse(
+            session_id=session_id,
+            mapping=mapping,
+        ).model_dump()
+
+    # ── Phase 3: environment filesystem proxy endpoints ──────────
+
+    async def _proxy_fs_response(
+        session_id: str,
+        method: str,
+        path: str,
+        body: dict[str, Any] | None = None,
+        *,
+        request: Request | None = None,
+        required_level: int = LEVEL_EDIT,
+        environment_id: str = "default",
+        publish_invalidation: bool = True,
+    ) -> Any:
+        """Proxy a filesystem request to the runner.
+
+        Translates runner error status codes into appropriate
+        API-level exceptions.
+
+        :param session_id: Session/conversation identifier.
+        :param method: HTTP method.
+        :param path: Runner-relative URL path.
+        :param body: Optional JSON body.
+        :param request: The incoming FastAPI request (for auth).
+        :param required_level: Minimum permission level needed.
+        :param environment_id: Environment resource id,
+            e.g. ``"default"``. Used for the live invalidation event
+            after successful mutating filesystem operations.
+        :param publish_invalidation: Whether a successful proxied
+            mutation should publish ``session.changed_files.invalidated``.
+            False for generic shell commands because read-only commands
+            are common and cannot be distinguished cheaply here.
+        :returns: Parsed JSON response.
+        """
+        conv = await _validate_session(session_id, request, required_level)
+        if method == "GET":
+            return await _proxy_get_to_runner(session_id, path, conv)
+        if method == "PUT":
+            # Reads can use the host tunnel, but saving needs a runner to
+            # enforce the environment's write policy. Reconnect before saving
+            # and use the refreshed binding if recovery launched a new runner.
+            if request is not None:
+                _, conv = await ensure_runner_connected(
+                    session_id=session_id,
+                    conv=conv,
+                    app_state=request.app.state,
+                    conversation_store=conversation_store,
+                    runner_router=runner_router or get_server_runner_router(),
+                    raise_host_refusal=True,
+                )
+            status, payload = await _proxy_put_to_runner(
+                session_id,
+                path,
+                body or {},
+                conv,
+            )
+        elif method == "PATCH":
+            status, payload = await _proxy_patch_to_runner(
+                session_id,
+                path,
+                body or {},
+                conv,
+            )
+        elif method == "POST":
+            status, payload = await _proxy_post_to_runner(
+                session_id,
+                path,
+                body or {},
+                conv,
+            )
+        elif method == "DELETE":
+            status, payload = await _proxy_delete_to_runner(
+                session_id,
+                path,
+                conv,
+            )
+        else:
+            raise HTTPException(status_code=405)
+
+        if status >= 400:
+            # Re-derive the typed session-lifecycle 410 (agent deleted or
+            # rebound) with its client-safe message instead of forwarding
+            # the runner's raw resolver text verbatim.
+            _raise_if_session_agent_missing_payload(payload)
+            error = payload.get("error", {})
+            message = error.get("message", "filesystem operation failed")
+            if status == 404:
+                raise OmnigentError(message, code=ErrorCode.NOT_FOUND)
+            raise HTTPException(status_code=status, detail=message)
+        if publish_invalidation:
+            _publish_changed_files_invalidated(session_id, environment_id)
+        return payload
+
+    # Reads that inline a whole file in their JSON body, so the response is as
+    # large as the file. Grouped on their own router purely to attach
+    # GZipFileContentRoute: the route table stays the source of truth for what
+    # compresses, and the PUT/PATCH/DELETE handlers sharing these paths — which
+    # return small acks — are registered on ``router`` and stay uncompressed.
+    # Included into ``router`` at the end of this function.
+    file_read_router = APIRouter(route_class=GZipFileContentRoute)
+
+    def _skip_gzip_for_binary(request: Request, payload: dict[str, Any]) -> dict[str, Any]:
+        """
+        Opt a base64 (binary) file read out of gzip, and return the payload.
+
+        Base64 of already-compressed media gains ~1.3x from gzip for real
+        event-loop time (385 ms at the 10 MiB binary cap), so it is skipped.
+        The decision is made here because this is where the payload is known —
+        the response is ``application/json`` for every file, so the transport
+        layer cannot tell binary from text without re-parsing the body.
+
+        :param request: The active request, carrying the flag to the route class.
+        :param payload: The read result, either a file-content object or a
+            directory listing.
+        :returns: *payload*, unchanged, for direct return by the caller.
+        """
+        if payload.get("encoding") == "base64":
+            skip_gzip(request)
+        return payload
+
+    @file_read_router.get(
+        "/sessions/{session_id}/resources/environments/{environment_id}/filesystem",
+        response_model=None,
+    )
+    async def list_environment_root(
+        request: Request,
+        session_id: str,
+        environment_id: str,
+        limit: int = Query(default=20, ge=1, le=1000),
+        after: str | None = Query(default=None),
+        before: str | None = Query(default=None),
+        order: str = Query(default="desc", pattern="^(asc|desc)$"),
+    ) -> Any:
+        """
+        List root directory of an environment.
+
+        :param request: The incoming FastAPI request (for auth).
+        :param session_id: Session/conversation identifier.
+        :param environment_id: Environment resource id.
+        :param limit: Maximum number of entries to return (1-1000, default 20).
+        :param after: Cursor entry id for forward pagination.
+        :param before: Cursor entry id for backward pagination.
+        :param order: Sort order, ``"asc"`` or ``"desc"``.
+        :returns: PaginatedList of filesystem entries.
+        """
+        # A host-absolute browse of the filesystem root reaches here: its path
+        # segment is empty, so it lands on the no-path route, and only
+        # ``base=host`` distinguishes it from a workspace-root listing. Hand it
+        # to the path handler so it gets the same owner gate and reach check as
+        # any other absolute location instead of listing the workspace root.
+        # ``read_or_list_environment_path`` runs its own ``_validate_session``
+        # at the owner level for an absolute path, so this delegation is gated
+        # there, not here.
+        if request.query_params.get("base") == "host":
+            return await read_or_list_environment_path(
+                request,
+                session_id,
+                environment_id,
+                "/",
+                limit=limit,
+                after=after,
+                before=before,
+                order=order,
+            )
+        params: dict[str, str] = {"limit": str(limit), "order": order}
+        if after is not None:
+            params["after"] = after
+        if before is not None:
+            params["before"] = before
+        qs = urllib.parse.urlencode(params)
+        path = (
+            f"/v1/sessions/{session_id}/resources/environments"
+            f"/{_runner_environment_segment(environment_id)}/filesystem?{qs}"
+        )
+        conv = await _authorize_browse_read(session_id, request)
+        return _skip_gzip_for_binary(
+            request,
+            await _fs_get_with_host_fallback(
+                session_id,
+                conv,
+                op="list_or_read",
+                host_params={
+                    "path": "",
+                    "limit": limit,
+                    "after": after,
+                    "before": before,
+                    "order": order,
+                },
+                runner_path=path,
+            ),
+        )
+
+    @router.get(
+        "/sessions/{session_id}/resources/environments/{environment_id}/content-search",
+        response_model=None,
+    )
+    async def search_environment_content(
+        request: Request,
+        session_id: str,
+        environment_id: str,
+        q: str = Query(min_length=1, max_length=4096, pattern=r".*\S.*"),
+        case_sensitive: bool = False,
+        regex: bool = False,
+        include: str = Query(default="", max_length=4096),
+        exclude: str = Query(default="", max_length=4096),
+        limit: int = Query(default=500, ge=1, le=500),
+    ) -> Any:
+        """Search the session workspace with the same access gate as file reads."""
+        flags = getattr(request.app.state, "feature_flags", FeatureFlags())
+        if not flags.enabled(Feature.WORKSPACE_CONTENT_SEARCH):
+            raise HTTPException(status_code=404, detail="Workspace content search is disabled")
+        conv = await _authorize_browse_read(session_id, request)
+        return await _proxy_get_to_runner(
+            session_id,
+            f"/v1/sessions/{session_id}/resources/environments/{environment_id}/content-search",
+            conv,
+            params={
+                "q": q,
+                "case_sensitive": str(case_sensitive).lower(),
+                "regex": str(regex).lower(),
+                "include": include,
+                "exclude": exclude,
+                "limit": str(limit),
+            },
+            timeout=25.0,
+            unsupported_endpoint_message=(
+                "Session runner does not support content search; update the host and restart the session"
+            ),
+        )
+
+    @router.get(
+        "/sessions/{session_id}/resources/environments/{environment_id}/search",
+        response_model=None,
+    )
+    async def search_environment_files(
+        request: Request,
+        session_id: str,
+        environment_id: str,
+        q: str = Query(min_length=1, pattern=r".*\S.*"),
+        include: str | None = Query(default=None),
+        exclude: str | None = Query(default=None),
+        limit: int = Query(default=500, ge=1, le=500),
+    ) -> Any:
+        """
+        Search for files recursively by name/path substring and glob filters.
+
+        Proxies to the runner's search endpoint.  Returns a flat list of
+        matching file entries (not directories) whose name or relative path
+        contains ``q`` (case-insensitive), optionally scoped by ``include`` /
+        ``exclude`` globs.  Requires at least one non-whitespace character in
+        ``q`` to prevent accidental full-tree scans.
+
+        :param request: The incoming FastAPI request (for auth).
+        :param session_id: Session/conversation identifier,
+            e.g. ``"conv_abc123"``.
+        :param environment_id: Environment resource id,
+            e.g. ``"default"``.
+        :param q: Case-insensitive search substring, e.g. ``"test.md"``.
+            Must contain at least one non-whitespace character.
+        :param include: Comma-separated glob patterns scoping which files are
+            returned, e.g. ``"*.ts,src/**"``.
+        :param exclude: Comma-separated glob patterns for files to drop,
+            e.g. ``"**/node_modules,*.test.ts"``.
+        :param limit: Maximum number of results (1-500, default 500).
+        :returns: JSON list response with matching filesystem entries.
+        """
+        return await _proxy_search(
+            request,
+            session_id,
+            environment_id,
+            "",
+            q=q,
+            include=include,
+            exclude=exclude,
+            limit=limit,
+        )
+
+    @router.get(
+        "/sessions/{session_id}/resources/environments/{environment_id}/search/{path:path}",
+        response_model=None,
+    )
+    async def search_environment_files_under(
+        request: Request,
+        session_id: str,
+        environment_id: str,
+        path: str,
+        q: str = Query(min_length=1, pattern=r".*\S.*"),
+        include: str | None = Query(default=None),
+        exclude: str | None = Query(default=None),
+        limit: int = Query(default=500, ge=1, le=500),
+    ) -> Any:
+        """
+        Search under a directory rather than the whole workspace.
+
+        Takes the same path shape as the filesystem routes: relative to the
+        workspace, or absolute with a leading slash. Keeps search covering
+        exactly what the file tree is showing.
+
+        :param request: The incoming FastAPI request (for auth).
+        :param session_id: Session/conversation identifier.
+        :param environment_id: Environment resource id.
+        :param path: Directory to search under.
+        :param q: Case-insensitive search substring.
+        :param include: Comma-separated include globs.
+        :param exclude: Comma-separated exclude globs.
+        :param limit: Maximum number of results (1-500, default 500).
+        :returns: JSON list response with matching filesystem entries.
+        """
+        return await _proxy_search(
+            request,
+            session_id,
+            environment_id,
+            path,
+            q=q,
+            include=include,
+            exclude=exclude,
+            limit=limit,
+        )
+
+    async def _proxy_search(
+        request: Request,
+        session_id: str,
+        environment_id: str,
+        path: str,
+        *,
+        q: str,
+        include: str | None,
+        exclude: str | None,
+        limit: int,
+    ) -> Any:
+        params: dict[str, str] = {"q": q, "limit": str(limit)}
+        if include is not None:
+            params["include"] = include
+        if exclude is not None:
+            params["exclude"] = exclude
+
+        absolute, path = _resolve_browse_path(request, path)
+        conv = await _authorize_browse_read(session_id, request, path)
+
+        qs = urllib.parse.urlencode(params)
+        suffix = ""
+        if path:
+            suffix = "/" + _runner_path_segment(path, absolute=absolute)
+        runner_path = (
+            f"/v1/sessions/{session_id}/resources/environments"
+            f"/{_runner_environment_segment(environment_id)}/search{suffix}?{qs}"
+        )
+        resolver = functools.partial(_authorize_absolute_browse, conv, path) if absolute else None
+        return await _fs_get_with_host_fallback(
+            session_id,
+            conv,
+            op="search",
+            host_params={
+                "q": q,
+                "include": include,
+                "exclude": exclude,
+                "limit": limit,
+                "path": "" if absolute else path,
+            },
+            runner_path=runner_path,
+            host_workspace_resolver=resolver,
+        )
+
+    @router.get(
+        "/sessions/{session_id}/resources/environments/{environment_id}/changes",
+        response_model=None,
+    )
+    async def list_environment_filesystem_changes(
+        request: Request,
+        session_id: str,
+        environment_id: str,
+    ) -> Any:
+        """
+        List all files changed since session start (flat, registry-backed).
+
+        Returns the watchdog change set for the session — every file
+        created, modified, or deleted since the session began, regardless
+        of directory depth.  Use for the flat "changed files" view.
+
+        :param request: The incoming FastAPI request (for auth).
+        :param session_id: Session/conversation identifier.
+        :param environment_id: Environment resource id.
+        :returns: Flat list of changed filesystem entries with ``status``.
+        """
+        path = (
+            f"/v1/sessions/{session_id}/resources/environments"
+            f"/{_runner_environment_segment(environment_id)}/changes"
+        )
+        conv = await _authorize_browse_read(session_id, request)
+        return await _fs_get_with_host_fallback(
+            session_id,
+            conv,
+            op="changes",
+            host_params={},
+            runner_path=path,
+        )
+
+    @file_read_router.get(
+        "/sessions/{session_id}/resources/environments/{environment_id}/diff/{relative_path:path}",
+        # Internal (UI diff view) — hidden from the public API reference.
+        include_in_schema=False,
+        response_model=None,
+    )
+    async def read_environment_file_diff(
+        request: Request,
+        session_id: str,
+        environment_id: str,
+        relative_path: str,
+    ) -> Any:
+        """
+        Return before/after diff content for a changed file.
+
+        Proxies to the runner's diff endpoint and returns before/after
+        content strings so the UI can render a diff view.  Returns 404 when
+        the file has not been modified this session.
+
+        :param request: The incoming FastAPI request (for auth).
+        :param session_id: Session/conversation identifier.
+        :param environment_id: Environment resource id.
+        :param relative_path: Path relative to environment root.
+        :returns: JSON with ``before`` and ``after`` content strings.
+        """
+        encoded = _runner_path_segment(relative_path, absolute=relative_path.startswith("/"))
+        path = (
+            f"/v1/sessions/{session_id}/resources/environments"
+            f"/{_runner_environment_segment(environment_id)}/diff/{encoded}"
+        )
+        conv = await _authorize_browse_read(session_id, request, relative_path)
+        return await _fs_get_with_host_fallback(
+            session_id,
+            conv,
+            op="diff",
+            host_params={"path": relative_path},
+            runner_path=path,
+        )
+
+    @file_read_router.get(
+        "/sessions/{session_id}/resources/github/diff",
+        # Internal (UI GitHub diff view) — hidden from the public API reference.
+        include_in_schema=False,
+        response_model=None,
+    )
+    async def read_github_pr_diff(
+        request: Request,
+        session_id: str,
+        pr_url: str | None = None,
+        head_sha: str | None = None,
+        base_sha: str | None = None,
+    ) -> Any:
+        """
+        Return the whole PR as one unified diff patch.
+
+        ``gh pr diff`` covering every changed file, gzipped on the way out
+        (patches are large). The web view parses it client-side into per-file
+        diffs. Falls back to the host tunnel when the runner is offline.
+
+        :param request: The incoming FastAPI request (for auth).
+        :param session_id: Session/conversation identifier.
+        :returns: JSON with the ``patch`` text.
+        """
+        conv = await _authorize_browse_read(session_id, request)
+        params = await _github_params(session_id, {"pr_url": pr_url} if pr_url else {})
+        if head_sha:
+            params["head_sha"] = head_sha
+        if base_sha:
+            params["base_sha"] = base_sha
+        return await _fs_get_with_host_fallback(
+            session_id,
+            conv,
+            op="github_pr_diff",
+            host_params=params,
+            runner_params=params or None,
+            runner_path=f"/v1/sessions/{session_id}/resources/github/diff",
+        )
+
+    @file_read_router.get(
+        "/sessions/{session_id}/resources/github/diff/{relative_path:path}",
+        # Internal (UI GitHub diff view) — hidden from the public API reference.
+        include_in_schema=False,
+        response_model=None,
+    )
+    async def read_github_file_diff(
+        request: Request,
+        session_id: str,
+        relative_path: str,
+        base: str | None = Query(default=None),
+        pr_url: str | None = None,
+        previous_path: str | None = None,
+        head_sha: str | None = None,
+        base_sha: str | None = None,
+    ) -> Any:
+        """
+        Return before/after content for a file in the selected PR.
+
+        Tracked PRs read GitHub revisions; legacy requests use the workspace.
+        Falls back to the host tunnel when the runner is offline.
+
+        :param request: The incoming FastAPI request (for auth).
+        :param session_id: Session/conversation identifier.
+        :param relative_path: Repo-root-relative path from the changes list.
+        :param base: Base branch name; the default is derived when omitted.
+        :returns: JSON with ``before`` and ``after`` content strings.
+        """
+        conv = await _authorize_browse_read(session_id, request, relative_path)
+        if previous_path is not None:
+            if not all(previous_path.split("/")):
+                raise OmnigentError(
+                    "Previous path must be a non-empty relative file path",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            # Query and host parameters retain the literal name after validation.
+            _runner_path_segment(previous_path, absolute=False)
+        params = {
+            key: value
+            for key, value in {
+                "base": base,
+                "pr_url": pr_url,
+                "previous_path": previous_path,
+                "head_sha": head_sha,
+                "base_sha": base_sha,
+            }.items()
+            if value is not None
+        }
+        encoded = _runner_path_segment(relative_path, absolute=relative_path.startswith("/"))
+        params = await _github_params(session_id, params)
+        return await _fs_get_with_host_fallback(
+            session_id,
+            conv,
+            op="github_diff",
+            host_params={"base": base, "path": relative_path, **params},
+            runner_path=f"/v1/sessions/{session_id}/resources/github/diff/{encoded}",
+            runner_params=params or None,
+        )
+
+    @file_read_router.get(
+        "/sessions/{session_id}/resources/environments"
+        "/{environment_id}/filesystem/{relative_path:path}",
+        response_model=None,
+        responses={
+            200: {
+                "description": (
+                    "File content or directory listing as JSON; the raw file "
+                    "as an attachment when `download=true`."
+                ),
+                "content": {
+                    "application/octet-stream": {
+                        "schema": {"type": "string", "format": "binary"},
+                    },
+                },
+            },
+        },
+    )
+    async def read_or_list_environment_path(
+        request: Request,
+        session_id: str,
+        environment_id: str,
+        relative_path: str,
+        limit: int = Query(default=20, ge=1, le=1000),
+        after: str | None = Query(default=None),
+        before: str | None = Query(default=None),
+        order: str = Query(default="desc", pattern="^(asc|desc)$"),
+        # A plain default, not ``Query(...)``: the root listing calls this
+        # function directly, and a ``Query`` object is truthy.
+        download: bool = False,
+    ) -> Any:
+        """
+        Read a file or list a directory in an environment.
+
+        :param request: The incoming FastAPI request (for auth).
+        :param session_id: Session/conversation identifier.
+        :param environment_id: Environment resource id.
+        :param relative_path: Path relative to environment root.
+        :param limit: Maximum number of entries to return for directory
+            listings (1-1000, default 20). Ignored for file reads.
+        :param after: Cursor entry id for forward pagination.
+        :param before: Cursor entry id for backward pagination.
+        :param order: Sort order, ``"asc"`` or ``"desc"``.
+        :param download: When ``True``, stream the complete file as an
+            attachment with no size cap instead of the capped JSON
+            envelope. A directory rejects it with 400.
+        :returns: File content or directory listing, or the raw file.
+        """
+        params: dict[str, str] = {"limit": str(limit), "order": order}
+        if after is not None:
+            params["after"] = after
+        if before is not None:
+            params["before"] = before
+
+        # A leading slash means an absolute location rather than a path under
+        # the workspace, so it is owner-only: the workspace is the session's
+        # shared context, everything past it is the owner's own machine. See
+        # `_mutating_level` for why anything weaker would make this route a
+        # way around the owner-scoped host filesystem endpoint.
+        absolute, relative_path = _resolve_browse_path(request, relative_path)
+        conv, owner = await _authorize_browse_read_with_owner(session_id, request, relative_path)
+
+        # The owner may browse a workspace symlink's outside target by absolute
+        # path already, so the runner is told it may follow the link; everyone
+        # else keeps the workspace boundary. The root itself is never a link.
+        reach = {"scope": "reach"} if owner and not absolute and relative_path else {}
+        qs = urllib.parse.urlencode({**params, **reach})
+        runner_rel = _runner_path_segment(relative_path, absolute=absolute)
+        if download:
+            return await _stream_download_from_runner(
+                request,
+                session_id,
+                conv,
+                f"/v1/sessions/{session_id}/resources/environments"
+                f"/{_runner_environment_segment(environment_id)}/filesystem/{runner_rel}?"
+                + urllib.parse.urlencode({"download": "true", **reach}),
+            )
+        path = (
+            f"/v1/sessions/{session_id}/resources/environments"
+            f"/{_runner_environment_segment(environment_id)}/filesystem/{runner_rel}?{qs}"
+        )
+        # Offline, the host reads whatever root it is handed, so the server
+        # authorizes the target itself before rooting the reader there. Deferred:
+        # a live runner does its own authorization, and a runner-only session has
+        # no recorded workspace for this to resolve against.
+        resolver = (
+            functools.partial(_authorize_absolute_browse, conv, relative_path)
+            if absolute
+            else None
+        )
+        # The session is already validated above at the browse level, which is
+        # stricter than main's plain LEVEL_READ for an absolute path.
+        return _skip_gzip_for_binary(
+            request,
+            await _fs_get_with_host_fallback(
+                session_id,
+                conv,
+                op="list_or_read",
+                host_params={
+                    "path": "" if absolute else relative_path,
+                    "limit": limit,
+                    "after": after,
+                    "before": before,
+                    "order": order,
+                },
+                runner_path=path,
+                host_workspace_resolver=resolver,
+            ),
+        )
+
+    @router.put(
+        "/sessions/{session_id}/resources/environments"
+        "/{environment_id}/filesystem/{relative_path:path}",
+        response_model=None,
+    )
+    async def write_environment_file(
+        session_id: str,
+        environment_id: str,
+        relative_path: str,
+        request: Request,
+    ) -> Any:
+        """
+        Write/replace a file in an environment.
+
+        :param session_id: Session/conversation identifier.
+        :param environment_id: Environment resource id.
+        :param relative_path: Path relative to environment root.
+        :param request: JSON body with ``content``.
+        :returns: Write result.
+        """
+        body = await request.json()
+        _, relative_path = _resolve_browse_path(request, relative_path)
+        path = _mutating_runner_path(session_id, environment_id, relative_path)
+        return await _proxy_fs_response(
+            session_id,
+            "PUT",
+            path,
+            body,
+            request=request,
+            environment_id=environment_id,
+            required_level=_browse_level(relative_path, within_workspace=LEVEL_EDIT),
+        )
+
+    @router.patch(
+        "/sessions/{session_id}/resources/environments"
+        "/{environment_id}/filesystem/{relative_path:path}",
+        response_model=None,
+    )
+    async def edit_environment_file(
+        session_id: str,
+        environment_id: str,
+        relative_path: str,
+        request: Request,
+    ) -> Any:
+        """
+        Edit a file in an environment via text replacement.
+
+        :param session_id: Session/conversation identifier.
+        :param environment_id: Environment resource id.
+        :param relative_path: Path relative to environment root.
+        :param request: JSON body with ``old_text`` and ``new_text``.
+        :returns: Edit result.
+        """
+        body = await request.json()
+        _, relative_path = _resolve_browse_path(request, relative_path)
+        path = _mutating_runner_path(session_id, environment_id, relative_path)
+        return await _proxy_fs_response(
+            session_id,
+            "PATCH",
+            path,
+            body,
+            request=request,
+            environment_id=environment_id,
+            required_level=_browse_level(relative_path, within_workspace=LEVEL_EDIT),
+        )
+
+    @router.delete(
+        "/sessions/{session_id}/resources/environments"
+        "/{environment_id}/filesystem/{relative_path:path}",
+        response_model=None,
+    )
+    async def delete_environment_path(
+        request: Request,
+        session_id: str,
+        environment_id: str,
+        relative_path: str,
+    ) -> Any:
+        """
+        Delete a file or directory in an environment.
+
+        :param request: The incoming FastAPI request (for auth).
+        :param session_id: Session/conversation identifier.
+        :param environment_id: Environment resource id.
+        :param relative_path: Path relative to environment root.
+        :returns: Delete result.
+        """
+        _, relative_path = _resolve_browse_path(request, relative_path)
+        path = _mutating_runner_path(session_id, environment_id, relative_path)
+        return await _proxy_fs_response(
+            session_id,
+            "DELETE",
+            path,
+            request=request,
+            environment_id=environment_id,
+            required_level=_browse_level(relative_path, within_workspace=LEVEL_EDIT),
+        )
+
+    # ── Phase 5: environment shell proxy ─────────────────────────
+
+    @router.post(
+        "/sessions/{session_id}/resources/environments/{environment_id}/shell",
+        response_model=None,
+        # CSRF hardening: body is parsed via request.json(); require a JSON
+        # Content-Type so a cross-site text/plain request can't reach it.
+        dependencies=[Depends(require_json_content_type)],
+    )
+    async def run_environment_shell(
+        session_id: str,
+        environment_id: str,
+        request: Request,
+    ) -> Any:
+        """
+        Execute a shell command in an environment.
+
+        Owner-only. A command has no path to inspect, so unlike the
+        filesystem proxy there is no workspace-relative form that could
+        be opened to collaborators: any command reaches the owner's own
+        machine, the same boundary ``_browse_level`` closes for absolute
+        paths, and it passes no policy or approval gate on the way.
+
+        :param session_id: Session/conversation identifier.
+        :param environment_id: Environment resource id.
+        :param request: JSON body with ``command`` and optional
+            ``timeout``.
+        :returns: Shell result.
+        """
+        body = await request.json()
+        path = (
+            f"/v1/sessions/{session_id}/resources/environments"
+            f"/{_runner_environment_segment(environment_id)}/shell"
+        )
+        return await _proxy_fs_response(
+            session_id,
+            "POST",
+            path,
+            body,
+            request=request,
+            required_level=LEVEL_OWNER,
+            environment_id=environment_id,
+            publish_invalidation=False,
+        )
+
+    # ── Pull requests (stored on the server) ──────────────────────
+    # The server owns which PRs belong to a session. The runner or host fetches
+    # every PR from its forge, for the PR the server vouches for, and the server
+    # keeps the list and last states so the tab shows them while both are offline.
+
+    async def _github_params(session_id: str, params: dict[str, Any]) -> dict[str, Any]:
+        """Vouch for the PR a GitHub request targets, so the runner or host serves it.
+
+        :raises HTTPException: 400 when the request names a PR the session doesn't link.
+        """
+        if pull_request_store is None:
+            return params
+        try:
+            stored = await asyncio.to_thread(pull_request_store.read, session_id)
+        except Exception:  # Storage trouble must not break the live panel.
+            _logger.warning(
+                "Could not read session pull requests",
+                exc_info=True,
+                extra={"session_id": session_id},
+            )
+            return params
+        try:
+            return {**params, **server_prs.vouch(stored, params.get("pr_url"))}
+        except server_prs.NotAssociatedError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    async def _with_server_pull_requests(
+        session_id: str, info: dict[str, Any], requested_at: float
+    ) -> dict[str, Any]:
+        """Store a runner or host payload's PRs, then answer with the server's list.
+
+        :param requested_at: Epoch seconds the server sent the request ``info`` answers.
+        """
+        if pull_request_store is None:
+            return info
+        try:
+            stored = await asyncio.to_thread(
+                server_prs.ingest_info,
+                pull_request_store,
+                session_id,
+                info,
+                requested_at=requested_at,
+            )
+        except Exception:  # Storage trouble must not break the live panel.
+            _logger.warning(
+                "Could not store session pull requests",
+                exc_info=True,
+                extra={"session_id": session_id},
+            )
+            return info
+        if pull_request_refresher is not None:
+            pull_request_refresher.note_read(session_id, requested_at)
+        return server_prs.answer(info, stored)
+
+    async def _record_attached(session_id: str, info: dict[str, Any]) -> None:
+        """Link the PR a successful attach selected, clearing an earlier unlink.
+
+        :raises HTTPException: 409 when the session has no room for it.
+        """
+        selected = info.get("selected_pr_url")
+        if pull_request_store is None or not isinstance(selected, str):
+            return
+        report = next(
+            (item for item in server_prs.parse_reports(info.get("prs")) if item.url == selected),
+            None,
+        )
+        if report is None:
+            return
+        try:
+            await asyncio.to_thread(pull_request_store.attach, session_id, report)
+        except SessionPullRequestLimitError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except Exception:  # The host linked it; storage trouble must not fail the request.
+            _logger.warning(
+                "Could not store a linked pull request",
+                exc_info=True,
+                extra={"session_id": session_id},
+            )
+
+    async def _store_unlink(session_id: str, url: str) -> None:
+        """Record an unlink the runner or host accepted; storage trouble is logged."""
+        if pull_request_store is None:
+            return
+        try:
+            await asyncio.to_thread(pull_request_store.remove, session_id, url)
+        except Exception:
+            _logger.warning(
+                "Could not store a pull request unlink",
+                exc_info=True,
+                extra={"session_id": session_id},
+            )
+
+    async def _github_info(
+        session_id: str,
+        conv: Conversation,
+        pr_url: str | None = None,
+    ) -> dict[str, Any]:
+        """Read PR context through the runner or host and store what it reports."""
+        params = await _github_params(session_id, {"pr_url": pr_url} if pr_url else {})
+        requested_at = time.time()
+        info = await _fs_get_with_host_fallback(
+            session_id,
+            conv,
+            op="github_info",
+            host_params=params,
+            runner_params=params or None,
+            runner_path=f"/v1/sessions/{session_id}/resources/github",
+        )
+        return await _with_server_pull_requests(session_id, info, requested_at)
+
+    async def _update_host_pull_requests(
+        session_id: str,
+        conv: Conversation,
+        url: str,
+        action: str,
+        *,
+        store_unlink: bool = False,
+    ) -> dict[str, Any]:
+        """Link or unlink a PR in the runner's or host's session registry, and store the result.
+
+        Linking checks the session has room before the host is asked to link the PR.
+
+        :param store_unlink: Record a ``remove`` on the server once the host accepts it.
+        :raises OmnigentError: ``RUNNER_UNAVAILABLE`` when neither can answer.
+        :raises HTTPException: 409 when the session has no room for another PR.
+        """
+        if action == "attach" and pull_request_store is not None:
+            try:
+                await asyncio.to_thread(pull_request_store.check_room, session_id, url)
+            except SessionPullRequestLimitError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            except Exception:  # The attach below still records what it can.
+                _logger.warning(
+                    "Could not check the session's pull request limit",
+                    exc_info=True,
+                    extra={"session_id": session_id},
+                )
+        params = await _github_params(
+            session_id, {"url": url, "action": action, "session_id": session_id}
+        )
+        requested_at = time.time()
+        try:
+            status, result = await _proxy_post_to_runner(
+                session_id,
+                f"/v1/sessions/{session_id}/resources/github/prs",
+                params,
+                conv,
+            )
+        except OmnigentError as exc:
+            if exc.code != ErrorCode.RUNNER_UNAVAILABLE:
+                raise
+            payload = await _write_workspace_via_host(
+                session_id, conv, op="github_prs_update", host_params=params
+            )
+            if payload is None:
+                raise
+            result = payload
+        else:
+            if status >= 400:
+                raise HTTPException(
+                    status_code=status,
+                    detail=result.get("detail", "Cannot update pull requests"),
+                )
+        if action == "attach":
+            await _record_attached(session_id, result)
+        elif store_unlink:
+            await _store_unlink(session_id, url)
+        return await _with_server_pull_requests(session_id, result, requested_at)
+
+    def _tunnel_is_local(conv: Conversation) -> bool:
+        """Whether this replica holds the session's runner or host tunnel."""
+        from omnigent.runtime import get_runner_router
+
+        routing = get_runner_router()
+        if (
+            conv.runner_id is not None
+            and routing is not None
+            and routing.runner_is_online(conv.runner_id)
+        ):
+            return True
+        return (
+            conv.host_id is not None
+            and host_registry is not None
+            and host_registry.get(conv.host_id) is not None
+        )
+
+    async def _refresh_session_pull_requests(session_id: str) -> None:
+        """Read a session's PR info from its runner or host, which stores what it reports."""
+        conv = await _validate_session(session_id)
+        if not _tunnel_is_local(conv):
+            return
+        stored = (
+            await asyncio.to_thread(pull_request_store.read, session_id)
+            if pull_request_store is not None
+            else None
+        )
+        # Outside a git checkout, a synced session without PRs has none to refresh.
+        if conv.git_branch is None and stored is not None and stored.synced and not stored.entries:
+            return
+        await _github_info(session_id, conv)
+
+    if pull_request_refresher is not None and pull_request_store is not None:
+        pull_request_refresher.bind(_refresh_session_pull_requests)
+
+    @router.get("/sessions/{session_id}/pull-requests", response_model=SessionPullRequestList)
+    async def list_session_pull_requests(
+        request: Request,
+        session_id: str,
+        limit: int = Query(default=100, ge=1, le=100),
+        after: str | None = Query(default=None, max_length=2048),
+    ) -> SessionPullRequestList:
+        """
+        List the session's linked pull requests from the server.
+
+        Never contacts the runner or host, so it answers while both are
+        offline. Each entry carries the state the host last fetched, and
+        ``synced`` says whether the server has imported the session's PRs yet.
+
+        :param request: The incoming FastAPI request (for auth).
+        :param session_id: Session/conversation identifier.
+        :param limit: The most PRs to return.
+        :param after: The ``last_id`` (PR URL) of the previous page.
+        :returns: A page of linked PRs in display order.
+        """
+        await _validate_session(session_id, request, LEVEL_READ)
+        if pull_request_store is None:
+            return SessionPullRequestList()
+        try:
+            page = await asyncio.to_thread(
+                pull_request_store.list_page, session_id, limit=limit, after_url=after
+            )
+        except LookupError as exc:
+            raise HTTPException(
+                status_code=400, detail="`after` is not a pull request linked to this session"
+            ) from exc
+        return server_prs.list_page(page)
+
+    @router.delete("/sessions/{session_id}/pull-requests", response_model=SessionPullRequestList)
+    async def unlink_session_pull_request(
+        request: Request,
+        session_id: str,
+        url: str = Query(max_length=2048),
+    ) -> SessionPullRequestList:
+        """
+        Unlink a pull request from the session, whether or not its host is online.
+
+        The server's unlink stands on its own; it is also passed to the runner
+        or host when one is reachable, so its local list stops reporting the PR.
+
+        :param request: The incoming FastAPI request (for auth).
+        :param session_id: Session/conversation identifier.
+        :param url: The linked PR's URL.
+        :returns: The first page of the session's remaining linked PRs.
+        """
+        conv = await _validate_session(session_id, request, LEVEL_EDIT)
+        if pull_request_store is None:
+            raise OmnigentError(
+                "Pull request storage is unavailable", code=ErrorCode.INTERNAL_ERROR
+            )
+        await asyncio.to_thread(pull_request_store.remove, session_id, url)
+        try:
+            await _update_host_pull_requests(session_id, conv, url, "remove")
+        except OmnigentError as exc:
+            # The client re-addresses to the replica holding the host; repeating is safe.
+            if exc.code == ErrorCode.WRONG_REPLICA:
+                raise
+            _logger.debug(
+                "Unlink not forwarded to the session host",
+                exc_info=True,
+                extra={"session_id": session_id},
+            )
+        except HTTPException:  # The stored unlink stands either way.
+            _logger.debug(
+                "Unlink not forwarded to the session host",
+                exc_info=True,
+                extra={"session_id": session_id},
+            )
+        page = await asyncio.to_thread(pull_request_store.list_page, session_id, limit=100)
+        return server_prs.list_page(page)
+
+    # ── GitHub integration (read-only) ───────────────────────────
+    # Registered BEFORE the generic ``/{resource_id}`` lookup so
+    # ``/resources/github`` is not captured as a resource id. The diff route
+    # lives on ``file_read_router`` (gzip) above.
+
+    @router.get(
+        "/sessions/{session_id}/resources/repository-branches",
+        response_model=SessionRepositoryBranchList,
+    )
+    async def get_session_repository_branches(request: Request, session_id: str) -> dict[str, Any]:
+        """Suggest fork branches without waking or modifying the source sandbox."""
+        from omnigent.onboarding.sandboxes.types import clone_dir_names
+        from omnigent.server.managed_hosts import (
+            parse_repo_workspace,
+            read_managed_repo_workspaces,
+        )
+
+        conversation = await _validate_session(session_id, request, LEVEL_READ)
+        workspaces = read_managed_repo_workspaces(conversation.labels)
+        try:
+            repositories = [parse_repo_workspace(workspace) for workspace in workspaces]
+        except ValueError:
+            return {"repositories": []}
+        unknown = {
+            "repositories": [
+                {"url": repository.url, "branch": None, "pushed": None}
+                for repository in repositories
+            ]
+        }
+        if not repositories or not conversation.workspace:
+            return unknown
+        targets = [
+            {"url": repository.url, "path": name if len(repositories) > 1 else ""}
+            for repository, name in zip(repositories, clone_dir_names(repositories), strict=True)
+        ]
+        try:
+            async with asyncio.timeout(7.0):
+                return await _fs_get_with_host_fallback(
+                    session_id,
+                    conversation,
+                    op="repository_branches",
+                    host_params={"repositories": targets},
+                    runner_path=f"/v1/sessions/{session_id}/resources/repository-branches",
+                    runner_params={"repositories": json.dumps(targets)},
+                    runner_timeout=7.0,
+                )
+        except TimeoutError:
+            return unknown
+        except OmnigentError as exc:
+            if exc.code not in {
+                ErrorCode.RUNNER_UNAVAILABLE,
+                ErrorCode.CONFLICT,
+                ErrorCode.NOT_FOUND,
+                ErrorCode.SESSION_AGENT_MISSING,
+            }:
+                raise
+        except HTTPException as exc:
+            if exc.status_code not in {400, 404, 410, 502, 503, 504}:
+                raise
+        return unknown
+
+    @router.get(
+        "/sessions/{session_id}/resources/github",
+        response_model=None,
+    )
+    async def get_session_github(
+        request: Request,
+        session_id: str,
+        pr_url: str | None = None,
+    ) -> dict[str, Any]:
+        """
+        Return GitHub context (repo, branch, base ref, PR) for a session.
+
+        Proxies to the runner, which shells out to ``gh``/``git`` in the
+        workspace. Returns an ``available: false`` payload (200) when ``gh`` is
+        missing or the workspace is not a git repo.
+
+        :param request: The incoming FastAPI request (for auth).
+        :param session_id: Session/conversation identifier.
+        :returns: The ``session.github.info`` object.
+        """
+        conv = await _validate_session(session_id, request, LEVEL_READ)
+        return await _github_info(session_id, conv, pr_url)
+
+    @router.get(
+        "/sessions/{session_id}/resources/github/changes",
+        response_model=None,
+    )
+    async def list_session_github_changes(
+        request: Request,
+        session_id: str,
+        pr_url: str | None = None,
+    ) -> dict[str, Any]:
+        """
+        List the PR's changed files (empty when the branch has no PR).
+
+        :param request: The incoming FastAPI request (for auth).
+        :param session_id: Session/conversation identifier.
+        :returns: Flat list of changed files with ``status`` and line counts.
+        """
+        conv = await _authorize_browse_read(session_id, request)
+        params = await _github_params(session_id, {"pr_url": pr_url} if pr_url else {})
+        return await _fs_get_with_host_fallback(
+            session_id,
+            conv,
+            op="github_changes",
+            host_params=params,
+            runner_params=params or None,
+            runner_path=f"/v1/sessions/{session_id}/resources/github/changes",
+        )
+
+    @router.post("/sessions/{session_id}/resources/github/prs", response_model=None)
+    async def update_session_github_pr(request: Request, session_id: str) -> dict[str, Any]:
+        """
+        Link a pull request the session's host can read, or unlink one.
+
+        Both need the runner or host online: linking verifies the PR with its
+        provider account, and the server records an unlink once the host accepts
+        it. ``DELETE /pull-requests`` unlinks while they are offline.
+
+        :param request: JSON body with ``url`` and ``action`` (``attach`` or ``remove``).
+        :param session_id: Session/conversation identifier.
+        :returns: The refreshed ``session.github.info`` object.
+        """
+        conv = await _validate_session(session_id, request, LEVEL_EDIT)
+        body = await request.json()
+        if not isinstance(body, dict) or not isinstance(body.get("url"), str):
+            raise HTTPException(status_code=400, detail="Expected a pull request URL")
+        action = body.get("action", "attach")
+        return await _update_host_pull_requests(
+            session_id, conv, body["url"], action, store_unlink=action == "remove"
+        )
+
+    @router.post(
+        "/sessions/{session_id}/resources/github/preferences",
+        response_model=None,
+    )
+    async def set_session_github_preference(
+        request: Request,
+        session_id: str,
+    ) -> dict[str, Any]:
+        """
+        Apply the GitHub panel's account (and optional base) selection.
+
+        Persists the choice — a per-workspace account preference in the user
+        config, and ``gh repo set-default`` when a base is given — then returns the
+        refreshed ``session.github.info``. Served by the runner when it's online,
+        else by the host over its tunnel (both run the same
+        :func:`github_resource.set_github_preference` against the local config +
+        workspace), so a preference change works with the runner asleep.
+
+        :param request: The incoming FastAPI request (JSON body + auth).
+        :param session_id: Session/conversation identifier.
+        :returns: The refreshed ``session.github.info`` object.
+        """
+        conv = await _validate_session(session_id, request, LEVEL_EDIT)
+        body = await request.json()
+        params = {"account": body.get("account"), "remote": body.get("remote")}
+        if body.get("pr_url"):
+            params.update(pr_url=body["pr_url"], session_id=session_id)
+        params = await _github_params(session_id, params)
+        requested_at = time.time()
+        try:
+            status, result = await _proxy_post_to_runner(
+                session_id,
+                f"/v1/sessions/{session_id}/resources/github/preferences",
+                params,
+                conv,
+            )
+        except OmnigentError as exc:
+            # Runner asleep — serve the write from the host if it's connected.
+            if exc.code != ErrorCode.RUNNER_UNAVAILABLE:
+                raise
+            payload = await _write_workspace_via_host(
+                session_id, conv, op="github_set_preference", host_params=params
+            )
+            if payload is None:
+                raise
+            return await _with_server_pull_requests(session_id, payload, requested_at)
+        if status >= 400:
+            error = result.get("error", {})
+            raise OmnigentError(
+                error.get("message", f"GitHub preference update failed (HTTP {status})"),
+                code=error.get("code", ErrorCode.INTERNAL_ERROR),
+            )
+        return await _with_server_pull_requests(session_id, result, requested_at)
+
+    @router.get(
+        "/sessions/{session_id}/resources/github/labels",
+        response_model=None,
+    )
+    async def list_session_github_labels(
+        request: Request,
+        session_id: str,
+        pr_url: str,
+    ) -> dict[str, Any]:
+        """
+        List the labels the selected PR's repository offers, for the label picker.
+
+        Requires edit access, like the label edit it feeds. Falls back to the
+        host tunnel when the runner is offline.
+
+        :param request: The incoming FastAPI request (for auth).
+        :param session_id: Session/conversation identifier.
+        :param pr_url: The selected PR, which must be tracked by the session.
+        :returns: A list of ``{name, color, description}`` with ``has_more``.
+        """
+        conv = await _validate_session(session_id, request, LEVEL_EDIT)
+        params = await _github_params(session_id, {"pr_url": pr_url})
+        return await _fs_get_with_host_fallback(
+            session_id,
+            conv,
+            op="github_labels",
+            host_params=params,
+            runner_params=params,
+            runner_path=f"/v1/sessions/{session_id}/resources/github/labels",
+            runner_timeout=_PR_EDIT_PROXY_TIMEOUT_S,
+        )
+
+    @router.post(
+        "/sessions/{session_id}/resources/github/labels",
+        response_model=None,
+        dependencies=[Depends(require_json_content_type)],
+    )
+    async def update_session_github_labels(request: Request, session_id: str) -> dict[str, Any]:
+        """
+        Add and remove labels on the selected PR with the host's provider account.
+
+        Served by the runner when it's online, else by the host over its tunnel.
+
+        :param request: JSON body with ``pr_url`` and ``add`` / ``remove`` name lists.
+        :param session_id: Session/conversation identifier.
+        :returns: A ``session.github.pr_labels`` with the PR's resulting labels.
+        """
+        conv = await _validate_session(session_id, request, LEVEL_EDIT)
+        body = await request.json()
+        if not isinstance(body, dict) or not isinstance(body.get("pr_url"), str):
+            raise HTTPException(status_code=400, detail="Expected a pull request URL")
+        return await _post_pr_edit(
+            session_id,
+            conv,
+            runner_path=f"/v1/sessions/{session_id}/resources/github/labels",
+            host_op="github_labels_update",
+            params={
+                "pr_url": body["pr_url"],
+                "add": body.get("add", []),
+                "remove": body.get("remove", []),
+            },
+            failure_detail="Cannot update labels",
+        )
+
+    @router.get(
+        "/sessions/{session_id}/resources/github/merge-options",
+        response_model=None,
+    )
+    async def get_session_github_merge_options(
+        request: Request,
+        session_id: str,
+        pr_url: str,
+    ) -> dict[str, Any]:
+        """
+        List the merge methods the selected PR's repository allows, for the merge dialog.
+
+        Requires edit access, like the merge it feeds. Falls back to the host
+        tunnel when the runner is offline.
+
+        :param request: The incoming FastAPI request (for auth).
+        :param session_id: Session/conversation identifier.
+        :param pr_url: The selected PR, which must be tracked by the session.
+        :returns: A ``session.github.merge_options`` with ``methods`` and ``default``.
+        """
+        conv = await _validate_session(session_id, request, LEVEL_EDIT)
+        params = await _github_params(session_id, {"pr_url": pr_url})
+        return await _fs_get_with_host_fallback(
+            session_id,
+            conv,
+            op="github_merge_options",
+            host_params=params,
+            runner_params=params,
+            runner_path=f"/v1/sessions/{session_id}/resources/github/merge-options",
+            runner_timeout=_PR_EDIT_PROXY_TIMEOUT_S,
+        )
+
+    @router.post(
+        "/sessions/{session_id}/resources/github/merge",
+        response_model=None,
+        dependencies=[Depends(require_json_content_type)],
+    )
+    async def merge_session_github_pr(request: Request, session_id: str) -> dict[str, Any]:
+        """
+        Merge the selected PR with the host's provider account.
+
+        The merge applies only while the PR's head is ``expected_head``. Served by
+        the runner when it's online, else by the host over its tunnel.
+
+        :param request: JSON body with ``pr_url``, ``merge_method`` (``merge``,
+            ``squash``, or ``rebase``), and ``expected_head``, a full commit SHA.
+        :param session_id: Session/conversation identifier.
+        :returns: A ``session.github.pr_merge``.
+        """
+        conv = await _validate_session(session_id, request, LEVEL_EDIT)
+        body = await request.json()
+        if not isinstance(body, dict) or not isinstance(body.get("pr_url"), str):
+            raise HTTPException(status_code=400, detail="Expected a pull request URL")
+        return await _post_pr_edit(
+            session_id,
+            conv,
+            runner_path=f"/v1/sessions/{session_id}/resources/github/merge",
+            host_op="github_merge",
+            params={
+                "pr_url": body["pr_url"],
+                "merge_method": body.get("merge_method"),
+                "expected_head": body.get("expected_head"),
+            },
+            failure_detail="Cannot merge the pull request",
+        )
+
+    @router.post(
+        "/sessions/{session_id}/resources/github/disable-auto-merge",
+        response_model=None,
+        dependencies=[Depends(require_json_content_type)],
+    )
+    async def disable_session_github_auto_merge(
+        request: Request, session_id: str
+    ) -> dict[str, Any]:
+        """
+        Turn off the selected PR's auto-merge with the host's provider account.
+
+        Served by the runner when it's online, else by the host over its tunnel.
+
+        :param request: JSON body with ``pr_url``.
+        :param session_id: Session/conversation identifier.
+        :returns: A ``session.github.pr_merge``.
+        """
+        conv = await _validate_session(session_id, request, LEVEL_EDIT)
+        body = await request.json()
+        if not isinstance(body, dict) or not isinstance(body.get("pr_url"), str):
+            raise HTTPException(status_code=400, detail="Expected a pull request URL")
+        return await _post_pr_edit(
+            session_id,
+            conv,
+            runner_path=f"/v1/sessions/{session_id}/resources/github/disable-auto-merge",
+            host_op="github_disable_auto_merge",
+            params={"pr_url": body["pr_url"]},
+            failure_detail="Cannot disable auto-merge",
+        )
+
+    @router.get(
+        "/sessions/{session_id}/resources/github/reviewers",
+        response_model=None,
+    )
+    async def list_session_github_reviewers(
+        request: Request,
+        session_id: str,
+        pr_url: str,
+    ) -> dict[str, Any]:
+        """
+        List the users and teams a review of the selected PR can be requested from.
+
+        Requires edit access, like the reviewer edit it feeds. Falls back to the
+        host tunnel when the runner is offline.
+
+        :param request: The incoming FastAPI request (for auth).
+        :param session_id: Session/conversation identifier.
+        :param pr_url: The selected PR, which must be tracked by the session.
+        :returns: A list of ``{login, kind, name}`` with ``has_more``.
+        """
+        conv = await _validate_session(session_id, request, LEVEL_EDIT)
+        params = await _github_params(session_id, {"pr_url": pr_url})
+        return await _fs_get_with_host_fallback(
+            session_id,
+            conv,
+            op="github_reviewers",
+            host_params=params,
+            runner_params=params,
+            runner_path=f"/v1/sessions/{session_id}/resources/github/reviewers",
+            runner_timeout=_PR_EDIT_PROXY_TIMEOUT_S,
+        )
+
+    @router.post(
+        "/sessions/{session_id}/resources/github/reviewers",
+        response_model=None,
+        dependencies=[Depends(require_json_content_type)],
+    )
+    async def update_session_github_reviewers(request: Request, session_id: str) -> dict[str, Any]:
+        """
+        Request reviews on the selected PR and withdraw pending requests.
+
+        Uses the host's provider account; served by the runner when it's online,
+        else by the host over its tunnel.
+
+        :param request: JSON body with ``pr_url`` and ``add`` / ``remove`` lists
+            of ``{login, kind}``.
+        :param session_id: Session/conversation identifier.
+        :returns: A ``session.github.pr_reviewers`` with the PR's resulting reviewers.
+        """
+        conv = await _validate_session(session_id, request, LEVEL_EDIT)
+        body = await request.json()
+        if not isinstance(body, dict) or not isinstance(body.get("pr_url"), str):
+            raise HTTPException(status_code=400, detail="Expected a pull request URL")
+        return await _post_pr_edit(
+            session_id,
+            conv,
+            runner_path=f"/v1/sessions/{session_id}/resources/github/reviewers",
+            host_op="github_reviewers_update",
+            params={
+                "pr_url": body["pr_url"],
+                "add": body.get("add", []),
+                "remove": body.get("remove", []),
+            },
+            failure_detail="Cannot update reviewers",
+        )
+
+    @router.get("/sessions/{session_id}/resources/github/review-threads", response_model=None)
+    async def get_session_review_threads(
+        request: Request,
+        session_id: str,
+        pr_url: str,
+        after: str = "",
+        head_sha: str = "",
+        base_sha: str = "",
+    ) -> dict[str, Any]:
+        """Read review conversations, with code excerpts subject to file sharing."""
+        conv = await _authorize_browse_read(session_id, request)
+        params = await _github_params(
+            session_id,
+            {
+                "pr_url": pr_url,
+                "after": after,
+                "head_sha": head_sha,
+                "base_sha": base_sha,
+            },
+        )
+        return await _fs_get_with_host_fallback(
+            session_id,
+            conv,
+            op="github_review_threads",
+            host_params=params,
+            runner_params=params,
+            runner_path=f"/v1/sessions/{session_id}/resources/github/review-threads",
+        )
+
+    @router.get(
+        "/sessions/{session_id}/resources/github/review-threads/{thread_id}/comments",
+        response_model=None,
+    )
+    async def get_session_review_thread_comments(
+        request: Request,
+        session_id: str,
+        thread_id: str,
+        pr_url: str,
+        after: str,
+    ) -> dict[str, Any]:
+        """Load additional replies in a published PR review conversation."""
+        conv = await _validate_session(session_id, request, LEVEL_READ)
+        params = await _github_params(session_id, {"pr_url": pr_url, "after": after})
+        return await _fs_get_with_host_fallback(
+            session_id,
+            conv,
+            op="github_review_thread_comments",
+            host_params={**params, "thread_id": thread_id},
+            runner_params=params,
+            runner_path=(
+                f"/v1/sessions/{session_id}/resources/github/review-threads/"
+                f"{urllib.parse.quote(thread_id, safe='')}/comments"
+            ),
+        )
+
+    @router.post(
+        "/sessions/{session_id}/resources/github/review-threads",
+        response_model=None,
+        dependencies=[Depends(require_json_content_type)],
+    )
+    async def create_session_review_thread(request: Request, session_id: str) -> dict[str, Any]:
+        """Publish a new line conversation with the host's selected GitHub account."""
+        conv = await _validate_session(session_id, request, LEVEL_EDIT)
+        body = await request.json()
+        if not isinstance(body, dict) or not isinstance(body.get("pr_url"), str):
+            raise HTTPException(status_code=400, detail="Expected a pull request URL")
+        return await _post_pr_edit(
+            session_id,
+            conv,
+            runner_path=f"/v1/sessions/{session_id}/resources/github/review-threads",
+            host_op="github_review_thread_create",
+            non_idempotent=True,
+            params={
+                "pr_url": body["pr_url"],
+                "body": body.get("body"),
+                "anchor": body.get("anchor"),
+            },
+            failure_detail="Could not confirm comment posting. Check GitHub before retrying.",
+        )
+
+    @router.post(
+        "/sessions/{session_id}/resources/github/review-threads/{thread_id}/replies",
+        response_model=None,
+        dependencies=[Depends(require_json_content_type)],
+    )
+    async def reply_to_session_review_thread(
+        request: Request,
+        session_id: str,
+        thread_id: str,
+    ) -> dict[str, Any]:
+        """Publish one reply with the host's selected GitHub account."""
+        conv = await _validate_session(session_id, request, LEVEL_EDIT)
+        body = await request.json()
+        if not isinstance(body, dict) or not isinstance(body.get("pr_url"), str):
+            raise HTTPException(status_code=400, detail="Expected a pull request URL")
+        return await _post_pr_edit(
+            session_id,
+            conv,
+            runner_path=(
+                f"/v1/sessions/{session_id}/resources/github/review-threads/"
+                f"{urllib.parse.quote(thread_id, safe='')}/replies"
+            ),
+            host_op="github_review_thread_reply",
+            non_idempotent=True,
+            params={"pr_url": body["pr_url"], "thread_id": thread_id, "body": body.get("body")},
+            failure_detail="Could not confirm comment posting. Check GitHub before retrying.",
+        )
+
+    @router.post(
+        "/sessions/{session_id}/resources/github/comments",
+        response_model=None,
+        dependencies=[Depends(require_json_content_type)],
+    )
+    async def create_session_github_comment(request: Request, session_id: str) -> dict[str, Any]:
+        """Post a top-level comment using the host's selected GitHub account."""
+        conv = await _validate_session(session_id, request, LEVEL_EDIT)
+        body = await request.json()
+        if not isinstance(body, dict) or not isinstance(body.get("pr_url"), str):
+            raise HTTPException(status_code=400, detail="Expected a pull request URL")
+        return await _post_pr_edit(
+            session_id,
+            conv,
+            runner_path=f"/v1/sessions/{session_id}/resources/github/comments",
+            host_op="github_comment_create",
+            non_idempotent=True,
+            params={"pr_url": body["pr_url"], "body": body.get("body")},
+            failure_detail="Could not confirm comment posting. Check GitHub before retrying.",
+        )
+
+    @router.post(
+        "/sessions/{session_id}/resources/github/details",
+        response_model=None,
+        dependencies=[Depends(require_json_content_type)],
+    )
+    async def update_session_github_details(request: Request, session_id: str) -> dict[str, Any]:
+        """
+        Replace the selected PR's title and/or description.
+
+        Uses the host's provider account; served by the runner when it's online,
+        else by the host over its tunnel.
+
+        :param request: JSON body with ``pr_url`` and an optional ``title`` and ``body``;
+            an omitted or null field keeps its current value.
+        :param session_id: Session/conversation identifier.
+        :returns: A ``session.github.pr_details`` with the PR's resulting title and body.
+        """
+        conv = await _validate_session(session_id, request, LEVEL_EDIT)
+        body = await request.json()
+        if not isinstance(body, dict) or not isinstance(body.get("pr_url"), str):
+            raise HTTPException(status_code=400, detail="Expected a pull request URL")
+        return await _post_pr_edit(
+            session_id,
+            conv,
+            runner_path=f"/v1/sessions/{session_id}/resources/github/details",
+            host_op="github_details_update",
+            params={
+                "pr_url": body["pr_url"],
+                "title": body.get("title"),
+                "body": body.get("body"),
+            },
+            failure_detail="Cannot update the pull request",
+        )
+
+    @router.post(
+        "/sessions/{session_id}/resources/github/attachments",
+        response_model=None,
+        # Multipart is CORS-safelisted, so only the Origin check stops a
+        # cross-site page uploading under the PR account.
+        dependencies=[Depends(require_trusted_origin)],
+    )
+    async def upload_session_github_attachment(
+        request: Request,
+        session_id: str,
+        pr_url: Annotated[str, Form()],
+        file: Annotated[UploadFile, File(...)],
+    ) -> dict[str, Any]:
+        """
+        Upload an image or video to embed in the selected PR's description.
+
+        The file goes to the provider without being kept by Omnigent, and the PR
+        is unchanged until a description that links it is saved. Falls back to
+        the host tunnel when the runner is offline.
+
+        :param request: The incoming FastAPI request (for auth).
+        :param session_id: Session/conversation identifier.
+        :param pr_url: The selected PR, which must be tracked by the session.
+        :param file: The image or video.
+        :returns: A ``session.github.pr_attachment`` with the ``url`` to embed.
+        """
+        conv = await _validate_session(session_id, request, LEVEL_EDIT)
+        content = await _read_upload_capped(file, _MAX_PR_ATTACHMENT_BYTES)
+        name = file.filename or ""
+        tracking = await _github_params(session_id, {"pr_url": pr_url})
+        try:
+            resp = await _post_attachment_to_runner(session_id, conv, name, content, tracking)
+        except OmnigentError as exc:
+            if exc.code != ErrorCode.RUNNER_UNAVAILABLE:
+                raise
+            payload = await _write_workspace_via_host(
+                session_id,
+                conv,
+                op="github_attachment_upload",
+                host_params={
+                    **tracking,
+                    "name": name,
+                    "content_base64": base64.b64encode(content).decode("ascii"),
+                },
+                timeout=_PR_ATTACHMENT_PROXY_TIMEOUT_S,
+            )
+            if payload is None:
+                raise
+            return payload
+        try:
+            result = resp.json()
+        except ValueError:
+            result = None
+        if resp.status_code >= 400 or not isinstance(result, dict):
+            detail = result.get("detail") if isinstance(result, dict) else None
+            raise HTTPException(
+                status_code=resp.status_code if resp.status_code >= 400 else 502,
+                detail=detail or "Cannot upload the file",
+            )
+        return result
+
+    async def _post_attachment_to_runner(
+        session_id: str,
+        conv: Conversation,
+        name: str,
+        content: bytes,
+        tracking: dict[str, Any],
+    ) -> httpx.Response:
+        """Forward an attachment's raw bytes to the runner.
+
+        :param tracking: ``pr_url`` and the server's vouching for it, as query params.
+
+        :raises OmnigentError: ``runner_unavailable`` when the runner is offline.
+        :raises HTTPException: 502 when the runner cannot be reached otherwise.
+        """
+        runner_client = await _get_runner_client_for_resource_access(session_id, conversation=conv)
+        if runner_client is None:
+            raise HTTPException(status_code=502, detail="no runner available for resource access")
+        try:
+            return await runner_client.post(
+                f"/v1/sessions/{session_id}/resources/github/attachments",
+                params={**tracking, "name": name},
+                content=content,
+                headers={"Content-Type": "application/octet-stream"},
+                timeout=_PR_ATTACHMENT_PROXY_TIMEOUT_S,
+            )
+        except (httpx.HTTPError, ConnectionError) as exc:
+            raise HTTPException(
+                status_code=502, detail="runner resource endpoint unavailable"
+            ) from exc
+
+    # Generic single-resource lookup — registered AFTER typed
+    # collections so "environments", "terminals", "files" are not
+    # captured as resource_id.
+
+    @router.get(
+        "/sessions/{session_id}/resources/{resource_id}",
+        response_model=None,
+    )
+    async def get_session_resource(
+        request: Request,
+        session_id: str,
+        resource_id: str,
+    ) -> dict[str, Any]:
+        """
+        Return a single resource by id from the unified inventory.
+
+        :param session_id: Session/conversation identifier.
+        :param resource_id: Opaque resource id.
+        :returns: The resource object regardless of type.
+        """
+        conv = await _validate_session(session_id, request, LEVEL_READ)
+        path = f"/v1/sessions/{session_id}/resources/{resource_id}"
+        return await _proxy_get_to_runner(session_id, path, conv)
+
+    # Mount the gzip-wrapped file reads. Appended after every sibling route so
+    # the `{relative_path:path}` catch-alls cannot shadow a more specific
+    # sibling (e.g. `.../environments/{id}/shell`), which is how they behaved
+    # when they were registered inline on `router`.
+    router.include_router(file_read_router)

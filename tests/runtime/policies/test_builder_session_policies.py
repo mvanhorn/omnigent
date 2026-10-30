@@ -11,6 +11,10 @@ Also covers DB-stored default policies (``session_id IS NULL``) and the
 
 from __future__ import annotations
 
+import logging
+from typing import Any
+
+import cachetools
 import pytest
 
 from omnigent.entities import Policy as StoredPolicy
@@ -18,6 +22,7 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.policies.function import FunctionPolicy
 from omnigent.runtime.policies.builder import (
     _DEFAULT_POLICY_SPECS_CACHE,
+    _DEFAULT_POLICY_SPECS_KEY,
     _SESSION_POLICY_SPECS_CACHE,
     _load_default_policy_specs,
     _load_session_policy_specs,
@@ -25,6 +30,7 @@ from omnigent.runtime.policies.builder import (
     build_policy_engine,
     invalidate_default_policy_specs_cache,
     invalidate_session_policy_specs_cache,
+    policy_specs_cache_age,
 )
 from omnigent.spec.types import (
     AgentSpec,
@@ -185,6 +191,54 @@ def test_invalidate_session_policy_specs_cache(db_uri: str) -> None:
     assert len(second) == 2
 
 
+class _CorruptedTTLCache(cachetools.TTLCache[Any, Any]):
+    """TTLCache whose expiry links are broken, as after unlocked writes."""
+
+    def __init__(self) -> None:
+        super().__init__(maxsize=64, ttl=30)
+
+    def expire(self, time: Any = None) -> Any:
+        raise KeyError((0, "conv_corrupted"))
+
+
+def test_corrupted_session_cache_falls_back_to_db_and_resets(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A raising session-policy cache never fails the engine build.
+
+    The DB specs are still enforced, a warning is logged, and the
+    corrupted backing is replaced so later builds cache normally again.
+
+    :param db_uri: Per-test SQLite URI from the root conftest.
+    """
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    conv = conv_store.create_conversation()
+    policy_store = SqlAlchemyPolicyStore(db_uri)
+    policy_store.create(
+        policy_id="3f0c2b8e6a9d4e1f8b7a6c5d4e3f2a1b",
+        session_id=conv.id,
+        name="survives_corruption",
+        type="python",
+        handler="tests.resources.examples._shared.tool_functions.block_long_sleep",
+    )
+    corrupted = _CorruptedTTLCache()
+    monkeypatch.setattr(_SESSION_POLICY_SPECS_CACHE, "_backing", corrupted)
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.db.workspace_cache"):
+        engine = build_policy_engine(
+            spec=_make_minimal_spec(),
+            conversation_id=conv.id,
+            conversation_store=conv_store,
+            policy_store=policy_store,
+        )
+
+    assert engine.policies[0].spec.name == "survives_corruption"
+    assert "Resetting workspace-scoped cache" in caplog.text
+    assert _SESSION_POLICY_SPECS_CACHE._backing is not corrupted
+    first = _load_session_policy_specs(conv.id, policy_store)
+    assert _load_session_policy_specs(conv.id, policy_store) is first
+
+
 def test_load_session_policy_specs_filters_disabled(db_uri: str) -> None:
     """Disabled policies are excluded from the loaded specs.
 
@@ -282,7 +336,10 @@ def test_build_engine_includes_session_policies(db_uri: str) -> None:
 
     assert isinstance(engine.policies[0], FunctionPolicy)
     assert engine.policies[0].spec.name == "test_policy"
-    assert engine.policies[-1].spec.name == "__ask_on_add_policy"
+    assert [p.spec.name for p in engine.policies[-2:]] == [
+        "__ask_on_add_policy",
+        "__ask_on_scheduled_task_change",
+    ]
 
 
 def test_build_engine_no_store_returns_noop(db_uri: str) -> None:
@@ -299,9 +356,11 @@ def test_build_engine_no_store_returns_noop(db_uri: str) -> None:
         policy_store=None,
     )
 
-    # No user-declared policies, but ask_on_add_policy is always present.
-    assert len(engine.policies) == 1
-    assert engine.policies[0].spec.name == "__ask_on_add_policy"
+    # No user-declared policies, but the mandatory approval guards are always present.
+    assert [p.spec.name for p in engine.policies] == [
+        "__ask_on_add_policy",
+        "__ask_on_scheduled_task_change",
+    ]
 
 
 def test_build_engine_ordering_session_agent_admin(db_uri: str) -> None:
@@ -359,6 +418,7 @@ def test_build_engine_ordering_session_agent_admin(db_uri: str) -> None:
         "agent_policy",
         "admin_policy",
         "__ask_on_add_policy",
+        "__ask_on_scheduled_task_change",
     ]
 
 
@@ -401,16 +461,18 @@ def test_subagent_inherits_root_session_policies(db_uri: str) -> None:
 
     names = [p.spec.name for p in engine.policies]
     assert "root_guard" in names, f"root session policy not inherited by sub-agent; got {names}"
+    assert names.count("__ask_on_scheduled_task_change") == 1
     # Root policy should come before the ask_on_add_policy sentinel.
     assert names.index("root_guard") < names.index("__ask_on_add_policy")
 
 
-def test_subagent_deduplicates_same_name_policy(db_uri: str) -> None:
-    """When root and child both have a policy with the same name, child wins.
+def test_subagent_exact_duplicate_keeps_root_policy_order(db_uri: str) -> None:
+    """An identical child policy cannot move its root copy later.
 
-    The root's copy is dropped to avoid double-evaluation. The
-    child's version appears in the engine at the session-policy
-    position.
+    Root and child carry structurally identical policies (same name,
+    handler, params), so only the root copy should remain. Keeping its
+    original position prevents the child from moving the guardrail behind
+    a later root policy.
 
     :param db_uri: Per-test SQLite URI.
     """
@@ -424,13 +486,19 @@ def test_subagent_deduplicates_same_name_policy(db_uri: str) -> None:
     )
 
     policy_store = SqlAlchemyPolicyStore(db_uri)
-    # Same-name policy on both root and child.
     policy_store.create(
         policy_id="c6de31de238a26c347a7c3d8d5a74c3a",
         session_id=root_conv.id,
         name="shared_guard",
         type="python",
         handler=handler,
+    )
+    policy_store.create(
+        policy_id="f4a8c2e6b0d1c3e5f7a9b2d4e6c8a0b1",
+        session_id=root_conv.id,
+        name="root_policy_after_guard",
+        type="python",
+        handler="tests.resources.examples._shared.tool_functions.block_division",
     )
     policy_store.create(
         policy_id="86507aab3e1f97f6b1bace6058204f1a",
@@ -448,9 +516,119 @@ def test_subagent_deduplicates_same_name_policy(db_uri: str) -> None:
     )
 
     names = [p.spec.name for p in engine.policies]
-    # "shared_guard" should appear exactly once (child's version).
     assert names.count("shared_guard") == 1, (
         f"expected exactly 1 'shared_guard', got {names.count('shared_guard')} in {names}"
+    )
+    assert names.index("shared_guard") < names.index("root_policy_after_guard"), (
+        f"expected the root guard to retain its original position; got {names}"
+    )
+
+
+def test_subagent_same_name_different_handler_keeps_root_policy(db_uri: str) -> None:
+    """A child policy squatting an inherited policy's name must not drop it.
+
+    Root has a guardrail; the child has a *different* policy reusing its
+    name. Both instances must be in the child's engine (the root's first),
+    so a name collision cannot neutralize the inherited guardrail.
+
+    :param db_uri: Per-test SQLite URI.
+    """
+    root_handler = "tests.resources.examples._shared.tool_functions.block_long_sleep"
+    child_handler = "tests.resources.examples._shared.tool_functions.block_division"
+
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    root_conv = conv_store.create_conversation()
+    child_conv = conv_store.create_conversation(
+        parent_conversation_id=root_conv.id,
+        kind="sub_agent",
+    )
+
+    policy_store = SqlAlchemyPolicyStore(db_uri)
+    policy_store.create(
+        policy_id="5b2c1f7a9d3e4c8ab6f0d1e2c3a4b5d6",
+        session_id=root_conv.id,
+        name="shared_guard",
+        type="python",
+        handler=root_handler,
+    )
+    policy_store.create(
+        policy_id="9e8d7c6b5a4f3e2d1c0b9a8f7e6d5c4b",
+        session_id=child_conv.id,
+        name="shared_guard",
+        type="python",
+        handler=child_handler,
+    )
+
+    engine = build_policy_engine(
+        spec=_make_minimal_spec(),
+        conversation_id=child_conv.id,
+        conversation_store=conv_store,
+        policy_store=policy_store,
+    )
+
+    shared = [
+        p
+        for p in engine.policies
+        if isinstance(p, FunctionPolicy) and p.spec.name == "shared_guard"
+    ]
+    handlers = [p.spec.function.path for p in shared if p.spec.function is not None]
+    assert handlers == [root_handler, child_handler], (
+        f"expected the inherited root policy to survive the name collision "
+        f"(root first, child appended); got handlers {handlers}"
+    )
+
+
+def test_subagent_same_name_different_params_keeps_root_policy(db_uri: str) -> None:
+    """A looser same-handler child policy must not replace the root's.
+
+    Root and child share name and handler but differ in factory params
+    (the child's limit is effectively no-op). Both must run so the
+    stricter root configuration still enforces.
+
+    :param db_uri: Per-test SQLite URI.
+    """
+    handler = "omnigent.policies.builtins.safety.max_tool_calls_per_session"
+
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    root_conv = conv_store.create_conversation()
+    child_conv = conv_store.create_conversation(
+        parent_conversation_id=root_conv.id,
+        kind="sub_agent",
+    )
+
+    policy_store = SqlAlchemyPolicyStore(db_uri)
+    policy_store.create(
+        policy_id="1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d",
+        session_id=root_conv.id,
+        name="tool_budget",
+        type="python",
+        handler=handler,
+        factory_params={"limit": 1},
+    )
+    policy_store.create(
+        policy_id="6d5c4b3a2f1e0d9c8b7a6f5e4d3c2b1a",
+        session_id=child_conv.id,
+        name="tool_budget",
+        type="python",
+        handler=handler,
+        factory_params={"limit": 100000},
+    )
+
+    engine = build_policy_engine(
+        spec=_make_minimal_spec(),
+        conversation_id=child_conv.id,
+        conversation_store=conv_store,
+        policy_store=policy_store,
+    )
+
+    budgets = [
+        p
+        for p in engine.policies
+        if isinstance(p, FunctionPolicy) and p.spec.name == "tool_budget"
+    ]
+    args = [p.spec.function.arguments for p in budgets if p.spec.function is not None]
+    assert args == [{"limit": 1}, {"limit": 100000}], (
+        f"expected both same-named configurations to run (strict root first); got {args}"
     )
 
 
@@ -709,4 +887,32 @@ def test_build_engine_ordering_session_agent_db_default_admin(db_uri: str) -> No
         "db_default_policy",
         "yaml_admin_policy",
         "__ask_on_add_policy",
+        "__ask_on_scheduled_task_change",
     ]
+
+
+def test_policy_specs_cache_age_tracks_the_older_store_read(db_uri: str) -> None:
+    """A no-policy answer is as old as the older of the two lists behind it.
+
+    A list no longer cached counts as a full TTL old, and without a store
+    there is nothing to go stale.
+
+    :param db_uri: Per-test SQLite URI from the root conftest.
+    """
+    store = SqlAlchemyPolicyStore(db_uri)
+    session_id = "0f4a9f8e7d6c5b4a39281706f5e4d3c2"
+    _DEFAULT_POLICY_SPECS_CACHE.clear()
+    _SESSION_POLICY_SPECS_CACHE.clear()
+    assert policy_specs_cache_age(session_id, None) == 0.0
+    assert policy_specs_cache_age(session_id, store) == 30.0
+
+    _load_default_policy_specs(store)
+    _load_session_policy_specs(session_id, store)
+    assert policy_specs_cache_age(session_id, store) < 1.0
+
+    specs, loaded_at = _SESSION_POLICY_SPECS_CACHE[session_id]
+    _SESSION_POLICY_SPECS_CACHE[session_id] = (specs, loaded_at - 20.0)
+    assert 20.0 <= policy_specs_cache_age(session_id, store) < 21.0
+    assert _DEFAULT_POLICY_SPECS_KEY in _DEFAULT_POLICY_SPECS_CACHE
+    _DEFAULT_POLICY_SPECS_CACHE.clear()
+    _SESSION_POLICY_SPECS_CACHE.clear()

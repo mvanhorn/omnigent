@@ -1,10 +1,10 @@
 """Tests for the generic-OIDC ``/auth/callback`` email resolution gate.
 
-These drive the *real* callback route end-to-end for a non-GitHub
-(generic OIDC) provider: a genuinely RS256-signed ``id_token`` is fed
-through the production ``jwt.decode`` path (real signature + ``iss`` /
-``aud`` / ``exp`` verification), and the only thing the tests vary is
-the ``email_verified`` claim.
+These drive the *real* generic-OIDC validation path with genuinely signed
+``id_token`` values (real signature + ``iss`` / ``aud`` / ``exp``
+verification). The callback-route tests vary the ``email_verified`` claim;
+the algorithm regression test uses an ES384 key to cover providers that do
+not advertise ES256.
 
 This is the regression coverage for "OIDC login accepts
 unverified email claim (account takeover)". Before the fix the
@@ -20,23 +20,32 @@ minted session cookie is the production code path.
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import time
 from collections.abc import Iterator
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 import httpx
 import jwt
 import pytest
-from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives.asymmetric import ec, rsa
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-from jwt.algorithms import RSAAlgorithm
+from jwt.algorithms import ECAlgorithm, RSAAlgorithm
 
 from omnigent.server.admin_list import AdminList
 from omnigent.server.auth import UnifiedAuthProvider
+from omnigent.server.device_grant_store import DeviceGrantStore
 from omnigent.server.oidc import OIDCConfig
-from omnigent.server.routes.auth import _AUTH_STATE_COOKIE_PLAIN, create_auth_router
+from omnigent.server.routes.auth import (
+    _AUTH_STATE_COOKIE_PLAIN,
+    _resolve_oidc_email,
+    create_auth_router,
+)
+from omnigent.server.routes.device_auth import create_device_auth_router
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 
 _TEST_SECRET = bytes.fromhex("aa" * 32)
@@ -44,9 +53,20 @@ _ISSUER = "https://accounts.google.com"
 _CLIENT_ID = "cid"
 
 
+def _cli_pkce_pair() -> tuple[str, str]:
+    verifier = "v" * 64
+    challenge = (
+        base64.urlsafe_b64encode(hashlib.sha256(verifier.encode("ascii")).digest())
+        .rstrip(b"=")
+        .decode("ascii")
+    )
+    return verifier, challenge
+
+
 def _oidc_config(
     skip_email_verification: bool = False,
     email_claim: str = "email",
+    require_reauth: bool = True,
 ) -> OIDCConfig:
     """Build a generic-OIDC config over plain HTTP (so TestClient cookies stick).
 
@@ -57,6 +77,8 @@ def _oidc_config(
         as ``OMNIGENT_OIDC_SKIP_EMAIL_VERIFICATION`` would.
     :param email_claim: Claim carrying the email identity, as
         ``OMNIGENT_OIDC_EMAIL_CLAIM`` would set it.
+    :param require_reauth: Verify ``auth_time`` on forced re-authentication,
+        as ``OMNIGENT_OIDC_REQUIRE_REAUTH`` would set it.
     """
     return OIDCConfig(
         issuer=_ISSUER,
@@ -76,6 +98,7 @@ def _oidc_config(
         allow_invites=False,
         skip_email_verification=skip_email_verification,
         email_claim=email_claim,
+        require_reauth=require_reauth,
     )
 
 
@@ -177,6 +200,7 @@ def callback_client(
         prefix="/auth",
     )
     app.state.pending_id_token = pending_id_token
+    app.state.auth_provider = provider
 
     with TestClient(app) as client:
         yield client, keys
@@ -211,6 +235,35 @@ def _do_callback(client: TestClient, id_token: str) -> httpx.Response:
         f"/auth/callback?code=auth-code&state={state}",
         follow_redirects=False,
     )
+
+
+def test_oidc_accepts_es384_id_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Accept a valid token from an IdP that only advertises ES384."""
+    private_key = ec.generate_private_key(ec.SECP384R1())
+    jwk_dict = json.loads(ECAlgorithm.to_jwk(private_key.public_key()))
+    jwk_dict["alg"] = "ES384"
+    signing_key = jwt.PyJWK.from_dict(jwk_dict)
+    monkeypatch.setattr(
+        jwt.PyJWKClient,
+        "get_signing_key_from_jwt",
+        lambda self, token: signing_key,
+    )
+
+    now = int(time.time())
+    token = jwt.encode(
+        {
+            "iss": _ISSUER,
+            "aud": _CLIENT_ID,
+            "iat": now,
+            "exp": now + 300,
+            "email": "Alice@Example.com",
+            "email_verified": True,
+        },
+        private_key,
+        algorithm="ES384",
+    )
+
+    assert _resolve_oidc_email({"id_token": token}, _oidc_config()) == "Alice@Example.com"
 
 
 def test_callback_verified_email_mints_session(
@@ -445,3 +498,590 @@ def test_callback_accepts_boolean_and_string_true(
     # Accepted as a verified identity → redirect + session.
     assert resp.status_code == 302, resp.text
     assert resp.cookies.get("ap_session") is not None
+
+
+# ── Forced re-auth: callback verifies id_token auth_time ───────────
+
+
+def _do_callback_reauth(client: TestClient, id_token: str, *, reauth_at: int) -> httpx.Response:
+    """Drive ``/auth/callback`` with a state cookie that demanded re-auth.
+
+    Mirrors :func:`_do_callback` but stamps ``reauth_at`` into the signed
+    state — the marker ``/auth/login?reauth=1`` writes when it forwards
+    ``prompt=login``/``max_age=0`` to the IdP. The callback must then
+    verify the id_token's ``auth_time`` proves a real re-authentication.
+    """
+    client.app.state.pending_id_token[0] = id_token
+    state = "state-token-reauth"
+    state_jwt = jwt.encode(
+        {
+            "state": state,
+            "code_verifier": "verifier",
+            "return_to": "/",
+            "exp": int(time.time()) + 300,
+            "reauth_at": reauth_at,
+        },
+        _TEST_SECRET,
+        algorithm="HS256",
+    )
+    client.cookies.set(_AUTH_STATE_COOKIE_PLAIN, state_jwt)
+    return client.get(
+        f"/auth/callback?code=auth-code&state={state}",
+        follow_redirects=False,
+    )
+
+
+def test_reauth_callback_accepts_fresh_auth_time(
+    callback_client: tuple[TestClient, _IdpKeys],
+) -> None:
+    """A reauth login whose auth_time is at/after the demand mints a session.
+
+    Conformant IdP honoring prompt=login: it re-authenticated the user
+    now, so auth_time >= reauth_at and the freshness demand is satisfied.
+    """
+    client, keys = callback_client
+    reauth_at = int(time.time())
+    token = keys.sign_id_token(
+        {"email": "alice@example.com", "email_verified": True, "auth_time": reauth_at + 1}
+    )
+
+    resp = _do_callback_reauth(client, token, reauth_at=reauth_at)
+
+    assert resp.status_code == 302, resp.text
+    assert resp.cookies.get("ap_session") is not None
+
+
+def test_reauth_callback_rejects_stale_auth_time(
+    callback_client: tuple[TestClient, _IdpKeys],
+) -> None:
+    """A reauth login whose auth_time predates the demand is refused.
+
+    This is the residual bypass the auth_time check closes: the IdP
+    silently reused its session (auth_time is the original login, before
+    we demanded prompt=login). Trusting it would mint a fresh-iat session
+    that sails past the device-consent freshness gate — a reflex-approve.
+    """
+    client, keys = callback_client
+    reauth_at = int(time.time())
+    token = keys.sign_id_token(
+        {"email": "alice@example.com", "email_verified": True, "auth_time": reauth_at - 3600}
+    )
+
+    resp = _do_callback_reauth(client, token, reauth_at=reauth_at)
+
+    assert resp.status_code == 403, resp.text
+    assert "did not re-authenticate" in resp.json()["error"]
+    assert resp.cookies.get("ap_session") is None
+
+
+def test_reauth_callback_rejects_missing_auth_time(
+    callback_client: tuple[TestClient, _IdpKeys],
+) -> None:
+    """A reauth login with no auth_time claim is refused.
+
+    max_age makes auth_time REQUIRED in the id_token (OIDC Core §3.1.3.7);
+    an IdP that omits it leaves the re-auth unverifiable, so we refuse
+    rather than trust an unprovable claim.
+    """
+    client, keys = callback_client
+    reauth_at = int(time.time())
+    token = keys.sign_id_token({"email": "alice@example.com", "email_verified": True})
+
+    resp = _do_callback_reauth(client, token, reauth_at=reauth_at)
+
+    assert resp.status_code == 403, resp.text
+    assert "did not confirm re-authentication" in resp.json()["error"]
+    assert resp.cookies.get("ap_session") is None
+
+
+def test_reauth_callback_accepts_entra_token_expiring_on_arrival(
+    callback_client: tuple[TestClient, _IdpKeys],
+) -> None:
+    """A reauth id_token whose ``exp`` has just passed is accepted within the leeway.
+
+    Microsoft Entra ID caps ``exp`` at ``auth_time + max_age``, so the
+    ``max_age=0`` that forced re-auth sends yields a token already at its
+    expiry on arrival. Zero-leeway validation rejected it as ``Signature
+    has expired``, surfacing as "Could not determine user email from IdP".
+    """
+    client, keys = callback_client
+    now = int(time.time())
+    reauth_at = now - 2
+    token = keys.sign_id_token(
+        {
+            "email": "alice@example.com",
+            "email_verified": True,
+            "iat": now - 300,
+            "auth_time": now - 1,
+            "exp": now - 1,
+        }
+    )
+
+    resp = _do_callback_reauth(client, token, reauth_at=reauth_at)
+
+    assert resp.status_code == 302, resp.text
+    assert resp.cookies.get("ap_session") is not None
+
+
+def test_reauth_callback_rejects_token_expired_beyond_leeway(
+    callback_client: tuple[TestClient, _IdpKeys],
+) -> None:
+    """The leeway is bounded: a genuinely stale id_token is still rejected."""
+    client, keys = callback_client
+    now = int(time.time())
+    reauth_at = now - 2
+    token = keys.sign_id_token(
+        {
+            "email": "alice@example.com",
+            "email_verified": True,
+            "iat": now - 3600,
+            "auth_time": now - 1,
+            "exp": now - 600,
+        }
+    )
+
+    resp = _do_callback_reauth(client, token, reauth_at=reauth_at)
+
+    assert resp.status_code == 400, resp.text
+    assert "Could not determine user email" in resp.json()["error"]
+    assert resp.cookies.get("ap_session") is None
+
+
+@pytest.mark.parametrize("callback_client", [{"require_reauth": False}], indirect=True)
+@pytest.mark.parametrize(
+    "auth_time_offset", [pytest.param(None, id="missing"), pytest.param(-3600, id="stale")]
+)
+def test_reauth_callback_opt_out_skips_auth_time_check(
+    callback_client: tuple[TestClient, _IdpKeys],
+    auth_time_offset: int | None,
+) -> None:
+    """With the operator opt-out, IdPs that omit or reuse auth_time can sign in."""
+    client, keys = callback_client
+    reauth_at = int(time.time())
+    claims: dict[str, object] = {"email": "alice@example.com", "email_verified": True}
+    if auth_time_offset is not None:
+        claims["auth_time"] = reauth_at + auth_time_offset
+
+    resp = _do_callback_reauth(client, keys.sign_id_token(claims), reauth_at=reauth_at)
+
+    assert resp.status_code == 302, resp.text
+    decoded = jwt.decode(resp.cookies["ap_session"], _TEST_SECRET, algorithms=["HS256"])
+    assert decoded["sub"] == "alice@example.com"
+
+
+def test_non_reauth_callback_ignores_auth_time(
+    callback_client: tuple[TestClient, _IdpKeys],
+) -> None:
+    """A plain login (no reauth_at) never consults auth_time.
+
+    Baseline: the new check must not affect the ordinary login path — a
+    token with no auth_time still mints a session when reauth was not
+    demanded.
+    """
+    client, keys = callback_client
+    token = keys.sign_id_token({"email": "alice@example.com", "email_verified": True})
+
+    resp = _do_callback(client, token)
+
+    assert resp.status_code == 302, resp.text
+    assert resp.cookies.get("ap_session") is not None
+
+
+# ── CLI login tickets + login-issued refresh grants ───────────────
+
+
+@pytest.mark.parametrize("reauth", ["1", "0", None])
+def test_cli_ticket_generic_oidc_reauth_round_trip(
+    callback_client: tuple[TestClient, _IdpKeys],
+    reauth: str | None,
+) -> None:
+    client, keys = callback_client
+    verifier, challenge = _cli_pkce_pair()
+    created = client.post(
+        "/auth/cli-login", json={"code_challenge": challenge, "code_challenge_method": "S256"}
+    ).json()
+    login_url = httpx.URL(created["login_url"]).copy_remove_param("reauth")
+    if reauth is not None:
+        login_url = login_url.copy_set_param("reauth", reauth)
+    login = client.get(str(login_url), follow_redirects=False)
+    authorization = parse_qs(urlsplit(login.headers["location"]).query)
+    assert authorization["prompt"] == ["login"]
+    assert authorization["max_age"] == ["0"]
+    state = jwt.decode(
+        client.cookies[_AUTH_STATE_COOKIE_PLAIN], _TEST_SECRET, algorithms=["HS256"]
+    )
+    assert state["ticket"] == created["ticket"]
+    client.app.state.pending_id_token[0] = keys.sign_id_token(
+        {"email": "alice@example.com", "email_verified": True, "auth_time": state["reauth_at"]}
+    )
+    callback = client.get(
+        "/auth/callback",
+        params={"code": "auth-code", "state": authorization["state"][0]},
+        follow_redirects=False,
+    )
+    assert callback.status_code == 302
+    consent = client.get(callback.headers["location"])
+    assert "Authorize sign-in" in consent.text
+    poll_params = {"ticket": created["ticket"]}
+    poll_headers = {"X-Omnigent-Code-Verifier": verifier}
+    assert (
+        client.get("/auth/cli-poll", params=poll_params, headers=poll_headers).status_code == 202
+    )
+    approval = client.post(
+        "/auth/cli-approve", data=poll_params, headers={"Origin": "http://testserver"}
+    )
+    assert "<h1>Approved</h1>" in approval.text
+    redeemed = client.get("/auth/cli-poll", params=poll_params, headers=poll_headers)
+    assert redeemed.status_code == 200
+    assert redeemed.json()["user_id"] == "alice@example.com"
+
+
+@pytest.mark.parametrize(
+    ("callback_client", "idp_sends_auth_time"),
+    [
+        pytest.param({}, True, id="auth-time-verified"),
+        pytest.param({"require_reauth": False}, False, id="reauth-opt-out-without-auth-time"),
+    ],
+    indirect=["callback_client"],
+)
+@pytest.mark.parametrize(
+    "login_kind",
+    ["ordinary_session", "other_ticket", "legacy_state"],
+)
+def test_cli_approval_requires_authentication_for_its_ticket(
+    callback_client: tuple[TestClient, _IdpKeys], idp_sends_auth_time: bool, login_kind: str
+) -> None:
+    client, keys = callback_client
+    verifier, challenge = _cli_pkce_pair()
+    body = {"code_challenge": challenge, "code_challenge_method": "S256"}
+    created = client.post("/auth/cli-login", json=body).json()
+    ticket = created["ticket"]
+    consent_url = f"/auth/cli-consent?ticket={ticket}"
+    if login_kind == "other_ticket":
+        login_url = client.post("/auth/cli-login", json=body).json()["login_url"]
+    else:
+        login_url = str(httpx.URL("/auth/login", params={"return_to": consent_url}))
+    login = client.get(login_url, follow_redirects=False)
+    authorization = parse_qs(urlsplit(login.headers["location"]).query)
+    state = jwt.decode(
+        client.cookies[_AUTH_STATE_COOKIE_PLAIN], _TEST_SECRET, algorithms=["HS256"]
+    )
+    if login_kind == "legacy_state":
+        state["ticket"] = ticket
+        for cookie in client.cookies.jar:
+            if cookie.name == _AUTH_STATE_COOKIE_PLAIN:
+                cookie.value = jwt.encode(state, _TEST_SECRET, algorithm="HS256")
+    claims: dict[str, object] = {"email": "alice@example.com", "email_verified": True}
+    if idp_sends_auth_time:
+        claims["auth_time"] = int(time.time())
+    client.app.state.pending_id_token[0] = keys.sign_id_token(claims)
+    callback = client.get(
+        "/auth/callback",
+        params={"code": "auth-code", "state": authorization["state"][0]},
+        follow_redirects=False,
+    )
+    assert callback.status_code == 302
+    approval = client.post(
+        "/auth/cli-approve", data={"ticket": ticket}, headers={"Origin": "http://testserver"}
+    )
+    assert "<h1>Approved</h1>" not in approval.text
+    poll_params = {"ticket": ticket}
+    poll_headers = {"X-Omnigent-Code-Verifier": verifier}
+    assert (
+        client.get("/auth/cli-poll", params=poll_params, headers=poll_headers).status_code == 202
+    )
+    consent = client.get(consent_url, follow_redirects=False)
+    assert consent.status_code == 302
+    bounce_params = parse_qs(urlsplit(consent.headers["location"]).query)
+    assert bounce_params["ticket"] == [ticket]
+    login = client.get(consent.headers["location"], follow_redirects=False)
+    authorization = parse_qs(urlsplit(login.headers["location"]).query)
+    assert authorization["prompt"] == ["login"]
+    state = jwt.decode(
+        client.cookies[_AUTH_STATE_COOKIE_PLAIN], _TEST_SECRET, algorithms=["HS256"]
+    )
+    if idp_sends_auth_time:
+        claims["auth_time"] = state["reauth_at"]
+    client.app.state.pending_id_token[0] = keys.sign_id_token(claims)
+    callback = client.get(
+        "/auth/callback",
+        params={"code": "auth-code", "state": authorization["state"][0]},
+        follow_redirects=False,
+    )
+    assert callback.status_code == 302
+    assert client.get(consent_url).status_code == 200
+    approval = client.post(
+        "/auth/cli-approve", data=poll_params, headers={"Origin": "http://testserver"}
+    )
+    assert "<h1>Approved</h1>" in approval.text
+    assert (
+        client.get("/auth/cli-poll", params=poll_params, headers=poll_headers).status_code == 200
+    )
+
+
+@pytest.mark.parametrize(
+    ("callback_client", "idp_sends_auth_time", "approved"),
+    [
+        pytest.param({}, True, True, id="auth-time-verified"),
+        pytest.param({}, False, False, id="missing-auth-time-refused"),
+        pytest.param(
+            {"require_reauth": False}, False, True, id="reauth-opt-out-without-auth-time"
+        ),
+    ],
+    indirect=["callback_client"],
+)
+def test_device_approval_reauthenticates_before_consent(
+    callback_client: tuple[TestClient, _IdpKeys],
+    tmp_path: Path,
+    idp_sends_auth_time: bool,
+    approved: bool,
+) -> None:
+    client, keys = callback_client
+    device_store = DeviceGrantStore(f"sqlite:///{tmp_path}/device.db")
+    client.app.include_router(
+        create_device_auth_router(client.app.state.auth_provider, device_store)
+    )
+    claims: dict[str, object] = {"email": "alice@example.com", "email_verified": True}
+    assert _do_callback(client, keys.sign_id_token(claims)).status_code == 302
+    client.cookies.delete(_AUTH_STATE_COOKIE_PLAIN)
+    for cookie in client.cookies.jar:
+        if cookie.name == "ap_session":
+            session = jwt.decode(cookie.value, _TEST_SECRET, algorithms=["HS256"])
+            session["iat"] -= 3600
+            cookie.value = jwt.encode(session, _TEST_SECRET, algorithm="HS256")
+    user_code = client.post("/oauth/device/authorize", json={"client_id": "slack"}).json()[
+        "user_code"
+    ]
+
+    consent = client.get("/oauth/device", params={"user_code": user_code}, follow_redirects=False)
+    assert consent.status_code == 302
+    assert parse_qs(urlsplit(consent.headers["location"]).query)["reauth"] == ["1"]
+    login = client.get(consent.headers["location"], follow_redirects=False)
+    authorization = parse_qs(urlsplit(login.headers["location"]).query)
+    assert authorization["prompt"] == ["login"]
+    assert authorization["max_age"] == ["0"]
+    state = jwt.decode(
+        client.cookies[_AUTH_STATE_COOKIE_PLAIN], _TEST_SECRET, algorithms=["HS256"]
+    )
+    if idp_sends_auth_time:
+        claims["auth_time"] = state["reauth_at"]
+    client.app.state.pending_id_token[0] = keys.sign_id_token(claims)
+    callback = client.get(
+        "/auth/callback",
+        params={"code": "auth-code", "state": authorization["state"][0]},
+        follow_redirects=False,
+    )
+    approval = client.post(
+        "/oauth/device/approve",
+        data={"user_code": user_code},
+        headers={"Origin": "http://localhost:8000"},
+    )
+
+    if not approved:
+        assert callback.status_code == 403
+        assert "did not confirm re-authentication" in callback.json()["error"]
+        assert approval.status_code == 200
+        assert "Your session is too old to approve this login." in approval.text
+        return
+    assert callback.status_code == 302
+    assert "Authorize access" in client.get(callback.headers["location"]).text
+    assert "<h1>Connected</h1>" in approval.text
+
+
+def test_cli_ticket_fulfillment_issues_refresh_grant(
+    tmp_path: Path,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A CLI-ticket login returns refresh material the CLI can renew with.
+
+    End-to-end over the OIDC router + the standalone token router (the
+    OIDC mount): cli-login → callback (fulfills ticket + issues grant) →
+    cli-poll (hands out refresh_token once) → /oauth/token refresh.
+    This is the renewal path that keeps an unattended host alive past
+    session-JWT expiry.
+    """
+    from omnigent.server.device_grant_store import DeviceGrantStore
+    from omnigent.server.routes.device_auth import create_oauth_token_router
+
+    keys = _IdpKeys()
+    perm_store = SqlAlchemyPermissionStore(db_uri)
+    admins = tmp_path / "admins"
+    admins.write_text("")
+    config = _oidc_config()
+    provider = UnifiedAuthProvider(source="oidc", oidc_config=config)
+    grant_store = DeviceGrantStore(db_uri)
+
+    pending_id_token: list[str] = [""]
+
+    async def _fake_post(
+        self: httpx.AsyncClient,
+        url: str,
+        *,
+        data: dict[str, str] | None = None,
+        headers: dict[str, str] | None = None,
+        timeout: float | None = None,
+    ) -> httpx.Response:
+        return httpx.Response(200, json={"id_token": pending_id_token[0]})
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", _fake_post)
+    monkeypatch.setattr(
+        jwt.PyJWKClient,
+        "get_signing_key_from_jwt",
+        lambda self, token: keys.signing_key,
+    )
+
+    app = FastAPI()
+    app.include_router(
+        create_auth_router(
+            provider,
+            perm_store,
+            AdminList(admins),
+            device_grant_store=grant_store,
+        ),
+        prefix="/auth",
+    )
+    app.include_router(create_oauth_token_router(provider, grant_store))
+
+    with TestClient(app) as client:
+        # 1. CLI requests a ticket.
+        cli_verifier, cli_challenge = _cli_pkce_pair()
+        r = client.post(
+            "/auth/cli-login",
+            json={"code_challenge": cli_challenge, "code_challenge_method": "S256"},
+        )
+        assert r.status_code == 200, r.text
+        ticket = r.json()["ticket"]
+
+        # 2. Browser completes the IdP flow; the state cookie carries the
+        # ticket so the callback redirects to the consent page.
+        reauth_at = int(time.time())
+        pending_id_token[0] = keys.sign_id_token(
+            {"email": "alice@example.com", "email_verified": True, "auth_time": reauth_at}
+        )
+        state = "state-token-xyz"
+        state_jwt = jwt.encode(
+            {
+                "state": state,
+                "code_verifier": "verifier",
+                "return_to": "/",
+                "ticket": ticket,
+                "reauth_at": reauth_at,
+                "exp": int(time.time()) + 300,
+            },
+            _TEST_SECRET,
+            algorithm="HS256",
+        )
+        client.cookies.set(_AUTH_STATE_COOKIE_PLAIN, state_jwt)
+        r = client.get(
+            f"/auth/callback?code=auth-code&state={state}",
+            follow_redirects=False,
+        )
+        assert r.status_code == 302, r.text
+        assert r.headers["location"] == f"/auth/cli-consent?ticket={ticket}"
+        r = client.post(
+            "/auth/cli-approve",
+            data={"ticket": ticket},
+            headers={"Origin": "http://localhost:8000"},
+        )
+        assert r.status_code == 200, r.text
+
+        # 3. The CLI polls: session token AND refresh material.
+        r = client.get(f"/auth/cli-poll?ticket={ticket}&code_verifier={cli_verifier}")
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["user_id"] == "alice@example.com"
+        refresh = body.get("refresh_token")
+        assert refresh, "cli-poll must include the login-issued refresh token"
+
+        # 4. The refresh token renews into a delegated access token.
+        r = client.post(
+            "/oauth/token", data={"grant_type": "refresh_token", "refresh_token": refresh}
+        )
+        assert r.status_code == 200, r.text
+        renewed = r.json()
+        assert renewed["access_token"]
+        # Login grants do not rotate — the same refresh token stays valid, so
+        # a lost response cannot brick an unattended host.
+        assert renewed["refresh_token"] == refresh
+        decoded = jwt.decode(renewed["access_token"], _TEST_SECRET, algorithms=["HS256"])
+        assert decoded["sub"] == "alice@example.com"
+        # Revocable (grant_id) but NOT scope-restricted: it renews the session
+        # JWT, so it keeps that authority rather than the delegated allowlist.
+        assert decoded["grant_id"]
+        assert "scope" not in decoded
+
+
+def test_cli_poll_without_grant_store_keeps_legacy_shape(
+    tmp_path: Path,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No grant store wired → the poll response has no refresh_token key
+    (old-server behavior, which new CLIs must tolerate)."""
+    keys = _IdpKeys()
+    perm_store = SqlAlchemyPermissionStore(db_uri)
+    admins = tmp_path / "admins"
+    admins.write_text("")
+    provider = UnifiedAuthProvider(source="oidc", oidc_config=_oidc_config())
+
+    pending_id_token: list[str] = [""]
+
+    async def _fake_post(
+        self: httpx.AsyncClient,
+        url: str,
+        *,
+        data: dict[str, str] | None = None,
+        headers: dict[str, str] | None = None,
+        timeout: float | None = None,
+    ) -> httpx.Response:
+        return httpx.Response(200, json={"id_token": pending_id_token[0]})
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", _fake_post)
+    monkeypatch.setattr(
+        jwt.PyJWKClient,
+        "get_signing_key_from_jwt",
+        lambda self, token: keys.signing_key,
+    )
+
+    app = FastAPI()
+    app.include_router(
+        create_auth_router(provider, perm_store, AdminList(admins)),
+        prefix="/auth",
+    )
+    with TestClient(app) as client:
+        cli_verifier, cli_challenge = _cli_pkce_pair()
+        r = client.post(
+            "/auth/cli-login",
+            json={"code_challenge": cli_challenge, "code_challenge_method": "S256"},
+        )
+        ticket = r.json()["ticket"]
+        reauth_at = int(time.time())
+        pending_id_token[0] = keys.sign_id_token(
+            {"email": "alice@example.com", "email_verified": True, "auth_time": reauth_at}
+        )
+        state = "state-token-xyz"
+        state_jwt = jwt.encode(
+            {
+                "state": state,
+                "code_verifier": "verifier",
+                "return_to": "/",
+                "ticket": ticket,
+                "reauth_at": reauth_at,
+                "exp": int(time.time()) + 300,
+            },
+            _TEST_SECRET,
+            algorithm="HS256",
+        )
+        client.cookies.set(_AUTH_STATE_COOKIE_PLAIN, state_jwt)
+        r = client.get(f"/auth/callback?code=auth-code&state={state}", follow_redirects=False)
+        assert r.status_code == 302
+        r = client.post(
+            "/auth/cli-approve",
+            data={"ticket": ticket},
+            headers={"Origin": "http://localhost:8000"},
+        )
+        assert r.status_code == 200
+        r = client.get(f"/auth/cli-poll?ticket={ticket}&code_verifier={cli_verifier}")
+        assert r.status_code == 200, r.text
+        assert "refresh_token" not in r.json()

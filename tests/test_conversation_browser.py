@@ -2,71 +2,16 @@
 
 from __future__ import annotations
 
+import http.client
 import subprocess
+import time
+import urllib.parse
+import webbrowser
+from pathlib import Path
 
 import pytest
 
 import omnigent.conversation_browser as browser
-
-
-@pytest.mark.parametrize(
-    "url,expected",
-    [
-        # Databricks workspace API mount → the recognizable /omnigent SPA URL.
-        (
-            "https://e2-dogfood.staging.cloud.databricks.com/api/2.0/omnigent",
-            "https://e2-dogfood.staging.cloud.databricks.com/omnigent",
-        ),
-        # A trailing ``?o=<org>`` selector on the API base is dropped.
-        (
-            "https://ws.databricks.com/api/2.0/omnigent?o=123",
-            "https://ws.databricks.com/omnigent",
-        ),
-        # Trailing slash on the API mount still maps cleanly.
-        (
-            "https://ws.databricks.com/api/2.0/omnigent/",
-            "https://ws.databricks.com/omnigent",
-        ),
-        # Non-Databricks URLs pass through unchanged (sans trailing slash).
-        ("http://127.0.0.1:6767", "http://127.0.0.1:6767"),
-        ("https://omnigent-02m5.onrender.com/", "https://omnigent-02m5.onrender.com"),
-    ],
-)
-def test_display_server_url_maps_databricks_api_mount(url: str, expected: str) -> None:
-    """
-    ``display_server_url`` rewrites the Databricks API mount to the SPA URL.
-
-    What this proves: the startup banner shows the workspace ``/omnigent``
-    URL a user recognizes instead of the internal ``/api/2.0/omnigent``
-    proxy path, while every other target is shown verbatim. A regression
-    that stopped mapping would leak the API path back into the banner.
-
-    :returns: None.
-    """
-    assert browser.display_server_url(url) == expected
-
-
-@pytest.mark.parametrize(
-    "url,expected",
-    [
-        ("https://ws.databricks.com/api/2.0/omnigent", True),
-        ("https://ws.databricks.com/api/2.0/omnigent/", True),
-        ("https://ws.databricks.com/omnigent", False),  # the SPA URL, not the API mount
-        ("http://127.0.0.1:6767", False),
-        ("https://omnigent-02m5.onrender.com", False),
-    ],
-)
-def test_is_workspace_hosted_url(url: str, expected: bool) -> None:
-    """
-    ``is_workspace_hosted_url`` is true only for the workspace API mount.
-
-    What this proves: the predicate the banner uses to suppress the
-    server-version row fires for ``/api/2.0/omnigent`` and nothing else, so
-    non-Databricks targets keep showing their version.
-
-    :returns: None.
-    """
-    assert browser.is_workspace_hosted_url(url) is expected
 
 
 def test_conversation_url_quotes_session_id() -> None:
@@ -81,6 +26,30 @@ def test_conversation_url_quotes_session_id() -> None:
     )
 
     assert url == "https://example.com/app/c/conv%20with%2Fslash%3Fquery"
+
+
+def test_conversation_url_prefixes_local_server_base_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A conversation link for our local managed server carries its configured
+    base path (else the SPA loads at a path its router basename does not match
+    and renders blank); a remote --server is never prefixed. Probe-free: the
+    match is against the recorded pidfile, stubbed here for determinism."""
+    from omnigent.host import local_server
+
+    monkeypatch.setattr(local_server, "_read_local_server_pid_file", lambda: (4242, 6767))
+    monkeypatch.setenv("OMNIGENT_WEB_BASE_PATH", "/proxy/6767")
+
+    # Local managed server -> link carries the prefix.
+    assert (
+        browser.conversation_url("http://127.0.0.1:6767", "conv_abc")
+        == "http://127.0.0.1:6767/proxy/6767/c/conv_abc"
+    )
+    # A remote --server keeps its own root (no local prefix leaks in).
+    assert (
+        browser.conversation_url("https://remote.example.com", "conv_abc")
+        == "https://remote.example.com/c/conv_abc"
+    )
 
 
 def test_open_conversation_url_uses_macos_open(
@@ -290,3 +259,270 @@ def test_conversation_url_plain_server_unchanged(tmp_path, monkeypatch) -> None:
         conversation_url("http://127.0.0.1:6767", "conv_abc123")
         == "http://127.0.0.1:6767/c/conv_abc123"
     )
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        # The URL a user copies from the address bar with a conversation open.
+        (
+            "https://app.databricksapps.com/c/9bed9ec6fd244725b60e159dc0052fea",
+            "https://app.databricksapps.com",
+        ),
+        ("https://app.databricksapps.com/c/conv_abc/", "https://app.databricksapps.com"),
+        ("http://127.0.0.1:6767/c/conv_abc", "http://127.0.0.1:6767"),
+        # Workspace web-UI mount keeps its prefix; only the route is trimmed.
+        ("https://ws.databricks.com/omnigent/c/conv_abc", "https://ws.databricks.com/omnigent"),
+        # Real server bases must survive untouched.
+        (
+            "https://ws.databricks.com/api/2.0/omnigent",
+            "https://ws.databricks.com/api/2.0/omnigent",
+        ),
+        ("http://127.0.0.1:6767", "http://127.0.0.1:6767"),
+        # A path that merely contains /c/ elsewhere is not a conversation route.
+        ("https://host.example/c/conv_abc/extra", "https://host.example/c/conv_abc/extra"),
+    ],
+)
+def test_strip_conversation_path(url: str, expected: str) -> None:
+    """A copied conversation link resolves back to the server base.
+
+    The SPA catch-all serves its HTML shell for any GET under ``/c/<id>``, so a
+    pasted conversation URL answers an auth probe with ``200`` and is accepted
+    as a server; every later API call then 404s because no router owns that
+    prefix. Trimming the client-side route is what keeps that URL usable.
+
+    :param url: Input URL.
+    :param expected: Expected server base.
+    :returns: None.
+    """
+    assert browser.strip_conversation_path(url) == expected
+
+
+def test_strip_conversation_path_inverts_conversation_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``strip_conversation_path`` undoes what ``conversation_url`` builds.
+
+    These two must stay inverses: the CLI prints a conversation link with one
+    and has to accept that same link back through the other. If either changes
+    shape independently, a pasted link silently becomes an unusable server URL.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    monkeypatch.setattr("omnigent.cli_auth.load_databricks_org_id", lambda _url: None)
+    base = "https://app.databricksapps.com"
+    link = browser.conversation_url(base, "conv_abc123")
+    assert link == f"{base}/c/conv_abc123"
+    assert browser.strip_conversation_path(link) == base
+
+
+def test_announce_conversation_url_echo_sink() -> None:
+    """The announcement emits one stable, greppable line and returns the URL.
+
+    A headless CI wrapper scrapes this line to surface the session link the
+    moment the session exists (before the turn finishes), so the prefix and
+    the ``<prefix><url>`` shape are a contract with that scraper.
+
+    :returns: None.
+    """
+    captured: list[str] = []
+    url = browser.announce_conversation_url(
+        base_url="http://127.0.0.1:6767",
+        conversation_id="conv_abc123",
+        echo=captured.append,
+    )
+    assert url == "http://127.0.0.1:6767/c/conv_abc123"
+    assert captured == [
+        f"{browser.SESSION_URL_ANNOUNCE_PREFIX}http://127.0.0.1:6767/c/conv_abc123"
+    ]
+
+
+def test_announce_conversation_url_defaults_to_stderr(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """With no echo sink the line goes to stderr, never stdout.
+
+    A one-shot ``-p`` run prints only the final answer to stdout; the session
+    announcement must not intermix with it, so it defaults to stderr.
+
+    :param capsys: Pytest capture fixture.
+    :returns: None.
+    """
+    browser.announce_conversation_url(
+        base_url="http://127.0.0.1:6767",
+        conversation_id="x",
+    )
+    out, err = capsys.readouterr()
+    assert out == ""
+    assert err.strip() == f"{browser.SESSION_URL_ANNOUNCE_PREFIX}http://127.0.0.1:6767/c/x"
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        # A plain conversation link keeps host + route only.
+        ("http://127.0.0.1:6767/c/conv_abc", "omnigent://127.0.0.1:6767/c/conv_abc"),
+        # Mounts and selectors cannot be represented faithfully.
+        (
+            "https://ws.databricks.com/omnigent/c/conv_abc?o=123",
+            None,
+        ),
+        # Local base paths are not discoverable by the desktop.
+        (
+            "http://127.0.0.1:6767/proxy/6767/c/conv_abc",
+            None,
+        ),
+        # Server-home URLs (what `omnigent start` opens) map to the root link.
+        ("http://127.0.0.1:6767", "omnigent://127.0.0.1:6767/"),
+        ("https://ws.databricks.com/omnigent/", None),
+        ("https://example.com/", "omnigent://example.com/"),
+        ("http://localhost:6767/?o=123", None),
+        ("http://localhost:6767/#settings", None),
+        ("http://user:password@localhost:6767/", None),
+        ("http://[invalid/", None),
+        # The desktop shell would infer the wrong scheme, so keep the browser URL.
+        ("http://10.0.0.5:6767/c/conv_abc", None),
+        ("https://localhost:6767/c/conv_abc", None),
+        ("http://[::1]:6767/", "omnigent://[::1]:6767/"),
+        # Non-http(s) input has no deep link.
+        ("omnigent://x/c/y", None),
+        ("not a url", None),
+    ],
+)
+def test_deep_link_url(url: str, expected: str | None) -> None:
+    """Web UI URLs rewrite to omnigent:// deep links carrying host + SPA route.
+
+    :param url: Input browser URL.
+    :param expected: Expected deep link, or None.
+    :returns: None.
+    """
+    assert browser.deep_link_url(url) == expected
+
+
+def test_open_conversation_url_desktop_falls_back_to_browser(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A deep link no app accepts (desktop app not installed) opens the web URL.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    calls: list[list[str]] = []
+
+    def fake_run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        """
+        Reject ``omnigent://`` URLs the way ``open`` does with no handler.
+
+        :param args: Opener argv, e.g. ``["open", "omnigent://h/c/x"]``.
+        :param kwargs: Ignored subprocess options.
+        :returns: A completed process; non-zero for deep links.
+        """
+        calls.append(args)
+        return subprocess.CompletedProcess(args, 1 if args[1].startswith("omnigent:") else 0)
+
+    monkeypatch.setattr(browser.sys, "platform", "darwin")
+    monkeypatch.setattr(browser.subprocess, "run", fake_run)
+
+    opened = browser.open_conversation_url("http://127.0.0.1:6767/c/conv_abc", desktop=True)
+
+    assert opened is True
+    assert len(calls) == 2
+    assert calls[0][0] == "open"
+    assert calls[0][1].startswith("omnigent://127.0.0.1:6767/c/conv_abc?desktop_ack=")
+    assert calls[1] == ["open", "http://127.0.0.1:6767/c/conv_abc"]
+
+
+@pytest.mark.parametrize("handler", ["current", "older", "missing", "wrong-token", "expired"])
+def test_desktop_requires_acknowledgment(monkeypatch: pytest.MonkeyPatch, handler: str) -> None:
+    """Only an app accepting this invocation suppresses the browser fallback."""
+    monkeypatch.setattr(browser, "_DESKTOP_ACK_TIMEOUT", 0.3)
+    opened: list[str] = []
+
+    def open_url(url: str) -> bool:
+        """Emulate installed handlers, including one that ignores root links."""
+        opened.append(url)
+        if not url.startswith("omnigent:"):
+            return True
+        if handler == "missing":
+            raise FileNotFoundError("no opener")
+        if handler == "older":
+            return True
+        query = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)
+        port, token = query["desktop_ack"][0].split(":")
+        if handler == "wrong-token":
+            token = "wrong"
+        if handler == "expired":
+            time.sleep(0.4)
+        connection = http.client.HTTPConnection("127.0.0.1", int(port), timeout=1)
+        try:
+            connection.request("POST", f"/desktop-open/{token}")
+            response = connection.getresponse()
+            assert response.status == {"current": 204, "wrong-token": 404, "expired": 410}[handler]
+            response.read()
+            if handler == "current":
+                connection.request("POST", f"/desktop-open/{token}")
+                assert connection.getresponse().status == 410
+        finally:
+            connection.close()
+        return True
+
+    monkeypatch.setattr(browser, "_open_with_platform_opener", open_url)
+    assert browser.open_conversation_url("http://localhost:6767/", desktop=True)
+    port = int(
+        urllib.parse.parse_qs(urllib.parse.urlsplit(opened[0]).query)["desktop_ack"][0].split(":")[
+            0
+        ]
+    )
+    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=1)
+    with pytest.raises(ConnectionRefusedError):
+        connection.connect()
+    connection.close()
+    assert len(opened) == (1 if handler == "current" else 2)
+    if handler != "current":
+        assert opened[-1] == "http://localhost:6767/"
+
+
+def test_desktop_linux_delayed_opener_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A successful BackgroundBrowser launch is insufficient to accept a link."""
+    opener = tmp_path / "xdg-open"
+    opener.write_text("#!/bin/sh\nsleep 0.1\nexit 1\n")
+    opener.chmod(0o755)
+    controller = webbrowser.BackgroundBrowser(str(opener))
+    opened: list[str] = []
+
+    def open_url(url: str) -> bool:
+        """Use the real asynchronous controller for desktop dispatch."""
+        opened.append(url)
+        if url.startswith("omnigent:"):
+            assert controller.open(url) is True
+        return True
+
+    monkeypatch.setattr(browser.sys, "platform", "linux")
+    monkeypatch.setattr(browser.webbrowser, "open", open_url)
+    monkeypatch.setattr(browser, "_DESKTOP_ACK_TIMEOUT", 0.3)
+    assert browser.open_conversation_url("http://localhost:6767/", desktop=True)
+    assert len(opened) == 2
+    assert opened[-1] == "http://localhost:6767/"
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://localhost:6767/proxy/6767/",
+        "https://workspace.example.com/omnigent/?o=123",
+        "https://localhost:6767/",
+    ],
+)
+def test_desktop_preserves_unrepresentable_browser_url(
+    monkeypatch: pytest.MonkeyPatch, url: str
+) -> None:
+    """Fallback opens the original destination without discarding routing data."""
+    opened: list[str] = []
+    monkeypatch.setattr(
+        browser, "_open_with_platform_opener", lambda target: opened.append(target) or True
+    )
+    assert browser.open_conversation_url(url, desktop=True)
+    assert opened == [url]

@@ -23,118 +23,23 @@ from sqlalchemy import (
     TypeDecorator,
     UniqueConstraint,
     false,
+    func,
     text,
     true,
 )
 from sqlalchemy.dialects.mysql import BINARY as MySQLBinary
+from sqlalchemy.dialects.mysql import VARCHAR as MySQLVarchar
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from omnigent.db.compression import CompressedText
+from omnigent.util.uuid import InvalidUuidError as InvalidUuidError
+from omnigent.util.uuid import normalize_uuid as normalize_uuid
+from omnigent.util.uuid import uuid_to_bytes as uuid_to_bytes
 
 # 32-byte sha256 digest column. LargeBinary → BYTEA (Postgres) / BLOB (SQLite),
 # but MySQL cannot index a BLOB without a key-prefix length, so use fixed-length
 # BINARY(32) there — an exact fit for the digest and fully indexable.
 _CKSUM32 = LargeBinary(32).with_variant(MySQLBinary(32), "mysql")
-
-# 16-byte (truncated sha256) digest column, same rationale as _CKSUM32 but half
-# the width. 128 bits of collision resistance is ample for a per-parent unique
-# key, so the conversation title hash uses this narrower form.
-_CKSUM16 = LargeBinary(16).with_variant(MySQLBinary(16), "mysql")
-
-
-# Hex length of a bare uuid4 id, the canonical Python-side form.
-_UUID_HEX_LEN = 32
-
-# Prefixes ids carried before they became bare 32-char hex. ``uuid_to_bytes``
-# strips exactly these (so old URLs/clients keep resolving) and nothing else —
-# an unknown prefix fails loud rather than silently storing a wrong-typed id's
-# hex tail (e.g. a ``resp_``/``runner_token_`` value mis-passed to a uuid column).
-_LEGACY_ID_PREFIXES = frozenset(
-    {
-        "ag",
-        "conv",
-        "host",
-        "pol",
-        "file",
-        "cmt",
-        # conversation-item per-type prefixes
-        "msg",
-        "fc",
-        "fco",
-        "err",
-        "rs",
-        "cmp",
-        "nt",
-        "rse",
-        "sc",
-        "tc",
-        "rd",
-        # runner-internal conversation binding
-        "agy_conv",
-    }
-)
-
-
-class InvalidUuidError(ValueError):
-    """An id string could not be normalised to a 32-char hex uuid.
-
-    Subclasses ``ValueError`` so existing ``except ValueError`` sites keep
-    working. Surfaced (wrapped in ``sqlalchemy.exc.StatementError``) when a
-    malformed id reaches a ``Uuid16`` column bind; the server maps it to a 404
-    so a bad id in a URL is not-found rather than a 500.
-    """
-
-
-def uuid_to_bytes(value: str | uuid.UUID) -> bytes:
-    """Normalise an id to the 16 raw bytes stored in a ``Uuid16`` column.
-
-    Accepts, reducing them all to the same 16 bytes: a :class:`uuid.UUID`
-    object; the bare 32-char hex form (what generators emit); the dashed
-    canonical uuid (``str(uuid4())``); and a legacy id carrying one of the
-    known :data:`_LEGACY_ID_PREFIXES` (``conv_<hex>``, ``ag_<hex>``, …) — so
-    old bookmarked URLs, pasted ids, and pre-migration clients keep resolving.
-    Anything else — a truncated id, non-hex text, an unknown prefix — fails
-    loud rather than silently storing the wrong bytes.
-
-    :param value: A ``uuid.UUID``, or a 32-char hex uuid optionally dashed or
-        legacy-prefixed.
-    :returns: The 16-byte big-endian value.
-    :raises InvalidUuidError: If *value* is not a 32-char hex uuid.
-    """
-    if isinstance(value, uuid.UUID):
-        return value.bytes
-    normalized = value.replace("-", "")
-    if "_" in normalized:
-        prefix, _, tail = normalized.rpartition("_")
-        if prefix in _LEGACY_ID_PREFIXES and len(tail) == _UUID_HEX_LEN:
-            normalized = tail
-    if len(normalized) != _UUID_HEX_LEN:
-        raise InvalidUuidError(f"expected a 32-char hex uuid, got {value!r}")
-    try:
-        return bytes.fromhex(normalized)
-    except ValueError as exc:
-        raise InvalidUuidError(f"invalid hex uuid: {value!r}") from exc
-
-
-def normalize_uuid(value: str | None) -> str | None:
-    """Return the bare 32-char hex form of *value*, or *value* unchanged.
-
-    The forgiving companion to :func:`uuid_to_bytes` for **Python-side** id
-    comparisons (e.g. a store's scope check against an ORM attribute, which
-    always reads back bare hex). A legacy-prefixed or dashed input normalises
-    to bare hex; a malformed input is returned as-is so the comparison simply
-    mismatches — preserving the pre-migration "unknown id = not found"
-    behaviour instead of raising. ``None`` passes through.
-
-    :param value: Any caller-supplied id string, or ``None``.
-    :returns: The bare 32-char hex form, or *value* verbatim if not a uuid.
-    """
-    if value is None:
-        return None
-    try:
-        return uuid_to_bytes(value).hex()
-    except InvalidUuidError:
-        return value
 
 
 class Uuid16(TypeDecorator[str]):
@@ -149,6 +54,9 @@ class Uuid16(TypeDecorator[str]):
     legacy-prefixed uuids; results always come back as bare lowercase hex.
     Result values guard the same driver variance ``CompressedText`` does:
     ``bytes``, ``memoryview`` (some drivers), or ``str`` (already hex).
+
+    Malformed binds raise ``InvalidUuidError``, wrapped by SQLAlchemy in
+    ``StatementError``. The server maps these invalid URL ids to a 404.
     """
 
     impl = LargeBinary(16)
@@ -159,14 +67,16 @@ class Uuid16(TypeDecorator[str]):
             return dialect.type_descriptor(MySQLBinary(16))
         return dialect.type_descriptor(LargeBinary(16))
 
-    def process_bind_param(self, value: str | uuid.UUID | None, _dialect: object) -> bytes | None:
+    def process_bind_param(self, value: str | uuid.UUID | None, dialect: object) -> bytes | None:
+        del dialect
         if value is None:
             return None
         return uuid_to_bytes(value)
 
     def process_result_value(
-        self, value: bytes | memoryview | str | None, _dialect: object
+        self, value: bytes | memoryview | str | None, dialect: object
     ) -> str | None:
+        del dialect
         if value is None:
             return None
         if isinstance(value, str):
@@ -241,8 +151,8 @@ def workspace_scope(workspace_id: int) -> Iterator[None]:
         _current_workspace_id.reset(token)
 
 
-AGENT_KIND_TEMPLATE = "template"
-AGENT_KIND_SESSION = "session"
+AGENT_KIND_SERVER = "server"
+AGENT_KIND_USER = "user"
 
 POLICY_SCOPE_DEFAULT = "default"
 POLICY_SCOPE_SESSION = "session"
@@ -264,12 +174,17 @@ class SqlAgent(OmnigentBase):
         ``"ag_abc123/a1b2c3d4e5f6..."``.
     :param version: Monotonic version counter. Starts at 1, incremented
         on each update via ``PUT /api/agents/{id}``.
-    :param kind: ``"template"`` for server-wide registered agents;
-        ``"session"`` for per-conversation copies.
+    :param kind: ``"server"`` for server-wide agents (built-ins, ``--agent``);
+        ``"user"`` for agents users upload or install.
     :param description: Optional free-text description of the agent's
         purpose. ``None`` when not provided.
     :param updated_at: Unix epoch seconds of the last update, or
         ``None`` if the agent has never been updated.
+    :param created_by: Identity of the user who created a session-scoped
+        agent, used to restrict agent-code mutation to its owner. ``None``
+        for template agents, single-user mode, and rows created before this
+        column existed (an unowned session-scoped agent is admin-only to
+        mutate).
     """
 
     __tablename__ = "agents"
@@ -288,11 +203,15 @@ class SqlAgent(OmnigentBase):
     bundle_location: Mapped[str] = mapped_column(String(512))
     version: Mapped[int] = mapped_column(Integer, default=1)
     # Enum stored as a stable int code (see omnigent.db.enum_codecs
-    # AGENT_KIND: template=1, session=2). The store converts to/from the
+    # AGENT_KIND: server=1, user=2). The store converts to/from the
     # string name at the row↔entity boundary.
     kind: Mapped[int] = mapped_column(SmallInteger)
     description: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
     updated_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Owner of a user agent (the creating user). Gates agent-code mutation to
+    # the owner; NULL for server agents and pre-migration rows (an unowned
+    # user agent is admin-only).
+    created_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
 
     __table_args__ = (
         CheckConstraint("kind IN (1, 2)", name="ck_agents_kind"),
@@ -305,6 +224,16 @@ class SqlAgent(OmnigentBase):
         # do — kind is included so the seek skips same-named session copies
         # straight to the template row.
         Index("ix_agents_name", "workspace_id", "name", "kind", "id"),
+        # Keyset listing of one user's own agents, newest first: equality on
+        # kind and created_by, order on created_at, primary-key tie-break.
+        Index(
+            "ix_agents_kind_owner_created",
+            "workspace_id",
+            "kind",
+            "created_by",
+            "created_at",
+            "id",
+        ),
     )
 
 
@@ -322,6 +251,10 @@ class SqlFile(OmnigentBase):
     :param bytes: Size of the file in bytes.
     :param content_type: MIME type of the file, e.g.
         ``"application/pdf"``. ``None`` when not provided.
+    :param blob_key: Artifact-store key for this row's bytes. Normally
+        equals ``id``; a forked row points it at the source row's blob
+        so the fork shares the bytes instead of duplicating them.
+        NULL on pre-``blob_key`` rows, read as ``COALESCE(blob_key, id)``.
     """
 
     __tablename__ = "files"
@@ -340,6 +273,13 @@ class SqlFile(OmnigentBase):
     bytes: Mapped[int] = mapped_column(Integer)
     content_type: Mapped[str | None] = mapped_column(String(256), nullable=True)
     session_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
+    # Artifact-store key for the bytes. NULL means "under id" (pre-blob_key
+    # rows); a fork copy sets it to the source's blob so many rows share one
+    # blob. Read as COALESCE(blob_key, id); reference-count it before deleting
+    # the blob so a fork's shared bytes survive the source's deletion.
+    blob_key: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
+    # Opaque JSON metadata about the original upload; never SQL-filtered.
+    source_metadata: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     __table_args__ = (
         # Files are only ever listed per session (WHERE session_id = ?),
@@ -381,6 +321,7 @@ class SqlUser(OmnigentBase):
     """
 
     __tablename__ = "users"
+    account_generation: Mapped[str | None] = mapped_column(String(32), nullable=True)
 
     # Tenant partition key: Databricks workspace id owning this row (0 = default). Part of the PK.
     workspace_id: Mapped[int] = mapped_column(
@@ -392,9 +333,27 @@ class SqlUser(OmnigentBase):
     )
     id: Mapped[str] = mapped_column(String(128), primary_key=True)
     is_admin: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=false())
+    deleted_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
     password_hash: Mapped[str | None] = mapped_column(String(256), nullable=True)
     created_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
     last_login_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+
+class SqlPreference(OmnigentBase):
+    """Named user preferences, scoped to a workspace and stored as opaque JSON."""
+
+    __tablename__ = "preferences"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
+    user_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    key: Mapped[str] = mapped_column(String(128), primary_key=True)
+    value: Mapped[str] = mapped_column(CompressedText, nullable=False)
 
 
 class SqlAccountToken(OmnigentBase):
@@ -431,6 +390,7 @@ class SqlAccountToken(OmnigentBase):
     """
 
     __tablename__ = "account_tokens"
+    account_generation: Mapped[str | None] = mapped_column(String(32), nullable=True)
 
     # Tenant partition key: Databricks workspace id owning this row (0 = default). Part of the PK.
     workspace_id: Mapped[int] = mapped_column(
@@ -456,6 +416,61 @@ class SqlAccountToken(OmnigentBase):
         CheckConstraint("kind IN (1, 2)", name="ck_account_tokens_kind"),
         Index("ix_account_tokens_expires_at", "workspace_id", "expires_at", "id"),
     )
+
+
+class SqlConnection(OmnigentBase):
+    """
+    SQLAlchemy model for the ``connections`` table.
+
+    One row per ``(workspace_id, user_id, provider, account_id)`` recording a
+    user's connected third-party integration (GitHub App today; MCP connectors
+    later). Backs the "Connect …" flows and the per-user sandbox credential
+    broker that vends the secret to managed sandboxes on demand.
+
+    The secret material is stored as one encrypted JSON blob
+    (:attr:`secret_enc`, AWS KMS ciphertext via
+    :class:`omnigent.stores.credential_store.secret_cipher.KmsSecretCipher`)
+    so any provider's secret shape fits without a schema change — plaintext
+    never touches the database.
+    Non-secret provider metadata (login, ids, scopes, expiries) lives in
+    :attr:`metadata_json`. See ``designs/CREDENTIAL_STORE.md``.
+
+    :param user_id: The omnigent user the connection belongs to —
+        email in header/OIDC modes, username in accounts mode.
+    :param provider: Integration provider key, e.g. ``"github"``.
+    :param account_id: Provider account discriminator; ``""`` for the user's
+        single account for that provider (in the PK so multi-account needs no
+        migration).
+    :param secret_enc: Encrypted JSON secret blob (all secret material).
+    :param metadata_json: Non-secret provider metadata as a JSON object.
+    :param created_at: Unix epoch seconds the connection was first made.
+    :param updated_at: Unix epoch seconds of the last refresh/reconnect.
+    """
+
+    __tablename__ = "connections"
+
+    # Tenant partition key: Databricks workspace id owning this row (0 = default). Part of the PK.
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
+    user_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    provider: Mapped[str] = mapped_column(String(64), primary_key=True)
+    account_id: Mapped[str] = mapped_column(
+        String(128), primary_key=True, nullable=False, server_default=""
+    )
+    # Both plain Text, deliberately (not CompressedText): secret_enc is KMS
+    # ciphertext (base64) — high-entropy, so compression buys nothing — and
+    # metadata_json is a small fixed set of provider fields (login, ids, scopes,
+    # expiries), far below the size where zstd's framing overhead pays off.
+    # Neither is filtered or pattern-matched in SQL.
+    secret_enc: Mapped[str] = mapped_column(Text, nullable=False)
+    metadata_json: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[int] = mapped_column(Integer, nullable=False)
+    updated_at: Mapped[int] = mapped_column(Integer, nullable=False)
 
 
 class SqlDeviceGrant(OmnigentBase):
@@ -505,6 +520,7 @@ class SqlDeviceGrant(OmnigentBase):
     """
 
     __tablename__ = "device_grants"
+    account_generation: Mapped[str | None] = mapped_column(String(32), nullable=True)
 
     # Tenant partition key: Databricks workspace id owning this row (0 = default). Part of the PK.
     workspace_id: Mapped[int] = mapped_column(
@@ -601,6 +617,11 @@ class SqlSessionPermission(OmnigentBase):
     )
 
 
+# MySQL stores these documents as BLOB (at most 65,535 bytes), so writes that
+# compress past that fail before reaching MySQL. Other dialects keep the uncapped codec.
+_MYSQL_BLOB_TEXT = CompressedText().with_variant(CompressedText(max_stored_bytes=65_535), "mysql")
+
+
 class SqlConversationMetadata(OmnigentBase):
     """
     SQLAlchemy model for the ``omnigent_conversation_metadata`` table.
@@ -627,11 +648,14 @@ class SqlConversationMetadata(OmnigentBase):
     # No FK: host records are managed outside this table.
     host_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
     sub_agent_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    task_summary: Mapped[str | None] = mapped_column(String(128), nullable=True)
     external_session_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    session_state: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
-    session_usage: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
+    session_state: Mapped[str | None] = mapped_column(_MYSQL_BLOB_TEXT, nullable=True)
+    session_usage: Mapped[str | None] = mapped_column(_MYSQL_BLOB_TEXT, nullable=True)
+    # JSON-encoded provider binding and model catalog captured at session creation.
+    inference_snapshot: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
     # JSON-encoded list of strings. NULL for non-native sessions.
-    terminal_launch_args: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
+    terminal_launch_args: Mapped[str | None] = mapped_column(_MYSQL_BLOB_TEXT, nullable=True)
     # Required when host_id is set; enforced by check constraint below.
     workspace: Mapped[str | None] = mapped_column(String(2048), nullable=True)
     git_branch: Mapped[str | None] = mapped_column(String(255), nullable=True)
@@ -647,6 +671,14 @@ class SqlConversationMetadata(OmnigentBase):
     live_status: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
     # Outstanding elicitation (approval-prompt) count; NULL = never written.
     pending_elicitation_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # First-class project membership. Relates to projects.id; no DB FK
+    # (Rule R032). NULL = unfiled. Coexists with the implicit ``omni_project``
+    # label via the store's dual-read until labels are consolidated.
+    project_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
+    # JSON document of the session's linked pull requests and pending unlinks,
+    # kept under 16,384 stored bytes by SessionPullRequestStore; NULL = none
+    # reported. Deferred so whole-row reads (e.g. the session list) skip it.
+    pull_requests: Mapped[str | None] = mapped_column(CompressedText, nullable=True, deferred=True)
 
     __table_args__ = (
         CheckConstraint("kind IN (1, 2)", name="ck_conversation_metadata_kind"),
@@ -656,29 +688,89 @@ class SqlConversationMetadata(OmnigentBase):
         ),
         # Supports list_conversations_by_runner_id and get_runner_ids.
         Index("ix_conversation_metadata_runner_id", "workspace_id", "runner_id", "id"),
+        Index("ix_conversation_metadata_host_id", "workspace_id", "host_id", "id"),
+        # "list sessions in project X" + per-project counts (GROUP BY project_id).
+        Index("ix_conversation_metadata_project_id", "workspace_id", "project_id", "id"),
     )
 
 
-def conversation_title_hash(title: str) -> bytes:
-    """Return the 16-byte truncated sha256 digest of a conversation title.
-
-    ``ix_conversations_parent_title_unique`` keys on this instead of a wide
-    512-char title prefix, so the unique index stays a fixed 16 bytes. The full
-    title is hashed verbatim (no normalization), so two titles collide iff their
-    digests do — uniqueness is exact and case-sensitive.
+class SqlProject(OmnigentBase):
     """
-    return hashlib.sha256(title.encode("utf-8")).digest()[:16]
+    SQLAlchemy model for the ``projects`` table.
 
+    A user-defined, owner-private container that groups sessions (see
+    ``designs/PROJECTS_PRD.md``). A project row exists independently of its
+    member sessions, so it can be empty, renamed, and carry its own config —
+    the things the implicit ``omni_project`` label could not. Session
+    membership lives on ``omnigent_conversation_metadata.project_id``, not
+    here; there is no DB foreign key (Rule R032).
 
-def _default_conversation_title_hash(context: Any) -> bytes:
-    """Column default: derive ``title_hash`` from the bound ``title`` on INSERT.
+    Ownership is stamped on the row via ``user_id`` (like ``scheduled_tasks``),
+    not derived from a permission table the way session ownership is — projects
+    have no ACL of their own and are never shared.
 
-    ``title`` carries a ``server_default=""``, so an INSERT that omits it leaves
-    ``title`` out of the bound params — fall back to ``""`` to match the stored
-    value. Column defaults do not fire on UPDATE, so the store recomputes it
-    explicitly on the rename paths.
+    :param id: Uuid16 primary key (bare 32-char hex in Python).
+    :param name: Human-readable project name; unique per owner, enforced in the
+        store (``_name_taken``) rather than by a DB constraint — see
+        ``__table_args__``.
+    :param user_id: Owning user, or ``None`` in single-user mode.
+    :param created_at: Unix epoch seconds at row creation.
+    :param updated_at: Unix epoch seconds of the last write, or ``None``.
     """
-    return conversation_title_hash(context.get_current_parameters().get("title") or "")
+
+    __tablename__ = "projects"
+
+    # Tenant partition key: Databricks workspace id owning this row (0 = default). Part of the PK.
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
+    id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    name: Mapped[str] = mapped_column(String(256), nullable=False)
+    # Owning user identity. String(128) matches session_permissions.user_id and
+    # every other user-identity column in this schema.
+    user_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    created_at: Mapped[int] = mapped_column(Integer, nullable=False)
+    updated_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Default session settings as a compact JSON object (host/workspace/harness/
+    # model/reasoning_effort/git base-branch, …), or NULL for "no defaults". The
+    # keys are an opaque, client-owned vocabulary: the value is read and written
+    # whole with the row and never filtered in SQL, so new keys need no schema
+    # change. Stored values are hints the new-chat dialog pre-fills and the user
+    # can always override. Opaque and never SQL-filtered — stored compressed
+    # (CompressedText).
+    config: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
+
+    __table_args__ = (
+        # "list my projects" — prefix scan on (workspace_id, user_id) with
+        # created_at in the key so the ORDER BY created_at, id is served by the
+        # index (no filesort). Personal display order lives in preferences.
+        #
+        # Also covers the two name lookups via its (workspace_id, user_id)
+        # prefix: the store's ``_name_taken`` probe and the ``?project=<name>``
+        # member join. Both then filter ``name`` over the owner's handful of
+        # rows, so neither needs a name-leading index of its own.
+        #
+        # There is deliberately NO unique index on (workspace_id, user_id, name).
+        # Per-owner name uniqueness is a store-level check (``_name_taken``), not
+        # a DB constraint: it never held for single-user mode anyway (``user_id``
+        # is NULL there and SQL treats NULLs as distinct), and ``name`` is
+        # mutable, so a unique key over it is maintained on every rename. The
+        # cost is that two concurrent creates/renames to the same name can both
+        # land; the member join already tolerates duplicate names by
+        # construction, since it unions first-class members with label-projects
+        # matched on the same string.
+        Index(
+            "ix_projects_user_id",
+            "workspace_id",
+            "user_id",
+            "created_at",
+            "id",
+        ),
+    )
 
 
 class SqlConversation(ConversationBase):
@@ -726,14 +818,6 @@ class SqlConversation(ConversationBase):
     created_at: Mapped[int] = mapped_column(Integer)
     updated_at: Mapped[int] = mapped_column(Integer)
     title: Mapped[str] = mapped_column(String(768), nullable=False, server_default="")
-    # Fixed-width sha256(title)[:16] mirror of ``title`` that the unique index
-    # keys on instead of a wide title prefix. The ORM default stamps it on INSERT
-    # and the store recomputes it on rename, so every app-created row has a hash;
-    # it is nullable only so raw-SQL inserts (tests/tooling that bypass the ORM
-    # default) don't have to supply it.
-    title_hash: Mapped[bytes | None] = mapped_column(
-        _CKSUM16, nullable=True, default=_default_conversation_title_hash
-    )
     parent_conversation_id: Mapped[str | None] = mapped_column(
         Uuid16(),
         nullable=True,
@@ -764,9 +848,10 @@ class SqlConversation(ConversationBase):
     )
 
     __table_args__ = (
-        # No bare created_at/updated_at indexes: the sessions list is ACL-scoped
-        # (id IN (...)) and resolves via the PK; the default sidebar (archived=
-        # false, updated_at DESC) is served by the archived_updated index below.
+        # Keep created_at unindexed here: ACL-selective listings may rationally
+        # use a semi-join plus sort, while an ordering index can encourage many
+        # permission probes. The default sidebar (archived=false, updated_at
+        # DESC) is served by the archived_updated index below.
         Index("ix_conversations_archived_updated", "workspace_id", "archived", "updated_at", "id"),
         Index(
             "ix_conversations_root_conversation_id",
@@ -782,18 +867,10 @@ class SqlConversation(ConversationBase):
             "agent_id",
             "id",
         ),
-        # Unique index on (parent_conversation_id, title_hash) prevents two
-        # same-named children under the same parent. Keys on the fixed-width
-        # title_hash rather than a wide title prefix. NULLs are distinct in a
-        # unique index, so top-level conversations (NULL parent) are exempt.
-        Index(
-            "ix_conversations_parent_title_unique",
-            "workspace_id",
-            "parent_conversation_id",
-            "title_hash",
-            unique=True,
-        ),
-        # Composite index for child-session listing.
+        # Child-session listing, and the per-parent title lookup that backs the
+        # application-level (parent, title) uniqueness check in create_conversation
+        # (no DB unique constraint: the check seeks this parent's children here and
+        # filters title as a residual).
         Index(
             "idx_conversations_parent",
             "workspace_id",
@@ -801,6 +878,15 @@ class SqlConversation(ConversationBase):
             text("created_at DESC"),
             text("id DESC"),
         ),
+        # Session title search uses lower(title) LIKE '%query%'. Alembic owns
+        # the PostgreSQL index because its migration first enables pg_trgm;
+        # CRDB bootstrap creates its index directly from model metadata.
+        Index(
+            "ix_conversations_title_trgm",
+            func.lower(title).label("title_lower"),
+            postgresql_using="gin",
+            postgresql_ops={"title_lower": "gin_trgm_ops"},
+        ).ddl_if(dialect="cockroachdb"),
     )
 
 
@@ -1215,6 +1301,13 @@ class SqlHost(OmnigentBase):
     :param sandbox_id: Provider-assigned id of the sandbox currently
         backing the host, e.g. ``"sb-a1b2c3"`` — what termination is
         issued against. ``NULL`` for external hosts.
+    :param terminating_sandbox_id: Provider-assigned id detached from the
+        active host generation and awaiting successful provider termination.
+        A fresh generation may be registered in ``sandbox_id`` while this
+        cleanup remains pending.
+    :param deleted_at: Logical deletion timestamp for a managed host whose
+        provider sandbox cleanup is still pending. The row is physically
+        removed after every recorded sandbox id terminates successfully.
     :param configured_harnesses: JSON-encoded per-harness readiness map
         reported in the host's last ``host.hello`` frame, e.g.
         ``'{"claude-sdk": true, "codex": false}'``. ``NULL`` when the
@@ -1224,6 +1317,7 @@ class SqlHost(OmnigentBase):
     """
 
     __tablename__ = "hosts"
+    account_generation: Mapped[str | None] = mapped_column(String(32), nullable=True)
 
     # Tenant partition key: Databricks workspace id owning this row (0 = default). Part of the PK.
     workspace_id: Mapped[int] = mapped_column(
@@ -1248,6 +1342,8 @@ class SqlHost(OmnigentBase):
     token_expires_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
     sandbox_provider: Mapped[str | None] = mapped_column(String(32), nullable=True)
     sandbox_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    terminating_sandbox_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    deleted_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     # Opaque; never SQL-filtered — stored compressed (CompressedText).
     configured_harnesses: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
 
@@ -1261,6 +1357,13 @@ class SqlHost(OmnigentBase):
         # rotation) stays consistent.
         UniqueConstraint(
             "workspace_id", "user_id", "name", name="uq_hosts_workspace_user_id_name"
+        ),
+        Index("ix_hosts_sandbox_scan", "sandbox_id", "workspace_id", "host_id"),
+        Index(
+            "ix_hosts_terminating_sandbox_scan",
+            "terminating_sandbox_id",
+            "workspace_id",
+            "host_id",
         ),
     )
 
@@ -1276,7 +1379,7 @@ class SqlUserDailyCost(OmnigentBase):
     aggregating the per-session ``conversations.session_usage`` blobs
     on every policy evaluation.
 
-    One row per ``(user_id, day_utc)``. Incremented (UPSERT
+    One row per ``(workspace_id, user_id, day_utc)``. Incremented (UPSERT
     ``cost_usd = cost_usd + delta``) at each turn boundary from the
     cost write sites — but only when the session runs under at least
     one policy, so the table is never touched in deployments that
@@ -1344,6 +1447,10 @@ class SqlScheduledTask(OmnigentBase):
         ``"claude-opus-4-7"``. ``None`` means use the agent default.
     :param reasoning_effort: Per-task reasoning-effort hint, e.g. ``"high"``.
         ``None`` means use the agent default.
+    :param permission_mode: Per-task permission mode for native coding harnesses
+        that support one (Claude Code), e.g. ``"acceptEdits"``. The fire path
+        turns it into the runner's ``--permission-mode`` launch arg. ``None``
+        means use the agent default.
     :param workspace: Absolute path on disk where a fired session's runner
         should start (the source repo / working dir). ``None`` when unset.
     :param base_branch: Git base ref a firing branches FROM when it creates a
@@ -1365,8 +1472,9 @@ class SqlScheduledTask(OmnigentBase):
         deterministic id at fire time, so there is nothing to pin).
     :param timezone: IANA timezone the trigger is evaluated in, e.g.
         ``"America/Los_Angeles"``.
-    :param state: Lifecycle state — ``active``/``paused``/``deleted``.
-        The scheduler only dispatches ``active`` tasks.
+    :param state: Lifecycle state — ``active``/``paused``/``deleted``/``completed``.
+        The scheduler only dispatches ``active`` tasks; ``completed`` schedules
+        have no remaining occurrences.
         Stored as a stable int code (see omnigent.db.enum_codecs
         SCHEDULED_TASK_STATE); the store converts to/from the string name at the
         row↔entity boundary. Defaults to ``active``.
@@ -1376,12 +1484,25 @@ class SqlScheduledTask(OmnigentBase):
         firing (relates to ``conversations.id``). ``None`` if never fired or the
         referenced conversation was deleted (application-owned SET-NULL cleanup;
         no DB foreign key).
+    :param session_mode: Which session each firing uses — ``new`` (a new session
+        per firing) or ``continue`` (one session, ``session_id``, across
+        firings). Stored as a stable int code (see omnigent.db.enum_codecs
+        SCHEDULED_TASK_SESSION_MODE). Defaults to ``new``.
+    :param session_id: For ``session_mode=continue``, the session firings
+        continue (relates to ``conversations.id``; no DB foreign key, Rule R032).
+        ``None`` until the first such firing creates it, unless a session was
+        chosen.
     :param created_at: Unix epoch seconds at row creation.
     :param updated_at: Unix epoch seconds of the last write, or ``None`` if the
         row has never been updated.
     """
 
     __tablename__ = "scheduled_tasks"
+    account_generation: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    next_run_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    project_id: Mapped[str | None] = mapped_column(Uuid16, nullable=True)
+    # Opaque grant reference, never credentials.
+    delegation_ref: Mapped[str | None] = mapped_column(String(1024), nullable=True)
 
     # Tenant partition key: Databricks workspace id owning this row (0 = default). Part of the PK.
     workspace_id: Mapped[int] = mapped_column(
@@ -1409,6 +1530,13 @@ class SqlScheduledTask(OmnigentBase):
     # mirror the matching conversations.* override columns.
     model_override: Mapped[str | None] = mapped_column(String(128), nullable=True)
     reasoning_effort: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # Per-task permission mode for native coding harnesses that carry one
+    # (Claude Code). The fire path converts it to the runner's
+    # ``--permission-mode`` launch arg. NULL = use the agent default.
+    permission_mode: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # Per-firing cost budget in USD. When set, the fire path attaches a
+    # cost_budget policy to each spawned session. NULL = no per-firing cap.
+    max_cost_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
     workspace: Mapped[str | None] = mapped_column(String(2048), nullable=True)
     # Git base ref a firing branches from when it creates a worktree at fire
     # time (mirrors session-create's git.base_branch input). None when unset.
@@ -1428,21 +1556,35 @@ class SqlScheduledTask(OmnigentBase):
     host_id: Mapped[str | None] = mapped_column(Uuid16, nullable=True)
     timezone: Mapped[str] = mapped_column(String(64), nullable=False, server_default="UTC")
     # Enum stored as a stable int code (see omnigent.db.enum_codecs
-    # SCHEDULED_TASK_STATE: active=1, paused=2, deleted=3). The
+    # SCHEDULED_TASK_STATE: active=1, paused=2, deleted=3, completed=4). The
     # store converts to/from the string name at the row↔entity boundary.
     state: Mapped[int] = mapped_column(SmallInteger, nullable=False, server_default="1")
-    last_run_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    last_run_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     # Relates to conversations.id. No DB foreign key (Rule R032); the
     # application nulls this out when the referenced conversation is deleted.
     last_run_conversation_id: Mapped[str | None] = mapped_column(Uuid16, nullable=True)
-    created_at: Mapped[int] = mapped_column(Integer)
-    updated_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Stable int code (see omnigent.db.enum_codecs SCHEDULED_TASK_SESSION_MODE:
+    # new=1, continue=2). Defaults to new so existing tasks keep a new session
+    # per firing.
+    session_mode: Mapped[int] = mapped_column(SmallInteger, nullable=False, server_default="1")
+    # Relates to conversations.id. No DB foreign key (Rule R032).
+    session_id: Mapped[str | None] = mapped_column(Uuid16, nullable=True)
+    created_at: Mapped[int] = mapped_column(BigInteger)
+    updated_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
 
     __table_args__ = (
-        CheckConstraint("state IN (1, 2, 3)", name="ck_scheduled_tasks_state"),
+        CheckConstraint("state IN (1, 2, 3, 4)", name="ck_scheduled_tasks_lifecycle_state"),
         CheckConstraint("execution_target IN (1, 2)", name="ck_scheduled_tasks_execution_target"),
-        Index("ix_scheduled_tasks_created_at", "workspace_id", "created_at", "id"),
-        Index("ix_scheduled_tasks_user_id", "workspace_id", "user_id", "id"),
+        CheckConstraint("session_mode IN (1, 2)", name="ck_scheduled_tasks_session_mode"),
+        Index("ix_scheduled_tasks_due", "state", "next_run_at", "workspace_id", "id"),
+        # Covers a user's task listing ordered by creation time.
+        Index(
+            "ix_scheduled_tasks_user_scope",
+            "workspace_id",
+            "user_id",
+            "created_at",
+            "id",
+        ),
     )
 
 
@@ -1463,7 +1605,7 @@ class SqlScheduledTaskRun(OmnigentBase):
         ``conversations.id``). ``None`` before dispatch, or after the referenced
         conversation is deleted (application-owned SET-NULL; no DB foreign key).
     :param status: Lifecycle state —
-        ``scheduled``/``running``/``succeeded``/``failed``/``skipped``. Stored
+        ``scheduled``/``starting``/``running``/``succeeded``/``failed``/``skipped``. Stored
         as a stable int code (see omnigent.db.enum_codecs
         SCHEDULED_TASK_RUN_STATUS); the store converts to/from the string name
         at the row↔entity boundary.
@@ -1479,6 +1621,16 @@ class SqlScheduledTaskRun(OmnigentBase):
     """
 
     __tablename__ = "scheduled_task_runs"
+    # Canonical occurrence key, without trailing whitespace.
+    trigger_key: Mapped[str | None] = mapped_column(
+        String(256).with_variant(
+            MySQLVarchar(256, charset="utf8mb4", collation="utf8mb4_bin"), "mysql"
+        ),
+        nullable=True,
+    )
+    # The occurrence's assigned host, independent of later task edits.
+    host_id: Mapped[str | None] = mapped_column(Uuid16, nullable=True)
+    lease_expires_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
 
     # Tenant partition key: Databricks workspace id owning this row (0 = default). Part of the PK.
     workspace_id: Mapped[int] = mapped_column(
@@ -1494,14 +1646,11 @@ class SqlScheduledTaskRun(OmnigentBase):
     scheduled_task_id: Mapped[str] = mapped_column(Uuid16, nullable=False)
     # Relates to conversations.id. No DB foreign key; app nulls on delete.
     conversation_id: Mapped[str | None] = mapped_column(Uuid16, nullable=True)
-    # Enum stored as a stable int code (see omnigent.db.enum_codecs
-    # SCHEDULED_TASK_RUN_STATUS: scheduled=1, running=2, succeeded=3, failed=4,
-    # skipped=5). The store converts to/from the string name at the
-    # row↔entity boundary.
+    # SCHEDULED_TASK_RUN_STATUS int code; 6 represents starting.
     status: Mapped[int] = mapped_column(SmallInteger)
-    scheduled_at: Mapped[int] = mapped_column(Integer)
-    fired_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    finished_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    scheduled_at: Mapped[int] = mapped_column(BigInteger)
+    fired_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    finished_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     # Opaque free-text error blob, never SQL-queried — stored compressed.
     error: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
     # Short, queryable failure classification token (e.g. "timeout",
@@ -1511,14 +1660,46 @@ class SqlScheduledTaskRun(OmnigentBase):
 
     __table_args__ = (
         CheckConstraint(
-            "status IN (1, 2, 3, 4, 5)",
-            name="ck_scheduled_task_runs_status",
+            "status IN (1, 2, 3, 4, 5, 6)",
+            name="ck_scheduled_task_runs_dispatch_status",
+        ),
+        UniqueConstraint(
+            "workspace_id",
+            "scheduled_task_id",
+            "trigger_key",
+            name="uq_scheduled_task_runs_occurrence",
+        ),
+        Index(
+            "ix_scheduled_task_runs_expired_claims",
+            "status",
+            "lease_expires_at",
+            "workspace_id",
+            "id",
         ),
         Index(
             "ix_scheduled_task_runs_scheduled_task_id",
             "workspace_id",
             "scheduled_task_id",
             "scheduled_at",
+            "id",
+        ),
+        # Reverse lookup conversation_id -> run for the event-driven completion
+        # hook (get_running_run_by_conversation), which fires on every turn's
+        # terminal edge; without this the lookup is a full-table scan.
+        # Superseded by ix_scheduled_task_runs_conversation_status; a later
+        # migration drops it after an observation period.
+        Index(
+            "ix_scheduled_task_runs_conversation_id",
+            "workspace_id",
+            "conversation_id",
+        ),
+        # The same lookup once a continued session has collected one run per
+        # firing: status keeps it to the running run.
+        Index(
+            "ix_scheduled_task_runs_conversation_status",
+            "workspace_id",
+            "conversation_id",
+            "status",
             "id",
         ),
     )

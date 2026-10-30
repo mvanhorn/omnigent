@@ -19,12 +19,13 @@ from pathlib import Path
 import pytest
 
 import omnigent.inner.antigravity_native_executor as executor_mod
-from omnigent.antigravity_native_bridge import (
+from omnigent.harnesses.antigravity_native.bridge import (
     AntigravityNativeBridgeState,
     write_bridge_state,
 )
 from omnigent.inner.antigravity_native_executor import AntigravityNativeExecutor
 from omnigent.inner.executor import ExecutorError, ExecutorEvent, TurnComplete
+from omnigent.inner.native_attachments import attachment_cache_dir
 
 _CONVERSATION_ID = "90468e33-38c3-4e48-ae9f-03c843196227"
 _PLACEHOLDER_ID = "agy_conv_placeholder123"
@@ -217,7 +218,11 @@ def test_run_turn_flattens_content_blocks(tmp_path: Path, injected: dict[str, ob
         ]
 
     events = asyncio.run(_drive())
-    assert _injected(injected)[0]["content"] == "line one\nline two"
+    # The unmaterializable image contributes a visible marker, not a
+    # silent drop; attachment lines precede the text lines.
+    assert _injected(injected)[0]["content"] == (
+        "[Attachment attachment could not be loaded]\nline one\nline two"
+    )
     assert isinstance(events[0], TurnComplete)
 
 
@@ -273,7 +278,7 @@ _PNG_DATA_URI = (
 def test_run_turn_image_attachment_materialized(
     tmp_path: Path, injected: dict[str, object]
 ) -> None:
-    """An image block is written to the bridge dir and referenced by path."""
+    """An image block is written to the session cache and referenced by path."""
     _seed_state(tmp_path)
 
     async def _drive() -> list[ExecutorEvent]:
@@ -299,7 +304,7 @@ def test_run_turn_image_attachment_materialized(
     assert isinstance(content, str)
     # attachment marker is prepended ahead of the typed text
     assert content.startswith("[Attached: ")
-    assert str(tmp_path) in content
+    assert str(attachment_cache_dir(tmp_path)) in content
     assert content.endswith("describe this")
     assert isinstance(events[0], TurnComplete)
 
@@ -729,9 +734,9 @@ def test_content_to_text_handles_string_blocks_none_and_other(tmp_path: Path) ->
     Flattening covers every content shape the executor may receive.
 
     A plain string passes through; ``input_text``/``text`` blocks join by newline
-    while an unmaterializable image/file block contributes nothing; ``None``
-    yields ``""``; any other shape falls back to a JSON encoding rather than
-    crashing.
+    while an unmaterializable image/file block contributes a visible
+    could-not-load marker; ``None`` yields ``""``; any other shape falls back to
+    a JSON encoding rather than crashing.
     """
     from omnigent.inner.antigravity_native_executor import _content_to_text
 
@@ -746,7 +751,7 @@ def test_content_to_text_handles_string_blocks_none_and_other(tmp_path: Path) ->
             ],
             tmp_path,
         )
-        == "a\nb"
+        == "[Attachment attachment could not be loaded]\na\nb"
     )
     assert _content_to_text(None, tmp_path) == ""
     # Defensive fallback for an unexpected shape: encoded, not crashed.

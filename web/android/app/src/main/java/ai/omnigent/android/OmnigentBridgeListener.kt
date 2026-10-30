@@ -2,6 +2,7 @@ package ai.omnigent.android
 
 import android.net.Uri
 import android.webkit.WebView
+import androidx.appcompat.app.AppCompatDelegate
 import androidx.webkit.JavaScriptReplyProxy
 import androidx.webkit.WebMessageCompat
 import androidx.webkit.WebViewCompat
@@ -17,12 +18,21 @@ import org.json.JSONObject
  * structural equivalent of the iOS `isMainFrame` + frame-origin check that a
  * raw `addJavascriptInterface` bridge cannot express.
  *
- * Callbacks arrive on the UI thread, so notification calls need no hop; the
- * blob write offloads to [BlobSaver]'s own worker.
+ * [BlobSaver] offloads writes to its own worker.
  */
 class OmnigentBridgeListener(
     private val notifications: NativeNotificationManager,
     private val blobSaver: BlobSaver,
+    /** Web asked for the server-picker payload (sidebar picker data). */
+    private val onServerPickerRequested: () -> Unit = {},
+    /** Web asked to re-point the shell at a picker-offered server URL. */
+    private val onSwitchServer: (String) -> Unit = {},
+    /** Web asked to open the shell's "connect to server" setup page. */
+    private val onOpenServerSetup: () -> Unit = {},
+    /** Present only for a natively authenticated workspace bridge. */
+    private val onSignOut: (() -> Unit)? = null,
+    /** Web asked to sign the server out; the shell answers whether it took over. */
+    private val onSignOutOfServer: () -> Unit = {},
 ) : WebViewCompat.WebMessageListener {
     override fun onPostMessage(
         view: WebView,
@@ -46,6 +56,28 @@ class OmnigentBridgeListener(
             }
 
         when (json.optString("method")) {
+            "setColorScheme" -> {
+                when (json.optString("scheme")) {
+                    "light" -> {
+                        AppCompatDelegate.setDefaultNightMode(
+                            AppCompatDelegate.MODE_NIGHT_NO,
+                        )
+                    }
+
+                    "dark" -> {
+                        AppCompatDelegate.setDefaultNightMode(
+                            AppCompatDelegate.MODE_NIGHT_YES,
+                        )
+                    }
+
+                    "system" -> {
+                        AppCompatDelegate.setDefaultNightMode(
+                            AppCompatDelegate.MODE_NIGHT_FOLLOW_SYSTEM,
+                        )
+                    }
+                }
+            }
+
             "setBadgeCount" -> {
                 notifications.setBadgeCount(
                     count = json.optInt("count", 0),
@@ -71,6 +103,27 @@ class OmnigentBridgeListener(
                     mimeType = json.optString("mimeType").ifEmpty { "application/octet-stream" },
                     suggestedName = json.optString("name"),
                 )
+            }
+
+            // Server-selection protocol, mirroring the iOS picker bridge.
+            "requestServerPicker" -> {
+                onServerPickerRequested()
+            }
+
+            "switchServer" -> {
+                onSwitchServer(json.optString("url").ifEmpty { return })
+            }
+
+            "openServerSetup" -> {
+                onOpenServerSetup()
+            }
+
+            "signOut" -> {
+                onSignOut?.invoke()
+            }
+
+            "signOutOfServer" -> {
+                onSignOutOfServer()
             }
         }
     }

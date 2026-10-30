@@ -9,8 +9,9 @@
 // mocked out (irrelevant to save wiring); only the write endpoint is mocked, to
 // assert the PUT fires with the edited content.
 
-import { act, render } from "@testing-library/react";
+import { act, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type * as FileContentModule from "@/hooks/useFileContent";
 
 // Captured callbacks the component registers on the editor, so tests can drive
 // edits / blur / ⌘S. Hoisted because the @monaco-editor/react mock factory
@@ -19,6 +20,9 @@ const h = vi.hoisted(() => ({
   onChange: null as ((value: string | undefined, ev: unknown) => void) | null,
   cmdS: null as (() => void) | null,
   blur: null as (() => void) | null,
+  scrollTops: [] as number[],
+  scroll: null as ((e: { scrollTop: number }) => void) | null,
+  domNode: document.createElement("div"),
 }));
 
 // Minimal Monaco namespace: only the members handleMount touches.
@@ -34,13 +38,17 @@ interface FakeEditor {
   getModel: () => { setEOL: () => void };
   addCommand: (binding: number, handler: () => void) => void;
   onDidBlurEditorWidget: (handler: () => void) => { dispose: () => void };
+  setScrollTop: (top: number) => void;
+  onDidScrollChange: (handler: (e: { scrollTop: number }) => void) => { dispose: () => void };
+  /** Real node so the restore can listen for the reader taking over scrolling. */
+  getDomNode: () => HTMLElement;
   saveViewState: () => null;
   restoreViewState: () => void;
   getAction: () => { run: () => void };
   getContribution: () => null;
   /** Test-only: set getValue() without firing onChange (mirrors a user keystroke
    *  landing in the buffer; the test fires onChange separately). */
-  __set: (v: string) => void;
+  setValueForTest: (v: string) => void;
 }
 
 function makeFakeEditor(initial: string): FakeEditor {
@@ -61,11 +69,19 @@ function makeFakeEditor(initial: string): FakeEditor {
       h.blur = handler;
       return { dispose: () => {} };
     },
+    setScrollTop: (top) => {
+      h.scrollTops.push(top);
+    },
+    onDidScrollChange: (handler) => {
+      h.scroll = handler;
+      return { dispose: () => {} };
+    },
+    getDomNode: () => h.domNode,
     saveViewState: () => null,
     restoreViewState: () => {},
     getAction: () => ({ run: () => {} }),
     getContribution: () => null,
-    __set: (v) => {
+    setValueForTest: (v) => {
       value = v;
     },
   };
@@ -106,11 +122,22 @@ vi.mock("./useMonacoCommentLayer", () => ({ useMonacoCommentLayer: () => null })
 vi.mock("next-themes", () => ({ useTheme: () => ({ resolvedTheme: "light" }) }));
 vi.mock("@/hooks/usePermissions", () => ({ useCanEdit: vi.fn().mockReturnValue(true) }));
 vi.mock("@/hooks/useWriteFileContent", () => ({ useWriteFileContent: vi.fn() }));
-vi.mock("@/hooks/RunnerHealthProvider", () => ({ useSessionRunnerOnline: vi.fn() }));
+// The pre-write conflict check GETs the live file before every save.
+vi.mock("@/hooks/useFileContent", async (importOriginal) => ({
+  ...(await importOriginal<typeof FileContentModule>()),
+  fetchFileContent: vi.fn(),
+}));
+vi.mock("@/hooks/RunnerHealthProvider", () => ({
+  useSessionRunnerOnline: vi.fn(),
+  useSessionHostOnline: vi.fn(),
+}));
 
 import { MonacoCodeEditor } from "./MonacoCodeEditor";
+import { CONFLICT_CHECK_TIMEOUT_MS } from "./useEditorAutoSave";
+import { getSavedScrollTop, saveScrollTop } from "./useScrollRestore";
 import * as writeHook from "@/hooks/useWriteFileContent";
 import * as runnerHook from "@/hooks/RunnerHealthProvider";
+import { fetchFileContent, type FileContentResponse } from "@/hooks/useFileContent";
 
 const PATH = "src/a.ts";
 const INITIAL = "const x = 1;\n";
@@ -128,13 +155,23 @@ function mockWrite(): void {
   } as unknown as ReturnType<typeof writeHook.useWriteFileContent>);
 }
 
+function serverFile(content: string): FileContentResponse {
+  return {
+    object: "session.environment.filesystem.file_content",
+    path: PATH,
+    content_type: "text/typescript",
+    encoding: "utf-8",
+    content,
+    bytes: content.length,
+  };
+}
+
 // Fresh element each call so rerender() doesn't bail on an identical reference
 // (the reconnect test relies on re-reading the runner-online mock).
-function makeEditor() {
+function makeEditor(content: string = INITIAL) {
   return (
     <MonacoCodeEditor
-      content={INITIAL}
-      // Not the focused/running session → pre-write conflict GET is skipped.
+      content={content}
       conversationId="conv_monaco_autosave"
       path={PATH}
       isSettled={true}
@@ -154,7 +191,7 @@ async function renderMounted(el: React.ReactElement) {
 
 // Drive a user edit: update the buffer, then fire the captured onChange.
 async function fireEdit(value: string) {
-  fakeEditor!.__set(value);
+  fakeEditor!.setValueForTest(value);
   await act(async () => {
     h.onChange?.(value, {});
   });
@@ -166,7 +203,11 @@ beforeEach(() => {
   h.onChange = null;
   h.cmdS = null;
   h.blur = null;
+  h.scrollTops = [];
+  h.scroll = null;
+  h.domNode = document.createElement("div");
   mockWrite();
+  vi.mocked(fetchFileContent).mockResolvedValue(serverFile(INITIAL));
   // Online → auto-save enabled.
   vi.mocked(runnerHook.useSessionRunnerOnline).mockReturnValue(true);
 });
@@ -271,9 +312,121 @@ describe("MonacoCodeEditor auto-save wiring (integration)", () => {
     expect(calls).toBe(1);
   });
 
+  it("keeps edits typed during a save when another writer's update arrives", async () => {
+    let resolveWrite!: () => void;
+    mutateAsync.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          resolveWrite = resolve;
+        }),
+    );
+    const { rerender } = await renderMounted(makeEditor());
+    await fireEdit(EDITED);
+    await act(async () => {
+      vi.advanceTimersByTime(1000);
+    });
+    // Typed while the save is in flight; its own debounce hasn't fired yet.
+    await fireEdit(EDITED + "// newer\n");
+    await act(async () => resolveWrite());
+    await act(async () => rerender(makeEditor("const y = 3;\n")));
+
+    expect(fakeEditor!.getValue()).toBe(EDITED + "// newer\n");
+    expect(screen.getByText(/modified externally/)).toBeInTheDocument();
+    await act(async () => {
+      vi.advanceTimersByTime(1000);
+    });
+    // Unresolved conflict: auto-save waits for Keep mine / Load latest.
+    expect(mutateAsync).toHaveBeenCalledExactlyOnceWith({ path: PATH, content: EDITED });
+  });
+
+  it("raises the conflict instead of saving over another writer's change", async () => {
+    vi.mocked(fetchFileContent).mockResolvedValue(serverFile("const y = 3;\n"));
+    await renderMounted(makeEditor());
+    await fireEdit(EDITED);
+    await act(async () => {
+      vi.advanceTimersByTime(1000);
+    });
+
+    expect(mutateAsync).not.toHaveBeenCalled();
+    expect(fakeEditor!.getValue()).toBe(EDITED);
+    expect(screen.getByText(/modified externally/)).toBeInTheDocument();
+  });
+
+  it("skips the write when the buffer is clean again after the conflict check", async () => {
+    let answerCheck!: (file: FileContentResponse) => void;
+    vi.mocked(fetchFileContent).mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          answerCheck = resolve;
+        }),
+    );
+    await renderMounted(makeEditor());
+    await fireEdit(EDITED);
+    await act(async () => {
+      vi.advanceTimersByTime(1000);
+    });
+    // Undone while the check is in flight; the server meanwhile has newer text,
+    // which the next refresh (not this possibly older response) applies.
+    await fireEdit(INITIAL);
+    await act(async () => answerCheck(serverFile("const y = 3;\n")));
+
+    expect(mutateAsync).not.toHaveBeenCalled();
+    expect(fakeEditor!.getValue()).toBe(INITIAL);
+  });
+
+  it("starts the save over when a refresh lands during the conflict check", async () => {
+    let answerCheck!: (file: FileContentResponse) => void;
+    vi.mocked(fetchFileContent).mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          answerCheck = resolve;
+        }),
+    );
+    const { rerender } = await renderMounted(makeEditor());
+    await fireEdit(EDITED);
+    await act(async () => {
+      vi.advanceTimersByTime(1000);
+    });
+    // Undone, a refresh applies newer text in place, then the user types again.
+    await fireEdit(INITIAL);
+    await act(async () => rerender(makeEditor("const y = 3;\n")));
+    expect(fakeEditor!.getValue()).toBe("const y = 3;\n");
+    await fireEdit("const y = 3;\n// mine\n");
+    vi.mocked(fetchFileContent).mockResolvedValue(serverFile("const y = 3;\n"));
+    // The check answers with content from before the refresh.
+    await act(async () => answerCheck(serverFile(INITIAL)));
+
+    expect(mutateAsync).toHaveBeenCalledExactlyOnceWith({
+      path: PATH,
+      content: "const y = 3;\n// mine\n",
+    });
+    expect(screen.queryByText(/modified externally/)).toBeNull();
+  });
+
+  it("saves anyway when the conflict check stalls", async () => {
+    vi.mocked(fetchFileContent).mockImplementationOnce(
+      (_conversationId, _path, signal) =>
+        new Promise((_, reject) => {
+          signal!.addEventListener("abort", () => reject(new Error("aborted")));
+        }),
+    );
+    await renderMounted(makeEditor());
+    await fireEdit(EDITED);
+    await act(async () => {
+      vi.advanceTimersByTime(1000);
+    });
+    expect(mutateAsync).not.toHaveBeenCalled();
+
+    await act(async () => {
+      vi.advanceTimersByTime(CONFLICT_CHECK_TIMEOUT_MS);
+    });
+    expect(mutateAsync).toHaveBeenCalledExactlyOnceWith({ path: PATH, content: EDITED });
+  });
+
   it("flushes accumulated edits when the runner reconnects", async () => {
-    // Offline → auto-save suppressed.
+    // Runner down, no host to serve the workspace → auto-save suppressed.
     vi.mocked(runnerHook.useSessionRunnerOnline).mockReturnValue(false);
+    vi.mocked(runnerHook.useSessionHostOnline).mockReturnValue(null);
     const { rerender } = await renderMounted(makeEditor());
     await fireEdit(EDITED);
     await act(async () => {
@@ -288,5 +441,62 @@ describe("MonacoCodeEditor auto-save wiring (integration)", () => {
       rerender(makeEditor());
     });
     expect(mutateAsync).toHaveBeenCalledWith({ path: PATH, content: EDITED });
+  });
+});
+
+// Monaco scrolls internally, so the viewer drives the shared scroll cache from
+// the editor's own scroll events rather than the DOM restore hook.
+describe("MonacoCodeEditor scroll position persistence", () => {
+  const KEY = `viewer:conv_monaco_autosave:${PATH}`;
+
+  it("restores the saved offset on mount", async () => {
+    saveScrollTop(KEY, 320);
+    await renderMounted(makeEditor());
+    expect(h.scrollTops).toContain(320);
+  });
+
+  it("records the editor's offset as the user scrolls", async () => {
+    saveScrollTop(KEY, 0);
+    await renderMounted(makeEditor());
+    expect(h.scroll).not.toBeNull();
+    h.scroll?.({ scrollTop: 210 });
+    expect(getSavedScrollTop(KEY)).toBe(210);
+  });
+
+  it("keeps offsets separate per file", async () => {
+    saveScrollTop(KEY, 320);
+    saveScrollTop("viewer:conv_monaco_autosave:src/other.ts", 15);
+    await renderMounted(makeEditor());
+    // Reaching the restored offset ends the restore, so later scrolls persist.
+    h.scroll?.({ scrollTop: 320 });
+    h.scroll?.({ scrollTop: 44 });
+    expect(getSavedScrollTop(KEY)).toBe(44);
+    expect(getSavedScrollTop("viewer:conv_monaco_autosave:src/other.ts")).toBe(15);
+  });
+
+  it("does not let the mount-time clamp overwrite the saved offset", async () => {
+    saveScrollTop(KEY, 320);
+    await renderMounted(makeEditor());
+    h.scrollTops = [];
+
+    // Not laid out yet: Monaco clamps to 0 and reports it. Persisting that would
+    // destroy the reader's position, so the target is re-asserted instead.
+    h.scroll?.({ scrollTop: 0 });
+    expect(getSavedScrollTop(KEY)).toBe(320);
+    expect(h.scrollTops).toContain(320);
+
+    // Once the editor can hold the offset, saving resumes.
+    h.scroll?.({ scrollTop: 320 });
+    h.scroll?.({ scrollTop: 90 });
+    expect(getSavedScrollTop(KEY)).toBe(90);
+  });
+
+  it("stops re-asserting when the reader scrolls during the restore", async () => {
+    saveScrollTop(KEY, 320);
+    await renderMounted(makeEditor());
+
+    h.domNode.dispatchEvent(new Event("wheel"));
+    h.scroll?.({ scrollTop: 10 });
+    expect(getSavedScrollTop(KEY)).toBe(10);
   });
 });

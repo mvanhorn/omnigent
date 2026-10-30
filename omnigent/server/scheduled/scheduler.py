@@ -10,9 +10,8 @@ Design notes:
 
 * **Source of truth is the DB.** :meth:`ScheduledTaskScheduler.start` loads every
   active task via ``store.list_active_all_workspaces()`` and arms a timer for
-  each. There is no in-memory schedule state beyond the live timers. Missed
-  fires (server was down) are **not** replayed — only the next future occurrence
-  is armed.
+  each, preserving route updates made during the load. Missed fires (server
+  was down) are **not** replayed — only the next future occurrence is armed.
 * **Timer overlap policy is SKIP.** If an ``on_fire`` callback for the same job
   is still running when the next tick arrives, the tick is dropped. The fire
   path also tracks its own longer-running session creation work.
@@ -27,6 +26,7 @@ tests can drive the scheduler with a fake clock and manual timer firing.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from collections.abc import Awaitable, Callable
@@ -60,7 +60,7 @@ _DUE_TOLERANCE_S = 1.0
 
 # ``on_fire(workspace_id, scheduled_task_id)`` — invoked when a task is due. The
 # caller creates the agent session under the provided workspace scope.
-OnFire = Callable[[int, str], Awaitable[None]]
+OnFire = Callable[[int, str], Awaitable[bool | None]]
 _JobKey = tuple[int, str]
 
 
@@ -105,6 +105,7 @@ class ScheduledTaskScheduler:
     :param on_fire: Async callback invoked with ``(workspace_id,
         scheduled_task_id)`` when a task is due. Exceptions are caught and
         logged so a failing fire never stops the timer from re-arming.
+        Returning False unregisters the job; True or None keeps it armed.
     :param now: Returns the current epoch seconds. Injectable for tests;
         defaults to :func:`time.time`.
     :param schedule_call: Arms a timer: ``(delay_s, factory) -> handle`` where
@@ -130,6 +131,7 @@ class ScheduledTaskScheduler:
         self._cancel_call = cancel_call or _default_cancel_call
         self._jobs: dict[_JobKey, _Job] = {}
         self._started = False
+        self._startup_changes: set[str] | None = None
 
     # ── lifecycle ────────────────────────────────────────────────────────────
 
@@ -144,21 +146,34 @@ class ScheduledTaskScheduler:
         if self._started:
             _logger.debug("scheduler: start() called but already started; ignoring")
             return
-        for task in self._store.list_active_all_workspaces():
-            try:
-                self._register(task)
-            except RRuleValidationError as exc:
-                _logger.warning(
-                    "scheduler: skipping task %s with invalid rrule %r: %s",
-                    task.id,
-                    task.rrule,
-                    exc,
-                )
-        self._started = True
-        _logger.info("ScheduledTaskScheduler started with %d job(s)", len(self._jobs))
+        changed: set[str] = set()
+        self._startup_changes = changed
+        try:
+            tasks = await asyncio.to_thread(self._store.list_active_all_workspaces)
+            if self._startup_changes is not changed:
+                return  # stop() invalidated this load.
+            for task in tasks:
+                # Route mutations already updated the timers while the read was pending.
+                if task.id in changed:
+                    continue
+                try:
+                    self._register(task)
+                except RRuleValidationError as exc:
+                    _logger.warning(
+                        "scheduler: skipping task %s with invalid rrule %r: %s",
+                        task.id,
+                        task.rrule,
+                        exc,
+                    )
+            self._started = True
+            _logger.info("ScheduledTaskScheduler started with %d job(s)", len(self._jobs))
+        finally:
+            if self._startup_changes is changed:
+                self._startup_changes = None
 
     def stop(self) -> None:
         """Cancel every armed timer and drop all jobs."""
+        self._startup_changes = None
         for job in self._jobs.values():
             if job.timer is not None:
                 self._cancel_call(job.timer)
@@ -188,6 +203,9 @@ class ScheduledTaskScheduler:
 
     def remove(self, task_id: str) -> None:
         """Cancel and forget a task's timer. Idempotent."""
+        # A removal must also suppress a snapshot timer that has not been armed yet.
+        if self._startup_changes is not None:
+            self._startup_changes.add(task_id)
         for key, job in list(self._jobs.items()):
             if job.task_id == task_id:
                 self._jobs.pop(key, None)
@@ -248,11 +266,16 @@ class ScheduledTaskScheduler:
         """Compute the next fire and arm a (possibly capped) timer for it."""
         now_epoch = self._now()
         after = datetime.fromtimestamp(now_epoch, tz=_UTC)
-        next_run = job.trigger.next_fire_after(after, job.tz)
+        try:
+            next_run = job.trigger.next_fire_after(after, job.tz)
+        except RRuleValidationError as exc:
+            _logger.warning("scheduler: task %s stopped: %s", job.task_id, exc)
+            next_run = None
         if next_run is None:
             job.next_run = None
             job.next_run_epoch = None
             job.timer = None
+            job.armed_capped = False
             return
         job.next_run = next_run
         job.next_run_epoch = next_run.timestamp()
@@ -302,7 +325,12 @@ class ScheduledTaskScheduler:
             return False
         job.running = True
         try:
-            await self._on_fire(job.workspace_id, job.task_id)
+            keep_registered = await self._on_fire(job.workspace_id, job.task_id)
+            key = (job.workspace_id, job.task_id)
+            if keep_registered is False and self._jobs.get(key) is job:
+                self._jobs.pop(key)
+                if job.timer is not None:
+                    self._cancel_call(job.timer)
             return True
         except Exception:
             _logger.exception("scheduler: on_fire for task %s failed", job.task_id)
@@ -314,6 +342,7 @@ class ScheduledTaskScheduler:
 # Strong references to in-flight fire coroutines. ``loop.create_task`` only
 # holds a weak reference, so without this a fire could be garbage-collected
 # mid-flight; we discard each task from the set when it completes.
+# custom-lint: disable-next=workspace-scoped-cache -- set of Task objects
 _PENDING_FIRES: set[Any] = set()
 
 

@@ -1,10 +1,12 @@
 """Per-harness startup command/args resolution from config.
 
 Lets users override the executable (``command``) and base launch args
-(``args``) for each harness in ``config.yaml`` via a polymorphic
+(``args``) for each harness in user-level ``config.yaml`` via a polymorphic
 ``harness:`` key — a scalar (legacy default) or a mapping with
 ``default`` plus per-harness overrides. See
 ``~/.pi/plans/omnigent/harness-startup-command-overrides.md``.
+Project configuration may select ``harness.default``; command and argument
+overrides are read only from user configuration.
 
 This is a leaf resolver module: it lazy-imports
 :func:`omnigent.harness_aliases.canonicalize_harness` so it can be used
@@ -25,6 +27,14 @@ Precedence (first non-empty wins):
   2. config ``harness.<canonical>.args``
   3. ``[]``
 
+``harness.codex-native.app_server`` (``command`` plus optional ``args``)
+wraps the Codex app-server rather than the terminal: Omnigent runs it with
+its ``-c`` overrides and ``app-server --listen …`` appended, for each
+session's app-server. Model probes keep running Codex directly. No env var
+outranks it.
+The wrapper chooses which Codex it runs; ``OMNIGENT_CODEX_PATH`` still names the
+binary Omnigent version-checks and keys the model catalog on, so keep them the same.
+
 Validation is warn+skip: an unknown harness id or a structurally
 malformed entry warns and is ignored, so a bad config never crashes
 ``config list`` / ``doctor`` / every command's config load.
@@ -34,7 +44,8 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any
+from collections.abc import Mapping
+from typing import TypedDict
 
 _logger = logging.getLogger(__name__)
 
@@ -61,6 +72,13 @@ _LEGACY_PATH_WARNED: set[str] = set()
 # Keys read from a per-harness override entry in the ``harness:`` mapping.
 _OVERRIDE_KEY_COMMAND = "command"
 _OVERRIDE_KEY_ARGS = "args"
+_OVERRIDE_KEY_APP_SERVER = "app_server"
+
+
+class _HarnessOverride(TypedDict, total=False):
+    command: str
+    args: list[str]
+    app_server: list[str]
 
 
 def _canonicalize(harness: str) -> str:
@@ -163,8 +181,8 @@ def legacy_harness_path_env_vars_set() -> list[tuple[str, str]]:
 
 
 def resolve_harness_config(
-    cfg: dict[str, Any],  # type: ignore[explicit-any]
-) -> tuple[str | None, dict[str, dict[str, Any]]]:  # type: ignore[explicit-any]
+    cfg: Mapping[str, object],
+) -> tuple[str | None, dict[str, _HarnessOverride]]:
     """Read the ``harness:`` key from effective config.
 
     Accepts both legacy forms:
@@ -197,8 +215,16 @@ def resolve_harness_config(
         )
         return None, {}
     default: str | None = None
-    overrides: dict[str, dict[str, Any]] = {}  # type: ignore[explicit-any]
+    overrides: dict[str, _HarnessOverride] = {}
     for key, value in raw.items():
+        if not isinstance(key, str):
+            from omnigent.inner import ui
+
+            ui.warn(
+                f"config `harness:` keys must be strings, got "
+                f"{type(key).__name__} — ignoring this entry."
+            )
+            continue
         if key == "default":
             if isinstance(value, str):
                 default = value
@@ -224,16 +250,13 @@ def resolve_harness_config(
     return default, overrides
 
 
-def _parse_override_entry(
-    key: str,
-    value: Any,  # type: ignore[explicit-any]
-) -> dict[str, Any] | None:  # type: ignore[explicit-any]
-    """Validate one per-harness override entry; warn+skip on malformed.
+def _parse_launch_fields(key: str, value: object) -> _HarnessOverride | None:
+    """Validate a ``{command, args}`` mapping; warn+skip on malformed fields.
 
-    :param key: The raw harness id as written in config (for messages).
+    :param key: The config path as written, for messages, e.g. ``"codex-native"``.
     :param value: The entry value — expected ``{command: str, args: list}``.
-    :returns: A validated ``{command?, args?}`` dict, or ``None`` when the
-        entry is structurally invalid (already warned).
+    :returns: A validated ``{command?, args?}`` dict, or ``None`` when *value*
+        is not a mapping (already warned).
     """
     from omnigent.inner import ui
 
@@ -244,20 +267,59 @@ def _parse_override_entry(
             f"config `harness.{key}` must be a mapping, got {type(value).__name__} — ignoring it."
         )
         return None
-    parsed: dict[str, Any] = {}  # type: ignore[explicit-any]
+    parsed: _HarnessOverride = {}
     command = value.get(_OVERRIDE_KEY_COMMAND)
     if command is not None:
         if isinstance(command, str) and command.strip():
-            parsed[_OVERRIDE_KEY_COMMAND] = command.strip()
+            parsed["command"] = command.strip()
         else:
             ui.warn(f"config `harness.{key}.command` must be a non-empty string — ignoring it.")
     args = value.get(_OVERRIDE_KEY_ARGS)
     if args is not None:
         if isinstance(args, list) and all(isinstance(a, str) for a in args):
-            parsed[_OVERRIDE_KEY_ARGS] = list(args)
+            parsed["args"] = [arg for arg in args if isinstance(arg, str)]
         else:
             ui.warn(f"config `harness.{key}.args` must be a list of strings — ignoring it.")
     return parsed
+
+
+def _parse_override_entry(
+    key: str,
+    value: object,
+) -> _HarnessOverride | None:
+    """Validate one per-harness override entry; warn+skip on malformed.
+
+    :param key: The raw harness id as written in config (for messages).
+    :param value: The entry value — expected ``{command: str, args: list, app_server?}``.
+    :returns: A validated ``{command?, args?, app_server?}`` dict, or ``None``
+        when the entry is structurally invalid (already warned).
+    """
+    from omnigent.inner import ui
+
+    parsed = _parse_launch_fields(key, value)
+    if parsed is None or not isinstance(value, dict):
+        return parsed
+    # Only `command` and `args` are read from the nested entry, so a cyclic YAML
+    # anchor there can't recurse.
+    app_server = value.get(_OVERRIDE_KEY_APP_SERVER)
+    if app_server is not None:
+        launch = _parse_launch_fields(f"{key}.{_OVERRIDE_KEY_APP_SERVER}", app_server)
+        if launch is not None and "command" in launch:
+            parsed["app_server"] = [launch["command"], *launch.get("args", [])]
+        elif launch is not None and isinstance(app_server, dict) and "command" not in app_server:
+            ui.warn(f"config `harness.{key}.app_server` needs a `command` — ignoring it.")
+    return parsed
+
+
+def resolve_codex_app_server_command(cfg: Mapping[str, object]) -> tuple[str, ...]:
+    """Return the configured native Codex app-server launch command, or ``()``.
+
+    :param cfg: Effective config dict.
+    :returns: ``harness.codex-native.app_server`` as ``(command, *args)``, e.g.
+        ``("ucode", "codex")``, or ``()`` to launch the Codex binary directly.
+    """
+    _, overrides = resolve_harness_config(cfg)
+    return tuple((overrides.get("codex-native") or {}).get("app_server") or ())
 
 
 def resolve_harness_command(
@@ -265,7 +327,7 @@ def resolve_harness_command(
     *,
     default: str,
     explicit: str | None = None,
-    cfg: dict[str, Any] | None = None,  # type: ignore[explicit-any]
+    cfg: Mapping[str, object] | None = None,
 ) -> str:
     """Resolve the executable to launch for *harness*.
 
@@ -311,7 +373,7 @@ def resolve_harness_args(
     harness: str,
     cli_args: tuple[str, ...],
     *,
-    cfg: dict[str, Any] | None = None,  # type: ignore[explicit-any]
+    cfg: Mapping[str, object] | None = None,
 ) -> list[str]:
     """Resolve the base launch args for *harness*.
 
@@ -341,7 +403,7 @@ def resolve_harness_args(
 
 def config_harness_path_override(
     harness: str,
-    cfg: dict[str, Any],  # type: ignore[explicit-any]
+    cfg: Mapping[str, object],
 ) -> str | None:
     """Return config's ``command`` override for *harness* when no env var is set.
 

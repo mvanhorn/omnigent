@@ -21,13 +21,17 @@ import type { ActiveSelection, SaveStatus } from "./codeViewerHelpers";
 // need the props, not a real DOM editor).
 const h = vi.hoisted(() => ({
   editorProps: null as {
-    options?: { readOnly?: boolean };
+    options?: { readOnly?: boolean; fontWeight?: string; wordWrap?: string };
     theme?: string;
     language?: string;
   } | null,
 }));
 vi.mock("@monaco-editor/react", () => ({
-  Editor: (props: { options?: { readOnly?: boolean }; theme?: string; language?: string }) => {
+  Editor: (props: {
+    options?: { readOnly?: boolean; fontWeight?: string; wordWrap?: string };
+    theme?: string;
+    language?: string;
+  }) => {
     h.editorProps = props;
     return null;
   },
@@ -47,7 +51,10 @@ vi.mock("next-themes", () => ({ useTheme: () => ({ resolvedTheme: "light" }) }))
 vi.mock("@/hooks/usePermissions", () => ({ useCanEdit: vi.fn() }));
 vi.mock("./useMarkdownEditorSync", () => ({ useMarkdownEditorSync: vi.fn() }));
 vi.mock("@/hooks/useWriteFileContent", () => ({ useWriteFileContent: vi.fn() }));
-vi.mock("@/hooks/RunnerHealthProvider", () => ({ useSessionRunnerOnline: vi.fn() }));
+vi.mock("@/hooks/RunnerHealthProvider", () => ({
+  useSessionRunnerOnline: vi.fn(),
+  useSessionHostOnline: vi.fn(),
+}));
 
 import * as permissions from "@/hooks/usePermissions";
 import * as syncHook from "./useMarkdownEditorSync";
@@ -106,6 +113,8 @@ function setupHooks(
     isSuccess?: boolean;
     // undefined = unknown (treated as online); false = offline.
     runnerOnline?: boolean;
+    // Host tunnel: false = down, null = not host-bound, undefined = unknown.
+    hostOnline?: boolean | null;
   } = {},
 ) {
   vi.mocked(permissions.useCanEdit).mockReturnValue(overrides.canEdit ?? true);
@@ -117,7 +126,7 @@ function setupHooks(
     discardAndApplyExternal: vi.fn(),
     dismissExternalUpdate: vi.fn(),
     markSaved: vi.fn(),
-    reconcileServerContent: vi.fn().mockReturnValue(false),
+    beginServerCheck: vi.fn(() => () => "write"),
   });
   vi.mocked(writeHook.useWriteFileContent).mockReturnValue({
     isPending: overrides.isPending ?? false,
@@ -127,10 +136,14 @@ function setupHooks(
     mutateAsync: vi.fn(),
   } as unknown as ReturnType<typeof writeHook.useWriteFileContent>);
   vi.mocked(runnerHook.useSessionRunnerOnline).mockReturnValue(overrides.runnerOnline);
+  vi.mocked(runnerHook.useSessionHostOnline).mockReturnValue(overrides.hostOnline);
 }
 
 function renderEditor(
-  props: { truncated?: boolean; onSaveStatusChange?: (s: SaveStatus) => void } = {},
+  props: {
+    truncated?: boolean;
+    onSaveStatusChange?: (s: SaveStatus) => void;
+  } = {},
 ) {
   return render(
     <MonacoCodeEditor
@@ -153,6 +166,7 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  localStorage.clear();
 });
 
 // ── buildCommentDecorations (offset → range bridge) ─────────────────────────────
@@ -277,6 +291,43 @@ describe("MonacoCodeEditor read-only / truncated gating", () => {
     if (banner) expect(screen.getByText(/too large to load fully/)).toBeDefined();
     else expect(screen.queryByText(/too large to load fully/)).toBeNull();
   });
+
+  it("applies the stored code font weight when Monaco is created", async () => {
+    localStorage.setItem("omnigent:code-font-weight", "600");
+    renderEditor();
+
+    await waitFor(() => expect(h.editorProps).not.toBeNull());
+    expect(h.editorProps?.options?.fontWeight).toBe("500");
+  });
+});
+
+describe("MonacoCodeEditor word wrap", () => {
+  it("leaves long lines unwrapped by default", async () => {
+    renderEditor();
+    await waitFor(() => expect(h.editorProps).not.toBeNull());
+    expect(h.editorProps?.options?.wordWrap).toBe("off");
+  });
+
+  it("passes the wrap toggle to the live editor's options", async () => {
+    const { rerender } = renderEditor();
+    await waitFor(() => expect(h.editorProps?.options?.wordWrap).toBe("off"));
+
+    rerender(
+      <MonacoCodeEditor
+        content="const x = 1;"
+        conversationId="conv_1"
+        path="src/a.ts"
+        isSettled={true}
+        comments={[]}
+        activeSelection={null}
+        onSetActiveSelection={() => {}}
+        wrapLines
+      />,
+    );
+
+    // Preservation of edits and selection across the toggle is checked in the E2E.
+    expect(h.editorProps?.options?.wordWrap).toBe("on");
+  });
 });
 
 describe("MonacoCodeEditor save-status reporting", () => {
@@ -306,8 +357,8 @@ describe("MonacoCodeEditor save-status reporting", () => {
       expected: "error",
     },
     {
-      name: "offline when dirty and the runner is down",
-      state: { isDirty: true, runnerOnline: false },
+      name: "offline when dirty and the workspace is unreachable",
+      state: { isDirty: true, runnerOnline: false, hostOnline: null },
       expected: "offline",
     },
     {

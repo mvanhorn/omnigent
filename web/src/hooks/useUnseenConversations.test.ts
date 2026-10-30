@@ -1,3 +1,5 @@
+import type * as UseUnseenConversationsModule from "./useUnseenConversations";
+
 import { act, cleanup, renderHook } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -8,7 +10,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 const { authFetch } = vi.hoisted(() => ({ authFetch: vi.fn() }));
 vi.mock("@/lib/identity", () => ({ authenticatedFetch: authFetch }));
 
-type Mod = typeof import("./useUnseenConversations");
+type Mod = typeof UseUnseenConversationsModule;
 
 /**
  * The module keeps its read-state mirror in module-level singletons
@@ -156,6 +158,81 @@ describe("markConversationSeen", () => {
   });
 });
 
+describe("seedRunUnreadBaseline", () => {
+  it("pins the baseline just below updatedAt and makes the dot show via isConversationUnseen", async () => {
+    const mod = await loadFresh();
+    mod.seedReadState([]);
+    authFetch.mockClear();
+
+    mod.seedRunUnreadBaseline("conv-1", 5_000);
+
+    expect(mod.isConversationUnseen("conv-1", 5_000, "idle")).toBe(true);
+    // Crucially: no explicitlyUnread override — markConversationSeen is not blocked.
+    expect(mod.isExplicitlyUnread("conv-1")).toBe(false);
+  });
+
+  it("does NOT block markConversationSeen — opening the conversation clears the dot", async () => {
+    // Regression: markConversationUnread set explicitlyUnread, blocking markConversationSeen
+    // (useMarkConversationSeen's initial-mount guard skips clearUnreadOverride on a fresh
+    // ChatPage mount). seedRunUnreadBaseline omits the override so the dot clears on open.
+    const mod = await loadFresh();
+    mod.seedReadState([]);
+    vi.useFakeTimers({ now: 6_000_000 });
+    setWindowFocused(true);
+
+    mod.seedRunUnreadBaseline("conv-1", 5_000);
+    expect(mod.isConversationUnseen("conv-1", 5_000, "idle")).toBe(true); // dot shows
+
+    mod.markConversationSeen("conv-1"); // simulates ChatPage opening the conversation
+    expect(mod.isConversationUnseen("conv-1", 5_000, "idle")).toBe(false); // dot clears
+  });
+});
+
+describe("isConversationUnread", () => {
+  const SERVER_READ = { lastSeen: 5_000, unread: false };
+
+  it("applies the server's read state when this client has none", async () => {
+    const mod = await loadFresh();
+    expect(mod.isConversationUnread("conv-1", 5_001, "idle", SERVER_READ)).toBe(true);
+    expect(mod.isConversationUnread("conv-1", 5_000, "idle", SERVER_READ)).toBe(false);
+    expect(mod.isConversationUnread("conv-1", 5_001, "running", SERVER_READ)).toBe(false);
+    expect(mod.isConversationUnread("conv-1", 1, "idle", { lastSeen: null, unread: true })).toBe(
+      true,
+    );
+    // Never seen anywhere and never flagged: read, as the sidebar seeds it.
+    expect(
+      mod.isConversationUnread("conv-1", 5_001, "idle", { lastSeen: null, unread: null }),
+    ).toBe(false);
+  });
+
+  it("prefers this client's read state over the server snapshot", async () => {
+    const mod = await loadFresh();
+    mod.seedReadState([]);
+    mod.markConversationSeen("conv-1", 6_000);
+    expect(
+      mod.isConversationUnread("conv-1", 5_500, "idle", { lastSeen: 5_000, unread: true }),
+    ).toBe(false);
+    mod.markConversationUnread("conv-2", 5_000);
+    expect(
+      mod.isConversationUnread("conv-2", 5_000, "idle", { lastSeen: 9_000, unread: false }),
+    ).toBe(true);
+  });
+
+  it("takes a newer read from another device over an older one here", async () => {
+    const mod = await loadFresh();
+    mod.seedReadState([]);
+    mod.markConversationSeen("conv-1", 100);
+    // Read here at 100, updated at 150, read on another device at 200.
+    expect(mod.isConversationUnread("conv-1", 150, "idle", { lastSeen: 200, unread: false })).toBe(
+      false,
+    );
+    // An update after both reads is still unread.
+    expect(mod.isConversationUnread("conv-1", 250, "idle", { lastSeen: 200, unread: false })).toBe(
+      true,
+    );
+  });
+});
+
 describe("markConversationUnread", () => {
   it("pins the baseline just below updated_at and flags + PUTs unread", async () => {
     const mod = await loadFresh();
@@ -182,6 +259,49 @@ describe("markConversationUnread", () => {
     mod.markConversationUnread("conv-1", 5_000);
     mod.markConversationSeen("conv-1", 6_000); // suppressed by the override
     expect(mod.isConversationUnseen("conv-1", 5_000, "idle")).toBe(true);
+  });
+});
+
+describe("markConversationRead", () => {
+  it("clears the explicit-unread override and the dot, PUTting the read state", async () => {
+    const mod = await loadFresh();
+    mod.seedReadState([]);
+    mod.markConversationUnread("conv-1", 5_000);
+    authFetch.mockClear();
+    // Client wall clock (4000) lags the row's updated_at (5000) — the
+    // baseline must still clear the dot by anchoring at updated_at.
+    vi.useFakeTimers({ now: 4_000_000 });
+
+    mod.markConversationRead("conv-1", 5_000);
+
+    expect(mod.isConversationUnseen("conv-1", 5_000, "idle")).toBe(false);
+    expect(mod.isExplicitlyUnread("conv-1")).toBe(false);
+    expect(lastPutBody()).toEqual({ last_seen: 5_000, unread: false });
+  });
+
+  it("anchors to the wall clock when it leads updated_at (captures unpolled updates)", async () => {
+    const mod = await loadFresh();
+    mod.seedReadState([]);
+    mod.markConversationUnread("conv-1", 5_000);
+    vi.useFakeTimers({ now: 6_000_000 });
+
+    mod.markConversationRead("conv-1", 5_000);
+
+    // An update from before the read (5_500 < the 6_000 read time) that the
+    // poll hadn't delivered yet stays read.
+    expect(mod.isConversationUnseen("conv-1", 5_500, "idle")).toBe(false);
+  });
+
+  it("applies before the first seed — explicit intent is exempt from the hydration gate", async () => {
+    const mod = await loadFresh();
+    // No seedReadState: the user acts before the conversation list loads.
+    mod.markConversationUnread("conv-1", 5_000);
+    expect(mod.isConversationUnseen("conv-1", 5_000, "idle")).toBe(true);
+
+    mod.markConversationRead("conv-1", 5_000);
+
+    expect(mod.isConversationUnseen("conv-1", 5_000, "idle")).toBe(false);
+    expect(mod.isExplicitlyUnread("conv-1")).toBe(false);
   });
 });
 
@@ -221,6 +341,58 @@ describe("useUnseenTick", () => {
     act(() => mod.markConversationUnread("conv-1", 5_000));
     expect(result.current).not.toBe(before);
   });
+
+  it("stays at 0 without re-rendering when disabled", async () => {
+    const mod = await loadFresh();
+    mod.seedReadState([]);
+    let renders = 0;
+    const { result } = renderHook(() => {
+      renders += 1;
+      return mod.useUnseenTick(false);
+    });
+    const rendersBefore = renders;
+    act(() => mod.markConversationUnread("conv-1", 5_000));
+    expect(result.current).toBe(0);
+    expect(renders).toBe(rendersBefore);
+  });
+});
+
+describe("useConversationReadState", () => {
+  it("does not re-render a row whose read state did not change", async () => {
+    const mod = await loadFresh();
+    mod.seedReadState([
+      { id: "conv-1", viewer_last_seen: 1_000 },
+      { id: "conv-2", viewer_last_seen: 1_000 },
+    ]);
+    let conv1Renders = 0;
+    let conv2Renders = 0;
+    const conv1 = renderHook(() => {
+      conv1Renders += 1;
+      return mod.useConversationReadState("conv-1", 2_000, "idle");
+    });
+    const conv2 = renderHook(() => {
+      conv2Renders += 1;
+      return mod.useConversationReadState("conv-2", 2_000, "idle");
+    });
+    const conv2Before = conv2Renders;
+
+    act(() => mod.markConversationSeen("conv-1", 2_000));
+
+    expect(conv1.result.current.unseen).toBe(false);
+    expect(conv1Renders).toBeGreaterThan(1);
+    expect(conv2.result.current.unseen).toBe(true);
+    expect(conv2Renders).toBe(conv2Before);
+  });
+
+  it("reports the explicit-unread bit independently of automatic unseen state", async () => {
+    const mod = await loadFresh();
+    mod.seedReadState([{ id: "conv-1", viewer_last_seen: 1_000 }]);
+    const { result } = renderHook(() => mod.useConversationReadState("conv-1", 2_000, "running"));
+
+    act(() => mod.markConversationUnread("conv-1", 2_000));
+
+    expect(result.current).toEqual({ unseen: false, explicitlyUnread: true });
+  });
 });
 
 describe("useMarkConversationSeen", () => {
@@ -234,6 +406,22 @@ describe("useMarkConversationSeen", () => {
 
     expect(mod.isConversationUnseen("conv-1", 4_000, "idle")).toBe(false);
     expect(lastPutBody()).toEqual({ last_seen: 5_000, unread: false });
+  });
+
+  it("anchors the baseline to the viewed updated_at when the server clock leads the client", async () => {
+    const mod = await loadFresh();
+    mod.seedReadState([]);
+    setWindowFocused(true);
+    // Client wall clock (5000) lags the server updated_at (6000) the user is
+    // reading — clock skew between the hosted server and the desktop app.
+    vi.useFakeTimers({ now: 5_000_000 });
+
+    renderHook(() => mod.useMarkConversationSeen("conv-1", 6_000));
+
+    // The just-read idle turn must not reappear as unseen, and the synced
+    // baseline is the viewed updated_at, not the lagging wall clock.
+    expect(mod.isConversationUnseen("conv-1", 6_000, "idle")).toBe(false);
+    expect(lastPutBody()).toEqual({ last_seen: 6_000, unread: false });
   });
 
   it("does NOT mark seen while the window is blurred", async () => {

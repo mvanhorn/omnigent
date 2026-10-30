@@ -28,8 +28,11 @@ See ``designs/DEVICE_AUTH.md`` for the device-grant design.
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import enum
+import hashlib
+import secrets
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
@@ -58,6 +61,10 @@ class AuthMode(enum.Enum):
 
 class OAuthError(RuntimeError):
     """A login step failed in a way the user must resolve."""
+
+
+class PerUserLoginUnavailableError(OAuthError):
+    """Server configuration provides no delegated login flow for this bot."""
 
 
 class AuthorizationPendingError(OAuthError):
@@ -130,8 +137,7 @@ class PendingLogin:
     """
 
     verification_url: str
-    # Short human-readable code to display, when the flow has one (device
-    # grant). Empty for the OIDC ticket flow (the IdP page needs no code).
+    # Short human-readable code to display when the flow has one.
     user_code: str
     _poll: Callable[[], Awaitable[TokenResult]]
     _close: Callable[[], Awaitable[None]]
@@ -204,10 +210,10 @@ async def start_login(
     if mode is AuthMode.OIDC:
         return await _start_cli_ticket_login(server_url)
     if mode is AuthMode.HEADER:
-        raise OAuthError(
-            "This server uses header/proxy authentication, which this bot "
-            "can't log in to per user. Put the bot behind the same identity "
-            "proxy, or run the server in accounts or OIDC mode."
+        raise PerUserLoginUnavailableError(
+            "This server accepts anonymous requests or uses header/proxy authentication. "
+            "Ask your administrator to enable accounts or OIDC authentication for "
+            "individual Slack logins, or configure Databricks Apps web-auth enrollment."
         )
     return await _start_device_login(server_url, client_id=client_id, client_secret=client_secret)
 
@@ -239,17 +245,28 @@ async def _start_device_login(
     except httpx.HTTPError as exc:
         await client.aclose()
         raise OAuthError(f"Could not start device authorization: {exc}") from exc
-    data = resp.json()
-    device_code = str(data["device_code"])
-    interval = max(int(data.get("interval", 5)), 1)
-    expires_in = int(data.get("expires_in", 600))
+    try:
+        data = resp.json()
+        device_code = str(data["device_code"])
+        interval = max(int(data.get("interval", 5)), 1)
+        expires_in = int(data.get("expires_in", 600))
+        # The complete URI (code prefilled) — a one-click link for the user.
+        # The anti-phishing checkpoint is NOT here but on the consent page: it
+        # forces a fresh password re-auth before a grant can be approved (see
+        # designs/DEVICE_AUTH.md), so prefilling the code is safe.
+        verification_url = str(data["verification_uri_complete"])
+        user_code = str(data.get("user_code", ""))
+    except (ValueError, KeyError, TypeError) as exc:
+        # A 200 with a malformed body would otherwise leak the open client.
+        await client.aclose()
+        raise OAuthError(f"Malformed device authorization response: {exc}") from exc
 
     async def _poll() -> TokenResult:
         return await _poll_device(client, device_code, interval, expires_in)
 
     return PendingLogin(
-        verification_url=str(data["verification_uri_complete"]),
-        user_code=str(data.get("user_code", "")),
+        verification_url=verification_url,
+        user_code=user_code,
         _poll=_poll,
         _close=client.aclose,
     )
@@ -263,10 +280,13 @@ async def _poll_device(
         if asyncio.get_event_loop().time() >= deadline:
             raise AuthorizationExpiredError("The login link expired.")
         await asyncio.sleep(interval)
-        resp = await client.post(
-            "/oauth/token",
-            data={"grant_type": _DEVICE_GRANT_TYPE, "device_code": device_code},
-        )
+        try:
+            resp = await client.post(
+                "/oauth/token",
+                data={"grant_type": _DEVICE_GRANT_TYPE, "device_code": device_code},
+            )
+        except httpx.HTTPError:
+            continue  # transient — keep polling until the deadline (mirrors the ticket flow)
         if resp.status_code == 200:
             return _token_from_response(
                 resp, access_key="access_token", has_refresh=True, default_expires=3600
@@ -290,31 +310,50 @@ async def _poll_device(
 async def _start_cli_ticket_login(server_url: str) -> PendingLogin:
     base = server_url.rstrip("/")
     client = httpx.AsyncClient(base_url=base, timeout=httpx.Timeout(30.0))
+    code_verifier = secrets.token_urlsafe(48)
+    code_challenge = (
+        base64.urlsafe_b64encode(hashlib.sha256(code_verifier.encode("ascii")).digest())
+        .rstrip(b"=")
+        .decode("ascii")
+    )
     try:
-        resp = await client.post("/auth/cli-login")
+        resp = await client.post(
+            "/auth/cli-login",
+            json={"code_challenge": code_challenge, "code_challenge_method": "S256"},
+        )
         resp.raise_for_status()
     except httpx.HTTPError as exc:
         await client.aclose()
         raise OAuthError(f"Could not start login: {exc}") from exc
-    data = resp.json()
-    ticket = str(data["ticket"])
-    # login_url is a server-relative path (e.g. "/auth/login?ticket=…").
-    login_url = str(data["login_url"])
+    try:
+        data = resp.json()
+        ticket = str(data["ticket"])
+        # login_url is a server-relative path (e.g. "/auth/login?ticket=…").
+        login_url = str(data["login_url"])
+        user_code = str(data.get("user_code", ""))
+    except (ValueError, KeyError, TypeError) as exc:
+        # A 200 with a malformed body would otherwise leak the open client.
+        await client.aclose()
+        raise OAuthError(f"Malformed cli-login response: {exc}") from exc
     verification_url = login_url if login_url.startswith("http") else f"{base}{login_url}"
 
     async def _poll() -> TokenResult:
-        return await _poll_cli_ticket(client, ticket)
+        return await _poll_cli_ticket(client, ticket, code_verifier)
 
     return PendingLogin(
         verification_url=verification_url,
-        user_code="",
+        user_code=user_code,
         _poll=_poll,
         _close=client.aclose,
     )
 
 
 async def _poll_cli_ticket(
-    client: httpx.AsyncClient, ticket: str, interval: int = 2, timeout_seconds: int = 300
+    client: httpx.AsyncClient,
+    ticket: str,
+    code_verifier: str,
+    interval: int = 2,
+    timeout_seconds: int = 300,
 ) -> TokenResult:
     deadline = asyncio.get_event_loop().time() + timeout_seconds
     while True:
@@ -322,7 +361,11 @@ async def _poll_cli_ticket(
             raise AuthorizationExpiredError("The login link expired.")
         await asyncio.sleep(interval)
         try:
-            resp = await client.get("/auth/cli-poll", params={"ticket": ticket})
+            resp = await client.get(
+                "/auth/cli-poll",
+                params={"ticket": ticket},
+                headers={"X-Omnigent-Code-Verifier": code_verifier},
+            )
         except httpx.HTTPError:
             continue  # transient — keep polling until the deadline
         if resp.status_code == 202:
@@ -333,7 +376,10 @@ async def _poll_cli_ticket(
             return _token_from_response(
                 resp, access_key="token", has_refresh=False, default_expires=8 * 3600
             )
-        # 410 (expired/unknown) or any other status → terminal.
+        if resp.status_code in (400, 403, 410):
+            raise AuthorizationExpiredError(
+                _error_code(resp) or "The login link expired or was rejected."
+            )
         raise AuthorizationExpiredError("The login link expired or was rejected.")
 
 

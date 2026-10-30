@@ -3,11 +3,27 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from omnigent_slack.events import HostType
+
+
+def event_is_dm(event: dict[str, object]) -> bool:
+    """Whether a Slack event arrived via a 1:1 DM rather than a channel.
+
+    Slack marks 1:1 DMs with ``channel_type == "im"``; their channel ids also
+    start with ``"D"``. Used by the service's event routing to decide whether a
+    plain message is actionable (DMs are; channel messages need an @-mention).
+    """
+    return event.get("channel_type") == "im" or str(event.get("channel") or "").startswith("D")
+
 
 @dataclass(frozen=True, slots=True)
 class ThreadKey:
     team_id: str
     channel_id: str
+    # The session key: the thread's root message ts — the same in a channel and a
+    # DM. One session per thread, so a new top-level message starts a new session
+    # and a threaded reply reuses it. (A DM is treated exactly like a channel here,
+    # NOT as one standing session per channel.)
     thread_ts: str
 
     @classmethod
@@ -15,6 +31,25 @@ class ThreadKey:
         channel_id = str(event["channel"])
         thread_ts = str(event.get("thread_ts") or event["ts"])
         return cls(team_id=team_id, channel_id=channel_id, thread_ts=thread_ts)
+
+    @property
+    def is_dm(self) -> bool:
+        """Whether this key is for a 1:1 DM, by the channel id's ``D`` prefix.
+
+        Slack 1:1 DM channels start with ``D`` (channels start with ``C``). This
+        is a pure function of the channel, independent of the thread — a DM still
+        maps one session per thread, like a channel.
+        """
+        return self.channel_id.startswith("D")
+
+    @property
+    def reply_ts(self) -> str:
+        """The ``thread_ts`` to post replies under — always a real message ts.
+
+        Both channels and DMs key on the thread root ts now, so replies thread
+        under it in either case (a top-level message's own ts starts a new thread).
+        """
+        return self.thread_ts
 
     def display(self) -> str:
         return f"{self.team_id}:{self.channel_id}:{self.thread_ts}"
@@ -26,6 +61,10 @@ class UserConfig:
 
     The Omnigent server is operator-fixed (``OMNIGENT_SERVER_URL``), so it
     is not part of a user's config.
+
+    ``host_type`` picks between the two ways a session gets a host. It is
+    ``"managed"`` when the user chose a server-provisioned sandbox, and then
+    ``host_id`` and ``workspace`` are empty — the server chooses both.
     """
 
     agent_id: str
@@ -33,16 +72,27 @@ class UserConfig:
     workspace: str
     host_id: str | None = None
     host_name: str | None = None
+    host_type: HostType = "external"
 
 
 @dataclass(frozen=True, slots=True)
 class SessionRecord:
-    """A Slack thread's Omnigent session and where it runs."""
+    """A Slack thread's Omnigent session and where it runs.
+
+    ``host_type`` is recorded per session, not just per user: it decides whether
+    a later turn on this thread may launch a runner, and it must survive both a
+    bot restart and the user changing their setup mid-thread.
+    """
 
     session_id: str
     owner_user_id: str | None
     host_id: str | None
     workspace: str | None
+    host_type: HostType = "external"
+    # Whether a bot process had a live turn stream for this thread that never
+    # ended cleanly. Still True with no local stream = a restart/crash abandoned
+    # the turn, so a busy report for it is a promise nobody can keep.
+    turn_inflight: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,3 +107,4 @@ class SlackTurn:
     owner_user_id: str
     workspace: str | None = None
     host_id: str | None = None
+    host_type: HostType = "external"

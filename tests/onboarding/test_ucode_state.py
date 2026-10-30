@@ -37,6 +37,7 @@ _VALID_STATE = {
     "current_workspace": _WORKSPACE_URL,
     "workspaces": {
         _WORKSPACE_URL: {
+            "fable_enabled": True,
             "claude_models": {
                 "opus": "databricks-claude-opus-4-7",
                 "sonnet": "databricks-claude-sonnet-4-6",
@@ -63,7 +64,7 @@ _VALID_STATE = {
                     "auth": {
                         "command": "sh",
                         "args": ["-c", "printf token"],
-                        "refresh_interval_ms": 900000,
+                        "refresh_interval_ms": 60000,
                     },
                 },
                 "pi": {
@@ -95,6 +96,7 @@ def test_read_ucode_state_returns_state_when_configured(tmp_path: Path) -> None:
         state = read_ucode_state(_WORKSPACE_URL)
 
     assert state is not None
+    assert state.fable_enabled is True
     assert state.claude_models["opus"] == "databricks-claude-opus-4-7"
     assert state.codex_models == ["databricks-gpt-5-5"]
     assert state.base_urls["claude"] == f"{_WORKSPACE_URL}/ai-gateway/anthropic"
@@ -104,6 +106,7 @@ def test_read_ucode_state_returns_state_when_configured(tmp_path: Path) -> None:
     assert state.agent("claude").auth_command == "printf token"
     assert state.agent("codex") is not None
     assert state.agent("codex").model == "databricks-gpt-5-5"
+    assert state.agent("codex").auth_refresh_interval_ms == 60000
     assert state.agent("pi") is not None
     assert state.agent("pi").base_urls == {
         "claude": f"{_WORKSPACE_URL}/ai-gateway/anthropic",
@@ -120,6 +123,41 @@ def test_read_ucode_state_trailing_slash_insensitive(tmp_path: Path) -> None:
 
     assert state is not None
     assert state.claude_models["opus"] == "databricks-claude-opus-4-7"
+
+
+def test_read_ucode_state_refresh_cadence_precedence(tmp_path: Path) -> None:
+    """The top-level cadence wins over Codex's nested one; only a positive int is a cadence."""
+    agents = {
+        "claude": {"auth_refresh_interval_ms": 300000, "auth": {"refresh_interval_ms": 60000}},
+        "codex": {"auth": {"refresh_interval_ms": True}},
+        "zero": {"auth_refresh_interval_ms": 0},
+        "negative": {"auth": {"refresh_interval_ms": -1}},
+    }
+    state_path = tmp_path / "state.json"
+    state_path.write_text(json.dumps({"workspaces": {_WORKSPACE_URL: {"agents": agents}}}))
+
+    with patch("omnigent.onboarding.ucode_state._STATE_PATH", state_path):
+        state = read_ucode_state(_WORKSPACE_URL)
+
+    assert state is not None
+    assert state.agent("claude").auth_refresh_interval_ms == 300000
+    for name in ("codex", "zero", "negative"):
+        assert state.agent(name).auth_refresh_interval_ms is None
+
+
+def test_read_ucode_state_infers_legacy_fable_opt_in(tmp_path: Path) -> None:
+    """Older state records signal Fable opt-in through the model mapping."""
+    legacy_state = json.loads(json.dumps(_VALID_STATE))
+    workspace = legacy_state["workspaces"][_WORKSPACE_URL]
+    workspace.pop("fable_enabled")
+    workspace["claude_models"]["fable"] = "system.ai.claude-fable-5"
+    state_file = _write_state(tmp_path, legacy_state)
+
+    with patch("omnigent.onboarding.ucode_state._STATE_PATH", state_file):
+        state = read_ucode_state(_WORKSPACE_URL)
+
+    assert state is not None
+    assert state.fable_enabled is True
 
 
 def test_read_ucode_state_returns_none_when_file_absent(tmp_path: Path) -> None:

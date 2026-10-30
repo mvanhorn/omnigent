@@ -32,15 +32,17 @@ const harnesses = [];
 // Build a fresh extension instance with its own temp inbox directory. Each call
 // produces independent closure state (activeResponseId, pendingInterruptUntil,
 // latestContext, ...).
-function makeHarness({ captureEvents = false } = {}) {
-  const inboxDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-native-inbox-"));
-  const configPath = path.join(inboxDir, "config.json");
+function makeHarness({ captureEvents = false, existingTools = [] } = {}) {
+  const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-native-inbox-"));
+  const inboxDir = path.join(fixtureRoot, "inbox");
+  fs.mkdirSync(inboxDir);
+  const configPath = path.join(fixtureRoot, "config.json");
   // A serverUrl + sessionId make postEvent attempt a real fetch; with a mock
   // global fetch that lets a test capture the posted event bodies. Without
   // them postEvent fails closed (the interrupt tests rely on that).
   const config = captureEvents
-    ? { inboxDir, serverUrl: "http://mock", sessionId: "conv_test" }
-    : { inboxDir };
+    ? { inboxDir, bridgeDir: inboxDir, serverUrl: "http://mock", sessionId: "conv_test" }
+    : { inboxDir, bridgeDir: inboxDir };
   fs.writeFileSync(configPath, JSON.stringify(config));
   process.env.OMNIGENT_PI_NATIVE_CONFIG = configPath;
 
@@ -58,11 +60,16 @@ function makeHarness({ captureEvents = false } = {}) {
   }
 
   const handlers = {};
+  const registeredTools = {};
   const pi = {
     on: (name, fn) => {
       handlers[name] = fn;
     },
     registerCommand: () => {},
+    registerTool: (tool) => {
+      registeredTools[tool.name] = tool;
+    },
+    getAllTools: () => existingTools,
     sendUserMessage: () => {},
   };
 
@@ -71,7 +78,7 @@ function makeHarness({ captureEvents = false } = {}) {
   const mod = require(EXT_PATH);
   mod(pi);
 
-  const h = { pi, handlers, inboxDir, postedEvents };
+  const h = { pi, handlers, fixtureRoot, configPath, inboxDir, postedEvents, registeredTools };
   harnesses.push(h);
   return h;
 }
@@ -297,6 +304,130 @@ async function testAgentStartClearsStaleWindow() {
   );
 }
 
+async function testTaskPlanPublishesTodos() {
+  const h = makeHarness({ captureEvents: true });
+  await h.handlers.session_start({}, {});
+  const tool = h.registeredTools.manage_todo_list;
+  assert("registers manage_todo_list", !!tool);
+  assert(
+    "requires a task plan before multi-step work",
+    tool.promptGuidelines.some((guideline) =>
+      guideline.includes(
+        "must call manage_todo_list before using other tools",
+      ),
+    ),
+  );
+
+  const result = await tool.execute("todo-1", {
+    operation: "write",
+    todoList: [
+      {
+        id: 1,
+        title: "Trace rendering",
+        description: "Tracing the shared event path",
+        status: "in-progress",
+      },
+      {
+        id: 2,
+        title: "Run checks",
+        description: "Run focused checks",
+        status: "not-started",
+      },
+    ],
+  });
+  const event = h.postedEvents.find(
+    (item) => item.type === "external_session_todos",
+  );
+  assert(
+    "manage_todo_list publishes the shared todo event",
+    JSON.stringify(event && event.data.todos) ===
+      JSON.stringify([
+        {
+          content: "Trace rendering",
+          status: "in_progress",
+          activeForm: "Tracing the shared event path",
+        },
+        {
+          content: "Run checks",
+          status: "pending",
+          activeForm: "Run focused checks",
+        },
+      ]),
+    JSON.stringify(event),
+  );
+  assert(
+    "manage_todo_list persists its current list in tool details",
+    result.details.todos.length === 2 &&
+      result.details.todos[0].status === "in-progress",
+    JSON.stringify(result),
+  );
+
+  const restored = makeHarness({ captureEvents: true });
+  await restored.handlers.session_start(
+    {},
+    {
+      sessionManager: {
+        getBranch: () => [
+          {
+            type: "message",
+            message: {
+              role: "toolResult",
+              toolName: "manage_todo_list",
+              details: { todos: result.details.todos },
+            },
+          },
+        ],
+      },
+    },
+  );
+  const restoredEvent = restored.postedEvents.find(
+    (item) => item.type === "external_session_todos",
+  );
+  assert(
+    "session_start restores and republishes the latest task plan",
+    restoredEvent && restoredEvent.data.todos.length === 2,
+    JSON.stringify(restoredEvent),
+  );
+}
+
+async function testExistingTaskToolIsMirroredWithoutConflict() {
+  const h = makeHarness({
+    captureEvents: true,
+    existingTools: [{ name: "manage_todo_list" }],
+  });
+  await h.handlers.session_start({}, {});
+  assert(
+    "reuses an existing manage_todo_list tool",
+    !h.registeredTools.manage_todo_list,
+  );
+
+  await h.handlers.tool_result(
+    {
+      toolCallId: "external-todo-1",
+      toolName: "manage_todo_list",
+      details: {
+        todos: [
+          {
+            id: 1,
+            title: "Use the shared tool",
+            description: "Using the shared task tool",
+            status: "in-progress",
+          },
+        ],
+      },
+    },
+    {},
+  );
+  const event = h.postedEvents.find(
+    (item) => item.type === "external_session_todos",
+  );
+  assert(
+    "mirrors an existing task tool into the shared todo event",
+    event && event.data.todos[0].content === "Use the shared tool",
+    JSON.stringify(event),
+  );
+}
+
 // The web store only clears its local "streaming" flag when a turn's `idle`
 // status edge carries the same response_id as the `running` edge that opened
 // it. A fresh id per edge left the composer stuck queueing until a tab switch
@@ -306,6 +437,9 @@ async function testRunningIdleShareResponseId() {
   const ctx = makeCtx({ idle: false });
 
   await h.handlers.agent_start({}, ctx);
+  await h.handlers.message_end({
+    message: { role: "assistant", stopReason: "stop", content: [] },
+  }, ctx);
   await h.handlers.agent_end({ messages: [] }, ctx);
 
   const edges = statusEdges(h.postedEvents);
@@ -330,6 +464,9 @@ async function testRunningIdleShareResponseId() {
 
   // A second turn mints a fresh id, still paired across its own running/idle.
   await h.handlers.agent_start({}, ctx);
+  await h.handlers.message_end({
+    message: { role: "assistant", stopReason: "stop", content: [] },
+  }, ctx);
   await h.handlers.agent_end({ messages: [] }, ctx);
   const edges2 = statusEdges(h.postedEvents);
   const running2 = edges2.filter((e) => e.status === "running");
@@ -344,20 +481,278 @@ async function testRunningIdleShareResponseId() {
   );
 }
 
+async function uiSession(mode = "tui", missing = []) {
+  const h = makeHarness({ captureEvents: true });
+  const originalCalls = [];
+  const ui = {};
+  for (const [method, result] of Object.entries({
+    confirm: true, select: "Allow", input: "typed", editor: "edited",
+    notify: undefined, setStatus: undefined, setTitle: undefined,
+  })) {
+    ui[method] = function (...args) {
+      assert(`${method}: fallback retains UI receiver`, this === ui);
+      originalCalls.push({ method, args });
+      return result;
+    };
+  }
+  for (const method of missing) delete ui[method];
+  const ctx = { mode, ui };
+  await h.handlers.session_start({}, ctx);
+  originalCalls.length = 0;
+  return { ...h, ctx, originalCalls };
+}
+
+function dialogFetch(respond) {
+  global.fetch = async (url, opts) => String(url).includes("pi-extension-ui")
+    ? respond(opts) : { ok: true, status: 204 };
+}
+
+function dialogResponse(value) {
+  return { ok: true, status: 200, text: async () => JSON.stringify(value) };
+}
+
+async function testTuiWrapParksConfirmWithoutCallingOriginal() {
+  const { ctx, originalCalls } = await uiSession();
+  dialogFetch((opts) => {
+    const body = JSON.parse(opts.body);
+    assert("confirm carries its correlation ID and request", body.elicitation_id &&
+      body.request.method === "confirm" && body.request.title === "Clear?");
+    return dialogResponse({ confirmed: true });
+  });
+  assert("confirm returns the server answer", await ctx.ui.confirm("Clear?", "Lost.") === true);
+  assert("original TUI dialog is bypassed", !originalCalls.some((call) => call.method === "confirm"));
+  ctx.ui.notify("hello");
+  ctx.ui.setStatus("test", "ready");
+  assert("notifications remain local", originalCalls.some((call) => call.method === "notify") && originalCalls.some((call) => call.method === "setStatus"));
+}
+
+async function testUnsupportedDialogsFallBackToTui() {
+  for (const status of [404, 405, 403]) {
+    const { ctx, originalCalls } = await uiSession();
+    dialogFetch(() => ({ ok: false, status }));
+    const opts = { timeout: 2000 };
+    for (const [method, args, expected] of [
+      ["confirm", ["Continue?", "Details", opts], true],
+      ["select", ["Choice?", ["Allow", "Block"], opts], "Allow"],
+      ["input", ["Name?", "placeholder", opts], "typed"],
+      ["editor", ["Notes", "prefill", opts], "edited"],
+    ]) {
+      const actual = await ctx.ui[method](...args);
+      assert(`${status}: ${method} result`, actual === (status === 403 ? (method === "confirm" ? false : undefined) : expected));
+      if (status !== 403) {
+        const call = originalCalls.at(-1);
+        assert(`${method}: preserves arguments`, call.method === method && call.args.every((arg, index) => arg === args[index]));
+      }
+    }
+    assert(`${status}: only unsupported endpoints use TUI`, originalCalls.length === (status === 403 ? 0 : 4));
+  }
+}
+
+async function testDialogCancellationDoesNotRepark() {
+  for (const [response, expectedCalls] of [
+    [dialogResponse({ cancelled: true }), 1],
+    [{ ok: true, status: 200, text: async () => "" }, 3],
+  ]) {
+    const { ctx } = await uiSession();
+    let calls = 0;
+    dialogFetch(() => { calls += 1; return response; });
+    assert("unanswered input returns undefined", await ctx.ui.input("Name?", "", { timeout: 6000 }) === undefined);
+    assert("cancel stops and empty responses are bounded", calls === expectedCalls);
+  }
+}
+
+async function testTuiWrapReparksSameElicitationId() {
+  const { ctx, configPath } = await uiSession();
+  const ids = [], headers = [];
+  const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
+  const setToken = (token) => fs.writeFileSync(configPath, JSON.stringify({ ...config, authHeaders: { authorization: token } }));
+  setToken("first-token");
+  dialogFetch((opts) => {
+    const body = JSON.parse(opts.body);
+    ids.push(body.elicitation_id);
+    headers.push(opts.headers.authorization);
+    assert("caller timeout reaches the server", body.request.timeout === 6000);
+    if (ids.length === 1) {
+      setToken("rotated-token");
+      return { ok: true, status: 200, text: async () => "" };
+    }
+    return dialogResponse({ value: "Allow" });
+  });
+  const started = Date.now();
+  assert("select returns chosen label", await ctx.ui.select("Choice?", ["Allow", "Block"], { timeout: 6000 }) === "Allow");
+  assert("empty responses back off", Date.now() - started >= 900);
+  assert("re-park preserves its ID", ids.length === 2 && ids[0] === ids[1]);
+  assert("re-park refreshes the bearer", JSON.stringify(headers) === JSON.stringify(["first-token", "rotated-token"]));
+}
+
+async function testPartialUiStillInitializes() {
+  const { ctx, registeredTools } = await uiSession("tui", ["editor"]);
+  assert("missing editor stays absent", ctx.ui.editor === undefined);
+  assert("startup registers task tool", !!registeredTools.manage_todo_list);
+  dialogFetch(() => dialogResponse({ confirmed: true }));
+  assert("remaining UI still works", await ctx.ui.confirm("Continue?", "") === true);
+}
+
+async function testActiveDialogCancellation() {
+  for (const phase of ["already-aborted", "headers", "body", "backoff", "timeout"]) {
+    const { ctx } = await uiSession();
+    const controller = new AbortController();
+    let requestStarted;
+    const started = new Promise((resolve) => { requestStarted = resolve; });
+    dialogFetch((opts) => {
+      const wait = () => new Promise((_, reject) => {
+        opts.signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+        requestStarted();
+      });
+      if (phase === "headers" || phase === "timeout") return wait();
+      if (phase === "body") return { ok: true, status: 200, text: wait };
+      setTimeout(requestStarted, 10);
+      return { ok: false, status: 503 };
+    });
+    if (phase === "already-aborted") controller.abort();
+    const pending = ctx.ui.confirm("Continue?", "Test only", {
+      ...(phase !== "timeout" ? { signal: controller.signal } : {}),
+      timeout: phase === "timeout" ? 50 : 2000,
+    });
+    if (phase !== "already-aborted" && phase !== "timeout") {
+      await started;
+      controller.abort();
+    }
+    let timer;
+    try {
+      const value = await Promise.race([
+        pending,
+        new Promise((resolve) => { timer = setTimeout(() => resolve("still-waiting"), 500); }),
+      ]);
+      assert(`${phase}: abort releases the caller`, value === false, String(value));
+    } finally {
+      clearTimeout(timer);
+    }
+    dialogFetch(() => dialogResponse({ confirmed: true }));
+    assert(`${phase}: a later dialog works`, await ctx.ui.confirm("Again?", "Test only") === true);
+  }
+}
+
+async function testRpcModeDoesNotWrapUi() {
+  const { ctx, originalCalls } = await uiSession("rpc");
+  assert("RPC mode keeps its original UI", await ctx.ui.confirm("Clear?", "Lost.") === true && originalCalls.some((call) => call.method === "confirm"));
+}
+
+async function testSessionStartupDoesNotCompleteATurn() {
+  const h = makeHarness({ captureEvents: true });
+  const ctx = makeCtx({ idle: true });
+  ctx.sessionManager = { getSessionId: () => "saved-native-session" };
+
+  await h.handlers.session_start({}, ctx);
+
+  assert(
+    "starting an idle or resumed session does not report a completed turn",
+    statusEdges(h.postedEvents).length === 0,
+    JSON.stringify(statusEdges(h.postedEvents)),
+  );
+}
+
+async function testSessionStartMarksInputReady() {
+  const h = makeHarness();
+  const marker = path.join(h.inboxDir, "input_ready");
+  assert("input-ready marker is absent before session_start", !fs.existsSync(marker));
+
+  await h.handlers.session_start({}, makeCtx({ idle: true }));
+
+  assert(
+    "session_start writes the input-ready marker once the inbox poller is armed",
+    fs.existsSync(marker) && !!h.pi.__omnigentInboxPoller,
+  );
+}
+
+async function testQueuedPromptDuringStartupStaysRunningUntilAgentEnd() {
+  const h = makeHarness({ captureEvents: true });
+  const ctx = makeCtx({ idle: true });
+  ctx.sessionManager = { getSessionId: () => "queued-native-session" };
+  const captureFetch = global.fetch;
+  let releaseStartupPatch;
+  const startupPatchPending = new Promise((resolve) => {
+    releaseStartupPatch = resolve;
+  });
+  global.fetch = async (url, opts) => {
+    if (opts.method === "PATCH") await startupPatchPending;
+    return captureFetch(url, opts);
+  };
+  let agentStartPromise;
+  h.pi.sendUserMessage = () => {
+    ctx.isIdle = () => false;
+    agentStartPromise = h.handlers.agent_start({}, ctx);
+  };
+  const payloadPath = path.join(h.inboxDir, "first-prompt.json");
+  fs.writeFileSync(
+    payloadPath,
+    JSON.stringify({ id: "first-prompt", type: "user_message", content: "Run the task" }),
+  );
+  const startup = h.handlers.session_start({}, ctx);
+  try {
+    const deadline = Date.now() + 3000;
+    while (fs.existsSync(payloadPath)) {
+      if (Date.now() > deadline) throw new Error("startup prompt was not consumed by poller");
+      await sleep(20);
+    }
+    if (!agentStartPromise) throw new Error("the queued prompt did not start an agent loop");
+    await agentStartPromise;
+    releaseStartupPatch();
+    await startup;
+
+    const beforeEnd = statusEdges(h.postedEvents);
+    assert(
+      "finishing startup preserves the queued prompt's running turn",
+      beforeEnd.length === 1 && beforeEnd[0].status === "running",
+      JSON.stringify(beforeEnd),
+    );
+
+    await h.handlers.message_end({
+      message: { role: "assistant", stopReason: "stop", content: [] },
+    }, ctx);
+    await h.handlers.agent_end({ messages: [] }, ctx);
+    const afterEnd = statusEdges(h.postedEvents);
+    assert(
+      "only agent_end completes the queued prompt with the same response_id",
+      afterEnd.length === 2 &&
+        afterEnd[0].status === "running" &&
+        afterEnd[1].status === "idle" &&
+        afterEnd[0].responseId === afterEnd[1].responseId,
+      JSON.stringify(afterEnd),
+    );
+  } finally {
+    releaseStartupPatch();
+    await startup;
+    global.fetch = captureFetch;
+  }
+}
+
 (async () => {
   try {
+    await testSessionStartupDoesNotCompleteATurn();
+    await testSessionStartMarksInputReady();
+    await testQueuedPromptDuringStartupStaysRunningUntilAgentEnd();
     await testRunningIdleShareResponseId();
+    await testTaskPlanPublishesTodos();
+    await testExistingTaskToolIsMirroredWithoutConflict();
     await testIdleInterruptDoesNotPoisonNextTurn();
     await testIdleInterruptFallbackNoIsIdle();
     await testMidTurnInterruptStillAborts();
     await testAgentLoopInterruptFallbackNoIsIdleBeforeTurnStart();
     await testMidTurnInterruptFallbackNoIsIdle();
     await testAgentStartClearsStaleWindow();
+    await testTuiWrapParksConfirmWithoutCallingOriginal();
+    await testUnsupportedDialogsFallBackToTui();
+    await testDialogCancellationDoesNotRepark();
+    await testTuiWrapReparksSameElicitationId();
+    await testPartialUiStillInitializes();
+    await testActiveDialogCancellation();
+    await testRpcModeDoesNotWrapUi();
   } finally {
     for (const h of harnesses) {
       if (h.pi.__omnigentInboxPoller) clearInterval(h.pi.__omnigentInboxPoller);
       try {
-        fs.rmSync(h.inboxDir, { recursive: true, force: true });
+        fs.rmSync(h.fixtureRoot, { recursive: true, force: true });
       } catch (_err) {}
     }
   }

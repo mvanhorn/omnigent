@@ -7,19 +7,27 @@ import base64
 import contextlib
 import socket
 import ssl
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 
 from omnigent.inner.credential_proxy import (
     SYNTHETIC_CREDENTIAL_PREFIX,
     CredentialRewriteRule,
+    RefreshingSecretProvider,
+    prepare_credential_proxy_runtime,
 )
 from omnigent.inner.egress.ca import ensure_ca, ensure_ca_bundle
 from omnigent.inner.egress.certs import HostCertCache
 from omnigent.inner.egress.proxy import EgressProxy
 from omnigent.inner.egress.rules import parse_rules
+from omnigent.inner.sandbox import SandboxPolicy
+from omnigent.spec.parser import _parse_credential_proxy
 
 
 @pytest.fixture()
@@ -28,6 +36,152 @@ def ca_paths(tmp_path: Path) -> tuple[Path, Path, Path]:
     cert_path, key_path = ensure_ca(cache_dir=tmp_path)
     bundle_path = ensure_ca_bundle(cert_path, cache_dir=tmp_path)
     return cert_path, key_path, bundle_path
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fail", [False, True])
+async def test_concurrent_credentials_share_resolution_without_exhausting_executor(
+    ca_paths: tuple[Path, Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    fail: bool,
+) -> None:
+    started = threading.Event()
+    released = threading.Event()
+
+    class Provider:
+        calls = 0
+
+        def resolve(self) -> str:
+            self.calls += 1
+            started.set()
+            if not released.wait(10):
+                raise TimeoutError("test broker was not released")
+            if fail:
+                raise RuntimeError("sensitive broker error")
+            return "replacement"
+
+    provider = Provider()
+    cert_path, key_path, _ = ca_paths
+    proxy = EgressProxy(
+        [],
+        cert_path,
+        key_path,
+        credential_rewrites=[
+            CredentialRewriteRule(
+                host="github.com",
+                scheme="basic",
+                username="x-access-token",
+                secret_provider=provider.resolve,
+            ),
+            CredentialRewriteRule(
+                host="api.github.com", scheme="token", secret_provider=provider.resolve
+            ),
+        ],
+    )
+    loop = asyncio.get_running_loop()
+    tasks = []
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        monkeypatch.setattr(loop, "_default_executor", executor)
+        try:
+            tasks = [
+                asyncio.create_task(
+                    proxy._rewrite_authorization_async(
+                        method="GET",
+                        host="github.com" if index % 2 else "api.github.com",
+                        headers_raw=b"Host: github.com\r\n\r\n",
+                    )
+                )
+                for index in range(64)
+            ]
+            async with asyncio.timeout(3):
+                while not started.is_set():
+                    await asyncio.sleep(0.01)
+            tasks[0].cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await tasks[0]
+            assert await asyncio.wait_for(asyncio.to_thread(lambda: "available"), 3) == "available"
+            assert provider.calls == 1
+            assert all(not task.done() for task in tasks[1:])
+            released.set()
+            results = await asyncio.wait_for(asyncio.gather(*tasks[1:]), 3)
+            assert provider.calls == 1
+            if fail:
+                assert all(result.status_code == 502 for result in results)
+                assert all(result.error == "Credential source unavailable" for result in results)
+                assert all(result.headers == b"" for result in results)
+            else:
+                expected_basic = base64.b64encode(b"x-access-token:replacement")
+                assert all(result.error is None for result in results)
+                assert all(
+                    b"token replacement" in result.headers or expected_basic in result.headers
+                    for result in results
+                )
+            assert not proxy._credential_resolutions
+            if fail:
+                fail = False
+                recovered = await proxy._rewrite_authorization_async(
+                    method="GET",
+                    host="api.github.com",
+                    headers_raw=b"Host: api.github.com\r\n\r\n",
+                )
+                assert recovered.error is None
+                assert b"token replacement" in recovered.headers
+                assert provider.calls == 2
+        finally:
+            released.set()
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "method,host,auth,error",
+    [
+        ("TRACE", "github.com", "", None),
+        ("GET", "github.com", "Authorization: token foreign\r\n", None),
+        ("GET", "example.com", "", None),
+        ("GET", "example.com", "Authorization: token oa_cred_test\r\n", "not allowed"),
+        (
+            "GET",
+            "github.com",
+            "Authorization: token oa_cred_test\r\nAuthorization: token oa_cred_wrong\r\n",
+            "not allowed",
+        ),
+    ],
+)
+async def test_async_rewrite_does_not_resolve_unneeded_or_rejected_credentials(
+    ca_paths: tuple[Path, Path, Path],
+    method: str,
+    host: str,
+    auth: str,
+    error: str | None,
+) -> None:
+    resolver = Mock(side_effect=AssertionError("credential should not be resolved"))
+    cert_path, key_path, _ = ca_paths
+    proxy = EgressProxy(
+        [],
+        cert_path,
+        key_path,
+        credential_rewrites=[
+            CredentialRewriteRule(
+                host="github.com",
+                scheme="token",
+                synthetic="oa_cred_test",
+                secret_provider=resolver,
+            ),
+        ],
+    )
+    headers = f"Host: {host}\r\n{auth}\r\n".encode()
+    result = await proxy._rewrite_authorization_async(
+        method=method, host=host, headers_raw=headers
+    )
+    if error is None:
+        assert result.error is None
+        assert result.headers == headers
+    else:
+        assert result.error is not None and error in result.error
+    resolver.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -51,13 +205,14 @@ async def test_proxy_start_stop_tcp(
 
 
 @pytest.mark.asyncio
-async def test_proxy_start_unix(ca_paths: tuple[Path, Path, Path], tmp_path: Path) -> None:
+async def test_proxy_start_unix(ca_paths: tuple[Path, Path, Path], short_tmp_parent: Path) -> None:
     """Proxy can listen on a Unix socket."""
     cert_path, key_path, _ = ca_paths
     rules = parse_rules(["GET example.com/**"])
     proxy = EgressProxy(rules, cert_path, key_path)
 
-    sock_path = tmp_path / "test.sock"
+    # short_tmp_parent (not tmp_path): the AF_UNIX path cap overflows on macOS.
+    sock_path = short_tmp_parent / "test.sock"
     await proxy.start_unix(sock_path)
 
     # Socket file is created
@@ -1155,6 +1310,212 @@ def _mitm_client_send_inner(
             raw.close()
 
 
+def _mitm_client_selected_alpn(
+    proxy_port: int,
+    connect_target: str,
+    server_hostname: str,
+    ca_bundle: Path,
+) -> str | None:
+    raw = socket.create_connection(("127.0.0.1", proxy_port), timeout=10)
+    try:
+        connect = f"CONNECT {connect_target} HTTP/1.1\r\nHost: {server_hostname}\r\n\r\n"
+        raw.sendall(connect.encode("latin-1"))
+        established = b""
+        while b"\r\n\r\n" not in established:
+            chunk = raw.recv(4096)
+            if not chunk:
+                break
+            established += chunk
+
+        ctx = ssl.create_default_context(cafile=str(ca_bundle))
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        ctx.set_alpn_protocols(["h2", "http/1.1"])
+        tls = ctx.wrap_socket(raw, server_hostname=server_hostname)
+        try:
+            return tls.selected_alpn_protocol()
+        finally:
+            with contextlib.suppress(Exception):
+                tls.close()
+    finally:
+        with contextlib.suppress(Exception):
+            raw.close()
+
+
+@pytest.mark.asyncio
+async def test_connect_relays_http2_for_unrestricted_host(
+    ca_paths: tuple[Path, Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cert_path, key_path, bundle_path = ca_paths
+    host = "agent.example.com"
+    request = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\nopaque-client-frames"
+    response = b"opaque-server-frames"
+    received: list[bytes] = []
+
+    async def _upstream(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        received.append(await reader.readexactly(len(request)))
+        writer.write(response)
+        await writer.drain()
+        writer.close()
+
+    upstream_ctx = HostCertCache(cert_path, key_path).get_ssl_context(host)
+    upstream_ctx.set_alpn_protocols(["h2"])
+    upstream = await asyncio.start_server(_upstream, "127.0.0.1", 0, ssl=upstream_ctx)
+    upstream_port = upstream.sockets[0].getsockname()[1]
+    proxy = EgressProxy(
+        parse_rules([f"* {host}/**"]),
+        cert_path,
+        key_path,
+        upstream_ca_bundle=bundle_path,
+        block_private_destinations=False,
+    )
+    proxy_port = await proxy.start_tcp()
+    monkeypatch.setattr(asyncio.get_event_loop(), "getaddrinfo", _resolve_to_loopback())
+
+    try:
+        observed = await asyncio.wait_for(
+            asyncio.to_thread(
+                _mitm_client_send_inner,
+                proxy_port,
+                f"{host}:{upstream_port}",
+                host,
+                bundle_path,
+                request,
+            ),
+            timeout=15,
+        )
+        assert received == [request]
+        assert observed == response
+    finally:
+        await proxy.stop()
+        upstream.close()
+        await upstream.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_connect_advertises_http2_only_for_safe_passthrough(
+    ca_paths: tuple[Path, Path, Path],
+) -> None:
+    cert_path, key_path, bundle_path = ca_paths
+    unrestricted_host = "unrestricted.example.com"
+    restricted_host = "restricted.example.com"
+    credential_host = "credential.example.com"
+    proxy = EgressProxy(
+        parse_rules(
+            [
+                f"* {unrestricted_host}/**",
+                f"POST {restricted_host}/allowed/**",
+                f"* {credential_host}/**",
+            ]
+        ),
+        cert_path,
+        key_path,
+        block_private_destinations=False,
+        credential_rewrites=[
+            CredentialRewriteRule(
+                host=credential_host,
+                scheme="bearer",
+                synthetic=f"{SYNTHETIC_CREDENTIAL_PREFIX}test",
+                real_secret="real-secret",
+            )
+        ],
+    )
+    proxy_port = await proxy.start_tcp()
+
+    try:
+        for host, expected in (
+            (unrestricted_host, "h2"),
+            (restricted_host, "http/1.1"),
+            (credential_host, "http/1.1"),
+        ):
+            selected = await asyncio.wait_for(
+                asyncio.to_thread(
+                    _mitm_client_selected_alpn,
+                    proxy_port,
+                    f"{host}:443",
+                    host,
+                    bundle_path,
+                ),
+                timeout=15,
+            )
+            assert selected == expected
+    finally:
+        await proxy.stop()
+
+
+@pytest.mark.asyncio
+async def test_connect_blocks_http2_for_path_restricted_host(
+    ca_paths: tuple[Path, Path, Path],
+) -> None:
+    cert_path, key_path, bundle_path = ca_paths
+    host = "restricted.example.com"
+    proxy = EgressProxy(
+        parse_rules([f"POST {host}/allowed/**"]),
+        cert_path,
+        key_path,
+        block_private_destinations=False,
+    )
+    proxy_port = await proxy.start_tcp()
+
+    try:
+        observed = await asyncio.wait_for(
+            asyncio.to_thread(
+                _mitm_client_send_inner,
+                proxy_port,
+                f"{host}:443",
+                host,
+                bundle_path,
+                b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n",
+            ),
+            timeout=15,
+        )
+        assert b"403 Forbidden" in observed
+        assert b"unrestricted host rule" in observed
+    finally:
+        await proxy.stop()
+
+
+@pytest.mark.asyncio
+async def test_connect_blocks_http2_when_host_has_credential_rewrite(
+    ca_paths: tuple[Path, Path, Path],
+) -> None:
+    cert_path, key_path, bundle_path = ca_paths
+    host = "credential.example.com"
+    connect_host = "Credential.Example.Com"
+    proxy = EgressProxy(
+        parse_rules([f"* {host}/**"]),
+        cert_path,
+        key_path,
+        block_private_destinations=False,
+        credential_rewrites=[
+            CredentialRewriteRule(
+                host=host,
+                scheme="bearer",
+                synthetic=f"{SYNTHETIC_CREDENTIAL_PREFIX}test",
+                real_secret="real-secret",
+            )
+        ],
+    )
+    proxy_port = await proxy.start_tcp()
+
+    try:
+        observed = await asyncio.wait_for(
+            asyncio.to_thread(
+                _mitm_client_send_inner,
+                proxy_port,
+                f"{connect_host}:443",
+                host,
+                bundle_path,
+                b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n",
+            ),
+            timeout=15,
+        )
+        assert b"403 Forbidden" in observed
+        assert b"credential rewrite rule" in observed
+    finally:
+        await proxy.stop()
+
+
 @pytest.mark.asyncio
 async def test_s6_connect_rejects_control_byte_in_inner_request_line(
     ca_paths: tuple[Path, Path, Path],
@@ -1501,13 +1862,24 @@ class _CapturedRequest:
         can assert the proxy collapsed any client-supplied
         ``Connection`` / ``Keep-Alive`` headers into exactly one
         ``close`` rather than forwarding duplicates.
+    :param max_forwards: The ``Max-Forwards`` header value the upstream
+        received (as sent, e.g. ``"2"``), or ``None`` when the request
+        carried no such header — lets a test assert the proxy decremented
+        the hop count on a forwarded TRACE / OPTIONS.
+    :param method: The request method the upstream received, e.g.
+        ``"GET"`` or ``"TRACE"``, or ``None`` when the request line could
+        not be parsed.
     """
 
     authorization: str | None
     connection: list[str] = field(default_factory=list)
+    max_forwards: str | None = None
+    method: str | None = None
 
 
-async def _start_capturing_upstream(captured: list[_CapturedRequest]) -> asyncio.Server:
+async def _start_capturing_upstream(
+    captured: list[_CapturedRequest], ssl_context: ssl.SSLContext | None = None
+) -> asyncio.Server:
     """Start a loopback HTTP server that records each ``Authorization`` header.
 
     The server reads the request head, appends the captured authorization
@@ -1523,17 +1895,31 @@ async def _start_capturing_upstream(captured: list[_CapturedRequest]) -> asyncio
         head = await reader.readuntil(b"\r\n\r\n")
         auth: str | None = None
         connection: list[str] = []
-        for line in head.split(b"\r\n"):
+        max_forwards: str | None = None
+        lines = head.split(b"\r\n")
+        method: str | None = None
+        if lines and lines[0]:
+            method = lines[0].split(b" ", 1)[0].decode("latin-1")
+        for line in lines:
             if line[:14].lower() == b"authorization:":
                 auth = line.partition(b":")[2].strip().decode("latin-1")
             elif line[:11].lower() == b"connection:":
                 connection.append(line.partition(b":")[2].strip().decode("latin-1").lower())
-        captured.append(_CapturedRequest(authorization=auth, connection=connection))
+            elif line[:13].lower() == b"max-forwards:":
+                max_forwards = line.partition(b":")[2].strip().decode("latin-1")
+        captured.append(
+            _CapturedRequest(
+                authorization=auth,
+                connection=connection,
+                max_forwards=max_forwards,
+                method=method,
+            )
+        )
         writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
         await writer.drain()
         writer.close()
 
-    return await asyncio.start_server(_handle, "127.0.0.1", 0)
+    return await asyncio.start_server(_handle, "127.0.0.1", 0, ssl=ssl_context)
 
 
 async def _proxied_http_get(
@@ -1558,6 +1944,48 @@ async def _proxied_http_get(
         f"GET http://127.0.0.1:{upstream_port}/probe HTTP/1.1\r\n"
         f"Host: 127.0.0.1:{upstream_port}\r\n"
         f"{auth_line}"
+        "Connection: close\r\n"
+        "\r\n"
+    ).encode("latin-1")
+    writer.write(request)
+    await writer.drain()
+    response = await asyncio.wait_for(reader.read(4096), timeout=5)
+    writer.close()
+    with contextlib.suppress(Exception):
+        await writer.wait_closed()
+    return response
+
+
+async def _proxied_http_request(
+    *,
+    proxy_port: int,
+    upstream_port: int,
+    method: str,
+    authorization: str | None = None,
+    extra_headers: str = "",
+) -> bytes:
+    """Send one plain-HTTP request of an arbitrary method through the proxy.
+
+    A generalization of :func:`_proxied_http_get` used by the TRACE /
+    OPTIONS and ``Max-Forwards`` tests, where the method and extra headers
+    (e.g. ``"Max-Forwards: 0\\r\\n"``) matter.
+
+    :param proxy_port: Loopback TCP port the proxy listens on.
+    :param upstream_port: Port of the local capturing upstream.
+    :param method: HTTP method to send, e.g. ``"TRACE"`` or ``"OPTIONS"``.
+    :param authorization: Raw ``Authorization`` value to send, or ``None``
+        to omit the header (the swap-on-access client shape).
+    :param extra_headers: Additional header lines, each CRLF-terminated,
+        inserted verbatim before the ``Connection: close`` line.
+    :returns: The raw response bytes the client received from the proxy.
+    """
+    reader, writer = await asyncio.open_connection("127.0.0.1", proxy_port)
+    auth_line = f"Authorization: {authorization}\r\n" if authorization is not None else ""
+    request = (
+        f"{method} http://127.0.0.1:{upstream_port}/probe HTTP/1.1\r\n"
+        f"Host: 127.0.0.1:{upstream_port}\r\n"
+        f"{auth_line}"
+        f"{extra_headers}"
         "Connection: close\r\n"
         "\r\n"
     ).encode("latin-1")
@@ -1632,6 +2060,204 @@ async def test_credential_rewrite_swaps_bearer_and_token(
     assert captured[0].authorization == expected_upstream
     # And the synthetic placeholder must NOT have leaked upstream.
     assert synthetic not in (captured[0].authorization or "")
+
+
+@pytest.mark.asyncio
+async def test_credential_rewrite_swaps_via_refreshing_provider(
+    ca_paths: tuple[Path, Path, Path],
+) -> None:
+    """A rule with a ``secret_provider`` resolves the live token per swap.
+
+    This is the Databricks-CLI shape: the real bearer expires, so the rule
+    carries a provider (not a static secret). The upstream must receive the
+    provider's current value, proving ``resolve_secret()`` is called on the
+    swap path (and thus long sessions pick up a refreshed token).
+    """
+    cert_path, key_path, _ = ca_paths
+    synthetic = f"{SYNTHETIC_CREDENTIAL_PREFIX}dbx123"
+    calls = {"n": 0}
+
+    def provider() -> str:
+        calls["n"] += 1
+        return f"live-token-{calls['n']}"
+
+    rule = CredentialRewriteRule(
+        host="127.0.0.1",
+        scheme="bearer",
+        synthetic=synthetic,
+        secret_provider=provider,
+    )
+    captured: list[_CapturedRequest] = []
+    upstream = await _start_capturing_upstream(captured)
+    upstream_port = upstream.sockets[0].getsockname()[1]
+
+    proxy = EgressProxy(
+        parse_rules(["* 127.0.0.1/**"]),
+        cert_path,
+        key_path,
+        block_private_destinations=False,
+        credential_rewrites=[rule],
+    )
+    proxy_port = await proxy.start_tcp()
+    try:
+        response = await _proxied_http_get(
+            proxy_port=proxy_port,
+            upstream_port=upstream_port,
+            authorization=f"Bearer {synthetic}",
+        )
+    finally:
+        await proxy.stop()
+        upstream.close()
+        await upstream.wait_closed()
+
+    assert b"200 OK" in response, f"Request did not complete: {response[:200]!r}"
+    assert len(captured) == 1
+    # The provider was invoked and its live token (not the synthetic)
+    # reached upstream.
+    assert calls["n"] == 1
+    assert captured[0].authorization == "Bearer live-token-1"
+    assert synthetic not in (captured[0].authorization or "")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tls", [False, True])
+async def test_running_proxy_refreshes_after_idle_and_recovers_from_source_failure(
+    ca_paths: tuple[Path, Path, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    tls: bool,
+) -> None:
+    cert_path, key_path, bundle_path = ca_paths
+    token_file = tmp_path / "private-source-marker"
+    token_file.write_text("startup-token")
+    clock = Mock(return_value=0.0)
+    monkeypatch.setattr(
+        "omnigent.inner.credential_proxy.RefreshingSecretProvider",
+        partial(RefreshingSecretProvider, clock=clock),
+    )
+    spec = _parse_credential_proxy(
+        [{"type": "gh_basic", "source": {"file": str(token_file), "refresh_interval_seconds": 60}}]
+    )
+    policy = SandboxPolicy(
+        backend_type="linux_bwrap",
+        active=True,
+        read_roots=[],
+        write_roots=[tmp_path / "workspace"],
+        write_files=[],
+        allow_network=False,
+    )
+    runtime = prepare_credential_proxy_runtime(spec, parent_env={}, sandbox=policy)
+    placeholders = dict(runtime.helper_env_updates)
+    captured: list[_CapturedRequest] = []
+    upstreams: dict[str, asyncio.Server] = {}
+    for host in ("github.com", "api.github.com"):
+        context = HostCertCache(cert_path, key_path).get_ssl_context(host) if tls else None
+        upstreams[host] = await _start_capturing_upstream(captured, context)
+    proxy = EgressProxy(
+        parse_rules(["* github.com/**", "* api.github.com/**"]),
+        cert_path,
+        key_path,
+        upstream_ca_bundle=bundle_path,
+        block_private_destinations=False,
+        credential_rewrites=runtime.rewrites,
+    )
+    port = await proxy.start_tcp()
+    monkeypatch.setattr(asyncio.get_running_loop(), "getaddrinfo", _resolve_to_loopback())
+
+    async def request(host: str) -> bytes:
+        upstream_port = upstreams[host].sockets[0].getsockname()[1]
+        target = "/probe" if tls else f"http://{host}:{upstream_port}/probe"
+        auth = (
+            f"Authorization: token {placeholders['GH_TOKEN']}\r\n"
+            if host.startswith("api.")
+            else ""
+        )
+        headers = (
+            f"GET {target} HTTP/1.1\r\nHost: {host}:{upstream_port}\r\n"
+            f"{auth}Connection: close\r\n\r\n"
+        ).encode()
+        if tls:
+            return await asyncio.wait_for(
+                asyncio.to_thread(
+                    _mitm_client_send_inner,
+                    port,
+                    f"{host}:{upstream_port}",
+                    host,
+                    bundle_path,
+                    headers,
+                ),
+                timeout=10,
+            )
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        try:
+            writer.write(headers)
+            await writer.drain()
+            return await asyncio.wait_for(reader.read(), timeout=10)
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    try:
+        clock.return_value = 4 * 3600.0
+        token_file.write_text("after-idle")
+        for host in upstreams:
+            assert b"200 OK" in await request(host)
+        expected_basic = base64.b64encode(b"x-access-token:after-idle").decode()
+        assert [capture.authorization for capture in captured] == [
+            f"Basic {expected_basic}",
+            "token after-idle",
+        ]
+        token_file.unlink()
+        clock.return_value += 60
+        for host in upstreams:
+            response = await request(host)
+            assert b"502 Bad Gateway" in response
+            assert b"private-source-marker" not in response
+        assert len(captured) == 2
+        assert "private-source-marker" not in caplog.text
+        token_file.write_text("recovered")
+        assert b"200 OK" in await request("api.github.com")
+        assert captured[-1].authorization == "token recovered"
+        assert runtime.helper_env_updates == placeholders
+    finally:
+        await proxy.stop()
+        for upstream in upstreams.values():
+            upstream.close()
+            await upstream.wait_closed()
+
+
+@pytest.mark.parametrize("host", ["api.cursor.com", "api2.cursor.sh", "agent.cursor.sh"])
+def test_credential_rewrite_accepts_shared_synthetic_on_configured_hosts(
+    ca_paths: tuple[Path, Path, Path], host: str
+) -> None:
+    cert_path, key_path, _ = ca_paths
+    synthetic = f"{SYNTHETIC_CREDENTIAL_PREFIX}cursor"
+    rules = [
+        CredentialRewriteRule(
+            host=allowed_host,
+            scheme="bearer",
+            synthetic=synthetic,
+            real_secret="real-cursor-secret",
+        )
+        for allowed_host in ("api.cursor.com", "api2.cursor.sh", "agent.cursor.sh")
+    ]
+    proxy = EgressProxy(
+        parse_rules(["* api.cursor.com/**", "* api2.cursor.sh/**", "* agent.cursor.sh/**"]),
+        cert_path,
+        key_path,
+        credential_rewrites=rules,
+    )
+
+    result = proxy._rewrite_authorization(
+        method="POST",
+        host=host,
+        headers_raw=f"Authorization: Bearer {synthetic}\r\n\r\n".encode(),
+    )
+
+    assert result.error is None
+    assert b"Authorization: Bearer real-cursor-secret" in result.headers
+    assert synthetic.encode() not in result.headers
 
 
 @pytest.mark.asyncio
@@ -1838,6 +2464,407 @@ async def test_credential_rewrite_injects_on_access_without_header(
     # The proxy synthesized the Authorization header from the rule — the
     # client sent none.
     assert captured[0].authorization == "Bearer real-secret-value"
+
+
+# ---------------------------------------------------------------------------
+# Credential injection is refused on loopback/diagnostic verbs (TRACE /
+# OPTIONS) and the proxy is a conformant Max-Forwards intermediary. TRACE
+# reflects the request back to the caller, so injecting a bound-host secret
+# there would echo it straight into the sandbox — the leak this hardening
+# closes. The guard is independent of the allowlist: even a permissive
+# ``* host/**`` rule never attaches (or swaps in) the real credential on
+# these verbs.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["TRACE", "OPTIONS"])
+async def test_credential_not_injected_on_loopback_method(
+    ca_paths: tuple[Path, Path, Path],
+    method: str,
+) -> None:
+    """Swap-on-access never fires on TRACE / OPTIONS.
+
+    A bare request to a bound host would normally get the real credential
+    attached (see ``test_credential_rewrite_injects_on_access_without_header``).
+    On a loopback/diagnostic verb it must NOT — the upstream must receive
+    no ``Authorization`` header at all. A regression here would let a TRACE
+    reflect the injected secret back into the sandbox.
+    """
+    cert_path, key_path, _ = ca_paths
+    rule = CredentialRewriteRule(
+        host="127.0.0.1",
+        scheme="bearer",
+        real_secret="real-secret-value",
+        synthetic=None,
+        username=None,
+    )
+    captured: list[_CapturedRequest] = []
+    upstream = await _start_capturing_upstream(captured)
+    upstream_port = upstream.sockets[0].getsockname()[1]
+
+    proxy = EgressProxy(
+        parse_rules(["* 127.0.0.1/**"]),
+        cert_path,
+        key_path,
+        block_private_destinations=False,
+        credential_rewrites=[rule],
+    )
+    proxy_port = await proxy.start_tcp()
+    try:
+        # No Max-Forwards header, so the request is forwarded to the
+        # upstream (the termination path is covered separately) — letting
+        # us assert on exactly what crossed the proxy boundary.
+        response = await _proxied_http_request(
+            proxy_port=proxy_port,
+            upstream_port=upstream_port,
+            method=method,
+            authorization=None,
+        )
+    finally:
+        await proxy.stop()
+        upstream.close()
+        await upstream.wait_closed()
+
+    assert b"200 OK" in response, f"Request did not complete: {response[:200]!r}"
+    assert len(captured) == 1
+    assert captured[0].method == method
+    # The real credential was NOT injected on the loopback/diagnostic verb.
+    assert captured[0].authorization is None
+    assert b"real-secret-value" not in response
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["TRACE", "OPTIONS"])
+async def test_synthetic_not_swapped_on_loopback_method(
+    ca_paths: tuple[Path, Path, Path],
+    method: str,
+) -> None:
+    """A synthetic placeholder is NOT upgraded to the real secret on TRACE / OPTIONS.
+
+    Even for the correct bound host, the placeholder swap is suppressed on
+    these verbs. The (harmless, fake) placeholder passes through unchanged;
+    the real secret is never emitted, so a reflected TRACE can only echo a
+    dummy value.
+    """
+    cert_path, key_path, _ = ca_paths
+    synthetic = f"{SYNTHETIC_CREDENTIAL_PREFIX}loopbackplaceholder"
+    rule = CredentialRewriteRule(
+        host="127.0.0.1",
+        scheme="bearer",
+        synthetic=synthetic,
+        real_secret="real-secret-value",
+        username=None,
+    )
+    captured: list[_CapturedRequest] = []
+    upstream = await _start_capturing_upstream(captured)
+    upstream_port = upstream.sockets[0].getsockname()[1]
+
+    proxy = EgressProxy(
+        parse_rules(["* 127.0.0.1/**"]),
+        cert_path,
+        key_path,
+        block_private_destinations=False,
+        credential_rewrites=[rule],
+    )
+    proxy_port = await proxy.start_tcp()
+    try:
+        response = await _proxied_http_request(
+            proxy_port=proxy_port,
+            upstream_port=upstream_port,
+            method=method,
+            authorization=f"Bearer {synthetic}",
+        )
+    finally:
+        await proxy.stop()
+        upstream.close()
+        await upstream.wait_closed()
+
+    assert b"200 OK" in response, f"Request did not complete: {response[:200]!r}"
+    assert len(captured) == 1
+    # The placeholder passed through untouched — never swapped for the real
+    # secret on a loopback/diagnostic verb.
+    assert captured[0].authorization == f"Bearer {synthetic}"
+    assert "real-secret-value" not in (captured[0].authorization or "")
+
+
+@pytest.mark.asyncio
+async def test_max_forwards_zero_terminates_trace_at_proxy(
+    ca_paths: tuple[Path, Path, Path],
+) -> None:
+    """TRACE with ``Max-Forwards: 0`` is answered by the proxy, not forwarded.
+
+    RFC 7231 §5.1.2: an intermediary that receives ``Max-Forwards: 0`` on
+    TRACE MUST act as the final recipient. The proxy replies 200
+    ``message/http`` and never contacts the upstream — so credential
+    injection (which runs on the forward path) can't fire, and the
+    reflected body carries no secret.
+    """
+    cert_path, key_path, _ = ca_paths
+    rule = CredentialRewriteRule(
+        host="127.0.0.1",
+        scheme="bearer",
+        real_secret="real-secret-value",
+        synthetic=None,
+        username=None,
+    )
+    captured: list[_CapturedRequest] = []
+    upstream = await _start_capturing_upstream(captured)
+    upstream_port = upstream.sockets[0].getsockname()[1]
+
+    proxy = EgressProxy(
+        parse_rules(["* 127.0.0.1/**"]),
+        cert_path,
+        key_path,
+        block_private_destinations=False,
+        credential_rewrites=[rule],
+    )
+    proxy_port = await proxy.start_tcp()
+    try:
+        response = await _proxied_http_request(
+            proxy_port=proxy_port,
+            upstream_port=upstream_port,
+            method="TRACE",
+            authorization=None,
+            extra_headers="Max-Forwards: 0\r\n",
+        )
+    finally:
+        await proxy.stop()
+        upstream.close()
+        await upstream.wait_closed()
+
+    assert b"200 OK" in response, f"Proxy did not answer TRACE: {response[:200]!r}"
+    assert b"message/http" in response
+    # The upstream was never contacted — the request stopped at the proxy.
+    assert captured == []
+    # The reflected request line is echoed, and no injected secret appears.
+    assert b"TRACE /probe HTTP/1.1" in response
+    assert b"real-secret-value" not in response
+
+
+@pytest.mark.asyncio
+async def test_max_forwards_zero_terminates_options_at_proxy(
+    ca_paths: tuple[Path, Path, Path],
+) -> None:
+    """OPTIONS with ``Max-Forwards: 0`` is answered by the proxy with ``Allow``.
+
+    The proxy responds as the final recipient (200 with an ``Allow``
+    header advertising its options) and never forwards upstream.
+    """
+    cert_path, key_path, _ = ca_paths
+    captured: list[_CapturedRequest] = []
+    upstream = await _start_capturing_upstream(captured)
+    upstream_port = upstream.sockets[0].getsockname()[1]
+
+    proxy = EgressProxy(
+        parse_rules(["* 127.0.0.1/**"]),
+        cert_path,
+        key_path,
+        block_private_destinations=False,
+    )
+    proxy_port = await proxy.start_tcp()
+    try:
+        response = await _proxied_http_request(
+            proxy_port=proxy_port,
+            upstream_port=upstream_port,
+            method="OPTIONS",
+            extra_headers="Max-Forwards: 0\r\n",
+        )
+    finally:
+        await proxy.stop()
+        upstream.close()
+        await upstream.wait_closed()
+
+    assert b"200 OK" in response, f"Proxy did not answer OPTIONS: {response[:200]!r}"
+    assert b"Allow:" in response
+    assert captured == []
+
+
+@pytest.mark.asyncio
+async def test_max_forwards_positive_is_decremented_on_forward(
+    ca_paths: tuple[Path, Path, Path],
+) -> None:
+    """A positive ``Max-Forwards`` on TRACE is decremented before forwarding.
+
+    RFC 7231 §5.1.2: when the value is greater than zero the intermediary
+    forwards with the value reduced by one. The upstream must therefore see
+    ``Max-Forwards: 2`` for a request that arrived with ``3``.
+    """
+    cert_path, key_path, _ = ca_paths
+    captured: list[_CapturedRequest] = []
+    upstream = await _start_capturing_upstream(captured)
+    upstream_port = upstream.sockets[0].getsockname()[1]
+
+    proxy = EgressProxy(
+        parse_rules(["* 127.0.0.1/**"]),
+        cert_path,
+        key_path,
+        block_private_destinations=False,
+    )
+    proxy_port = await proxy.start_tcp()
+    try:
+        response = await _proxied_http_request(
+            proxy_port=proxy_port,
+            upstream_port=upstream_port,
+            method="TRACE",
+            extra_headers="Max-Forwards: 3\r\n",
+        )
+    finally:
+        await proxy.stop()
+        upstream.close()
+        await upstream.wait_closed()
+
+    assert b"200 OK" in response, f"Request did not complete: {response[:200]!r}"
+    assert len(captured) == 1
+    assert captured[0].method == "TRACE"
+    # Decremented by exactly one on the forwarded request.
+    assert captured[0].max_forwards == "2"
+
+
+@pytest.mark.asyncio
+async def test_max_forwards_ignored_on_non_applicable_method(
+    ca_paths: tuple[Path, Path, Path],
+) -> None:
+    """``Max-Forwards`` on a GET is ignored, and injection still fires.
+
+    The header only governs TRACE / OPTIONS (RFC 7231 §5.1.2). A GET
+    carrying ``Max-Forwards`` must be forwarded unchanged (value intact),
+    and swap-on-access credential injection must still run — proving the
+    Max-Forwards machinery didn't disturb the normal forward path.
+    """
+    cert_path, key_path, _ = ca_paths
+    rule = CredentialRewriteRule(
+        host="127.0.0.1",
+        scheme="bearer",
+        real_secret="real-secret-value",
+        synthetic=None,
+        username=None,
+    )
+    captured: list[_CapturedRequest] = []
+    upstream = await _start_capturing_upstream(captured)
+    upstream_port = upstream.sockets[0].getsockname()[1]
+
+    proxy = EgressProxy(
+        parse_rules(["* 127.0.0.1/**"]),
+        cert_path,
+        key_path,
+        block_private_destinations=False,
+        credential_rewrites=[rule],
+    )
+    proxy_port = await proxy.start_tcp()
+    try:
+        response = await _proxied_http_request(
+            proxy_port=proxy_port,
+            upstream_port=upstream_port,
+            method="GET",
+            authorization=None,
+            extra_headers="Max-Forwards: 5\r\n",
+        )
+    finally:
+        await proxy.stop()
+        upstream.close()
+        await upstream.wait_closed()
+
+    assert b"200 OK" in response, f"Request did not complete: {response[:200]!r}"
+    assert len(captured) == 1
+    # Value forwarded untouched (not decremented) on a non-applicable verb.
+    assert captured[0].max_forwards == "5"
+    # And normal swap-on-access injection still happened.
+    assert captured[0].authorization == "Bearer real-secret-value"
+
+
+# ---------------------------------------------------------------------------
+# Unit coverage for the Max-Forwards / no-inject helpers (no network).
+# ---------------------------------------------------------------------------
+
+
+def test_apply_max_forwards_ignores_non_applicable_method() -> None:
+    """Non TRACE/OPTIONS methods bypass Max-Forwards entirely (headers unchanged)."""
+    headers = b"Host: example.com\r\nMax-Forwards: 3\r\n\r\n"
+    terminate, out = EgressProxy._apply_max_forwards("GET", headers)
+    assert terminate is False
+    assert out == headers
+
+
+def test_apply_max_forwards_missing_header_forwards_unchanged() -> None:
+    """A TRACE without Max-Forwards is forwarded as a transparent hop."""
+    headers = b"Host: example.com\r\n\r\n"
+    terminate, out = EgressProxy._apply_max_forwards("TRACE", headers)
+    assert terminate is False
+    assert out == headers
+
+
+def test_apply_max_forwards_zero_terminates() -> None:
+    """Max-Forwards: 0 halts the request at the proxy."""
+    headers = b"Host: example.com\r\nMax-Forwards: 0\r\n\r\n"
+    terminate, _out = EgressProxy._apply_max_forwards("TRACE", headers)
+    assert terminate is True
+
+
+def test_apply_max_forwards_positive_decrements() -> None:
+    """A positive Max-Forwards is decremented by one on the forwarded block."""
+    headers = b"Host: example.com\r\nMax-Forwards: 4\r\n\r\n"
+    terminate, out = EgressProxy._apply_max_forwards("OPTIONS", headers)
+    assert terminate is False
+    assert b"Max-Forwards: 3" in out
+    assert b"Max-Forwards: 4" not in out
+
+
+def test_apply_max_forwards_malformed_terminates() -> None:
+    """A malformed Max-Forwards is treated as exhausted (fail closed)."""
+    headers = b"Host: example.com\r\nMax-Forwards: notanumber\r\n\r\n"
+    terminate, _out = EgressProxy._apply_max_forwards("TRACE", headers)
+    assert terminate is True
+
+
+def test_build_trace_echo_strips_sensitive_headers() -> None:
+    """The reflected TRACE body echoes the request but drops secret-bearing headers."""
+    request_line = b"TRACE /path HTTP/1.1\r\n"
+    headers = (
+        b"Host: example.com\r\n"
+        b"Authorization: Bearer super-secret\r\n"
+        b"Cookie: session=abc\r\n"
+        b"Proxy-Authorization: Basic zzz\r\n"
+        b"User-Agent: probe\r\n"
+        b"\r\n"
+    )
+    body = EgressProxy._build_trace_echo(request_line, headers)
+    assert b"TRACE /path HTTP/1.1" in body
+    assert b"Host: example.com" in body
+    assert b"User-Agent: probe" in body
+    # None of the secret-bearing headers (or their values) survive.
+    assert b"Authorization" not in body
+    assert b"super-secret" not in body
+    assert b"Cookie" not in body
+    assert b"session=abc" not in body
+    assert b"Proxy-Authorization" not in body
+
+
+@pytest.mark.parametrize("method", ["TRACE", "OPTIONS", "trace", "options"])
+def test_rewrite_authorization_skips_forbidden_methods(
+    ca_paths: tuple[Path, Path, Path],
+    method: str,
+) -> None:
+    """``_rewrite_authorization`` never injects on TRACE / OPTIONS (any case)."""
+    cert_path, key_path, _ = ca_paths
+    rule = CredentialRewriteRule(
+        host="127.0.0.1",
+        scheme="bearer",
+        real_secret="real-secret-value",
+        synthetic=None,
+        username=None,
+    )
+    proxy = EgressProxy(
+        parse_rules(["* 127.0.0.1/**"]),
+        cert_path,
+        key_path,
+        credential_rewrites=[rule],
+    )
+    headers = b"Host: 127.0.0.1\r\n\r\n"
+    result = proxy._rewrite_authorization(method=method, host="127.0.0.1", headers_raw=headers)
+    assert result.error is None
+    assert b"Authorization" not in result.headers
+    assert b"real-secret-value" not in result.headers
 
 
 # ---------------------------------------------------------------------------

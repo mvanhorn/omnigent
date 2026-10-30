@@ -1,0 +1,567 @@
+"""Agent sub-resource routes: get/update session agent, MCP proxy."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+from typing import Annotated, Any
+
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    HTTPException,
+    Request,
+    UploadFile,
+)
+from fastapi.responses import Response
+
+from omnigent.errors import SESSION_AGENT_MISSING_MESSAGE, ErrorCode, OmnigentError
+from omnigent.host.identity import MANAGED_HOST_TOKEN_HEADER
+from omnigent.mcp_selection import MCP_SELECTION_HEADER, MCP_SELECTION_PREFIX, selected_mcp_spec
+from omnigent.native.native_coding_agents import native_coding_agent_for_agent_name
+from omnigent.runner.routing import RunnerRouter
+from omnigent.runtime.agent_cache import AgentCache
+from omnigent.runtime.policies.approval import _ELICITATION_MODE
+from omnigent.server._elicitation_registry import (
+    _harness_elicitation_owners,
+    _harness_elicitation_registry,
+    _harness_parked_elicitations,
+    _harness_pre_resolved_elicitations,
+    _ParkedHarnessElicitation,
+    _PreResolvedHarnessElicitation,
+)
+from omnigent.server.auth import (
+    LEVEL_EDIT,
+    LEVEL_OWNER,
+    LEVEL_READ,
+    AuthProvider,
+)
+from omnigent.server.bundles import bundle_location, validate_agent_bundle
+from omnigent.server.host_registry import HostRegistry
+from omnigent.server.permissions import check_session_access
+from omnigent.server.routes._auth_helpers import (
+    can_mutate_session_agent as _can_mutate_session_agent,
+)
+from omnigent.server.routes._auth_helpers import (
+    require_access as _require_access,
+)
+from omnigent.server.routes._auth_helpers import (
+    require_access_and_level as _require_access_and_level,
+)
+from omnigent.server.routes._auth_helpers import (
+    require_agent_owner as _require_agent_owner,
+)
+from omnigent.server.routes._auth_helpers import (
+    require_user as _require_user,
+)
+from omnigent.server.routes._content_type import (
+    require_json_content_type,
+)
+from omnigent.server.routes._sessions.common import (
+    _TURN_ACTOR_LABEL,
+    _logger,
+    get_server_runner_router,
+    host_interactive_shells_for_request,
+    set_server_runner_router,
+)
+from omnigent.server.routes._sessions.helpers import (
+    _build_actor,
+    _handle_mcp_tools_list,
+    _mcp_error_response,
+    _mcp_ok_response,
+)
+from omnigent.server.routes._sessions.orchestration import (
+    _handle_mcp_tools_call,
+)
+from omnigent.server.routes.sessions.routes_permissions import (
+    _policy_description,
+    _policy_type,
+    _to_agent_object,
+)
+from omnigent.server.schemas import (
+    AgentObject,
+    MCPServerSummary,
+    PolicySummary,
+    SkillSummary,
+)
+from omnigent.stores import AgentStore, ConversationStore
+from omnigent.stores.artifact_store import ArtifactStore
+from omnigent.stores.permission_store import PermissionStore
+
+
+def register_agent_routes(
+    router: APIRouter,
+    *,
+    conversation_store: ConversationStore,
+    agent_store: AgentStore,
+    artifact_store: ArtifactStore | None = None,
+    runner_router: RunnerRouter | None = None,
+    auth_provider: AuthProvider | None = None,
+    permission_store: PermissionStore | None = None,
+    agent_cache: AgentCache | None = None,
+    host_registry: HostRegistry | None = None,
+) -> None:
+    """Register the agent sub-resource routes on router."""
+
+    @router.get("/sessions/{session_id}/agent")
+    async def get_session_agent(
+        request: Request,
+        session_id: str,
+    ) -> AgentObject:
+        """
+        Return the :class:`AgentObject` for the session's bound agent.
+
+        Replaces the standalone ``GET /api/agents/{id}`` endpoint by
+        resolving the agent through the session's ``agent_id`` foreign
+        key. The caller only needs to know the session id.
+
+        :param request: The incoming FastAPI request.
+        :param session_id: Session identifier, e.g.
+            ``"conv_abc123"``.
+        :returns: The bound agent's :class:`AgentObject`.
+        :raises OmnigentError: If the session or agent is not found.
+        """
+        user_id = _require_user(request, auth_provider)
+        access = await _require_access_and_level(
+            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+        )
+        conv = access.conversation
+        if conv is None:
+            conv = conversation_store.get_conversation(session_id)
+            if conv is None:
+                raise OmnigentError(
+                    f"Session not found: {session_id!r}",
+                    code=ErrorCode.NOT_FOUND,
+                )
+        if conv.agent_id is None:
+            raise OmnigentError(
+                "Session has no agent binding",
+                code=ErrorCode.INTERNAL_ERROR,
+            )
+        agent = await asyncio.to_thread(agent_store.get, conv.agent_id)
+        if agent is None:
+            raise OmnigentError(SESSION_AGENT_MISSING_MESSAGE, code=ErrorCode.NOT_FOUND)
+        mcp_servers_editable = await asyncio.to_thread(
+            _can_mutate_session_agent,
+            user_id,
+            session_id,
+            agent,
+            permission_store,
+            conversation_store,
+            conversation=conv,
+        )
+        terminals_override = None
+        if (
+            conv.host_id is not None
+            and host_registry is not None
+            and native_coding_agent_for_agent_name(agent.name) is not None
+        ):
+            normalized = host_interactive_shells_for_request(
+                conv.host_id,
+                host_registry=host_registry,
+                runner_router=runner_router or get_server_runner_router(),
+            )
+            terminals_override = normalized or None
+        result = _to_agent_object(
+            agent,
+            agent_cache,
+            terminals_override=terminals_override,
+            mcp_servers_editable=mcp_servers_editable,
+            mcp_selection=conv.labels,
+        )
+        result.mcp_registry_editable = not conv.sub_agent_name and (
+            mcp_servers_editable
+            or permission_store is None
+            or await asyncio.to_thread(
+                check_session_access,
+                user_id,
+                session_id,
+                LEVEL_OWNER,
+                permission_store,
+                conversation_store,
+                conversation=conv,
+            )
+        )
+        return result
+
+    @router.get(
+        "/sessions/{session_id}/agent/contents",
+        response_class=Response,
+        responses={
+            200: {"content": {"application/gzip": {}}},
+            404: {"description": "Session or agent not found"},
+        },
+    )
+    async def get_session_agent_contents(
+        request: Request,
+        session_id: str,
+    ) -> Response:
+        """
+        Download the raw ``.tar.gz`` agent bundle for the session's
+        bound agent.
+
+        Replaces ``GET /api/agents/{id}/contents``. Runners call this
+        on cache miss to fetch the spec + bundled files.
+
+        :param request: The incoming FastAPI request.
+        :param session_id: Session identifier, e.g.
+            ``"conv_abc123"``.
+        :returns: Raw bundle bytes as ``application/gzip``.
+        :raises OmnigentError: If the session, agent, or bundle is
+            not found.
+        """
+        managed_token = request.headers.get(MANAGED_HOST_TOKEN_HEADER)
+        if managed_token:
+            # A sandbox host can read only bundles for sessions bound to it.
+            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            host_store = getattr(request.app.state, "host_store", None)
+            managed = None
+            if conv is not None and conv.host_id is not None and host_store is not None:
+                managed = await asyncio.to_thread(
+                    host_store.resolve_launch_token, conv.host_id, managed_token
+                )
+            if managed is None:
+                raise HTTPException(status_code=401, detail="unauthenticated host")
+        else:
+            user_id = _require_user(request, auth_provider)
+            access = await _require_access_and_level(
+                user_id, session_id, LEVEL_READ, permission_store, conversation_store
+            )
+            conv = access.conversation
+        if conv is None:
+            conv = conversation_store.get_conversation(session_id)
+            if conv is None:
+                raise OmnigentError(
+                    f"Session not found: {session_id!r}",
+                    code=ErrorCode.NOT_FOUND,
+                )
+        if conv.agent_id is None:
+            raise OmnigentError(
+                "Session has no agent binding",
+                code=ErrorCode.INTERNAL_ERROR,
+            )
+        agent = await asyncio.to_thread(agent_store.get, conv.agent_id)
+        if agent is None:
+            raise OmnigentError(SESSION_AGENT_MISSING_MESSAGE, code=ErrorCode.NOT_FOUND)
+        if artifact_store is None:
+            raise OmnigentError(
+                "Artifact store not configured",
+                code=ErrorCode.INTERNAL_ERROR,
+            )
+        bundle_bytes = artifact_store.get(agent.bundle_location)
+        if bundle_bytes is None:
+            raise OmnigentError(
+                "Agent bundle not found in artifact store",
+                code=ErrorCode.INTERNAL_ERROR,
+            )
+        selection_headers = {}
+        if request.headers.get(MCP_SELECTION_HEADER) == "1":
+            selection_headers[MCP_SELECTION_HEADER] = json.dumps(
+                {
+                    key: value
+                    for key, value in conv.labels.items()
+                    if key.startswith(MCP_SELECTION_PREFIX)
+                }
+            )
+        return Response(
+            content=bundle_bytes,
+            media_type="application/gzip",
+            headers={
+                "Cache-Control": "no-store",
+                **selection_headers,
+                "X-Agent-Id": agent.id,
+                "X-Agent-Version": str(agent.version),
+                "X-Agent-Name": agent.name,
+                # Provenance for the runner's env-expansion decision:
+                # user agents are tenant input and must NOT have ${VAR}
+                # expanded against the runner process env; only server
+                # agents may. The runner fails safe (treats a
+                # missing header as session-scoped → no expansion).
+                "X-Agent-Session-Scoped": "false" if agent.operator_authored else "true",
+            },
+        )
+
+    @router.put(
+        "/sessions/{session_id}/agent",
+    )
+    async def update_session_agent(
+        request: Request,
+        session_id: str,
+        bundle: Annotated[UploadFile, File(...)],
+    ) -> AgentObject:
+        """
+        Replace the session's agent bundle with a new upload.
+
+        Validates the new bundle, checks that the spec name matches
+        the existing agent, stores the bundle under a
+        content-addressed key, updates the agent row, and warm-swaps
+        the cache. Idempotent when the bundle content is unchanged.
+        Requires session-owner permission because a bundle can replace MCP servers.
+
+        :param request: The incoming FastAPI request.
+        :param session_id: Session identifier, e.g.
+            ``"conv_abc123"``.
+        :param bundle: Uploaded ``.tar.gz`` agent bundle file.
+        :returns: The updated :class:`AgentObject`.
+        :raises OmnigentError: If the session or agent is not found,
+            the bundle is invalid, or the spec name doesn't match.
+        """
+        user_id = _require_user(request, auth_provider)
+        access = await _require_access_and_level(
+            user_id, session_id, LEVEL_OWNER, permission_store, conversation_store
+        )
+        conv = access.conversation
+        if conv is None:
+            conv = conversation_store.get_conversation(session_id)
+            if conv is None:
+                raise OmnigentError(
+                    f"Session not found: {session_id!r}",
+                    code=ErrorCode.NOT_FOUND,
+                )
+        if conv.agent_id is None:
+            raise OmnigentError(
+                "Session has no agent binding",
+                code=ErrorCode.INTERNAL_ERROR,
+            )
+        agent = await asyncio.to_thread(agent_store.get, conv.agent_id)
+        if agent is None:
+            raise OmnigentError(SESSION_AGENT_MISSING_MESSAGE, code=ErrorCode.NOT_FOUND)
+
+        # Shared/template agents are read-only here;
+        # mirrors the guard in session_mcp_servers._editable_agent.
+        if agent.session_id is None:
+            raise OmnigentError(
+                "Built-in agents are read-only through this endpoint.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+
+        # Owner-only: a session-scoped agent's bundle runs with runner
+        # authority, so a LEVEL_EDIT grant on the session (shared editors,
+        # reused-agent sessions) is not enough — only the creating user or an
+        # admin may replace it.
+        await asyncio.to_thread(_require_agent_owner, user_id, agent, permission_store)
+
+        bundle_bytes = await bundle.read()
+        # Run bundle validation (tar extraction + spec parse, both
+        # blocking) off the event loop -- mirrors the POST
+        # /sessions/bundled path. A malicious bundle that blocks here
+        # must not hang the entire server loop. The
+        # policy-handler allowlist is enforced only on a
+        # shared / multi-user server; a trusted single-user/local server
+        # keeps supporting custom handlers (see _create_session_from_bundle).
+        spec = await asyncio.to_thread(
+            validate_agent_bundle,
+            bundle_bytes,
+            enforce_handler_allowlist=True,
+        )
+        if spec.name is None:
+            raise OmnigentError("spec missing name", code=ErrorCode.INVALID_INPUT)
+
+        if spec.name != agent.name:
+            raise OmnigentError(
+                f"spec name '{spec.name}' does not match agent "
+                f"name '{agent.name}'; name is immutable",
+                code=ErrorCode.INVALID_INPUT,
+            )
+
+        from omnigent.runner.routing import routing_host_id
+        from omnigent.server.mcp_compatibility import (
+            registry_services,
+            require_registry_mcp_runtime,
+        )
+
+        require_registry_mcp_runtime(
+            registry_services(selected_mcp_spec(spec, conv.labels)),
+            host_id=await asyncio.to_thread(routing_host_id, conv, conversation_store),
+            runner_id=conv.runner_id,
+            host_registry=getattr(request.app.state, "host_registry", None),
+            tunnel_registry=getattr(request.app.state, "tunnel_registry", None),
+            runner_router=runner_router,
+        )
+        new_loc = bundle_location(agent.id, bundle_bytes)
+
+        # Idempotency: same bundle content = no-op
+        if new_loc == agent.bundle_location:
+            return _to_agent_object(
+                agent,
+                agent_cache,
+                mcp_servers_editable=True,
+                mcp_selection=conv.labels,
+                mcp_registry_editable=not conv.sub_agent_name,
+            )
+
+        if artifact_store is None:
+            raise OmnigentError(
+                "Artifact store not configured",
+                code=ErrorCode.INTERNAL_ERROR,
+            )
+        artifact_store.put(new_loc, bundle_bytes)
+        if agent_store.supports_config_edit:
+            updated = await asyncio.to_thread(
+                agent_store.update, agent.id, new_loc, user_id, description=spec.description
+            )
+        else:
+            updated = await asyncio.to_thread(agent_store.update, agent.id, new_loc, user_id)
+        if updated is None:
+            raise OmnigentError(
+                f"Agent not found: {agent.id!r}",
+                code=ErrorCode.NOT_FOUND,
+            )
+
+        if agent_cache is not None:
+            # Only server agents may expand ${VAR} against the server env;
+            # user agents are tenant input.
+            agent_cache.replace(
+                agent.id, new_loc, bundle_bytes, expand_env=agent.operator_authored
+            )
+
+        return _to_agent_object(
+            updated,
+            agent_cache,
+            mcp_servers_editable=True,
+            mcp_selection=conv.labels,
+            mcp_registry_editable=not conv.sub_agent_name,
+        )
+
+    # ── POST /sessions/{session_id}/mcp ──────────────────────────────────
+    # MCP Streamable HTTP proxy endpoint. Only registered when a
+    # ``runner_router`` is injected; returns 503 otherwise so test
+    # setups that don't wire a runner skip the endpoint cleanly.
+
+    @router.post(
+        "/sessions/{session_id}/mcp",
+        # Internal MCP proxy — hidden from the public API reference.
+        include_in_schema=False,
+        response_model=None,  # Returns a raw Response with application/json
+        # CSRF hardening: the MCP Streamable HTTP contract already mandates
+        # an application/json request body; enforce it so a cross-site
+        # text/plain request can't drive JSON-RPC against this proxy.
+        dependencies=[Depends(require_json_content_type)],
+    )
+    async def mcp_proxy(
+        session_id: str,
+        request: Request,
+    ) -> Response:
+        """
+        MCP Streamable HTTP proxy endpoint.
+
+        Implements the MCP JSON-RPC 2.0 protocol over HTTP.  The AP
+        server owns policy enforcement (TOOL_CALL / TOOL_RESULT); the
+        runner owns execution via ``POST /v1/sessions/{id}/mcp/execute``
+        (reached through the WS tunnel the runner opened at startup).
+        This split ensures:
+
+        - Policy runs on the Omnigent server where the ConversationStore and
+          label state live.
+        - Stdio MCP subprocesses spawn on the runner's machine with the
+          correct ``cwd``, environment, and installed tooling.
+
+        Supported methods:
+
+        - ``initialize`` — capability negotiation.
+        - ``tools/list`` — list all tools; delegated to runner execute.
+        - ``tools/call`` — policy eval on AP, execution on runner.
+
+        :param session_id: Session whose agent's MCP servers to proxy,
+            e.g. ``"conv_abc123"``.
+        :param request: The incoming FastAPI request. Body must be a
+            JSON-RPC 2.0 object.
+        :returns: A ``application/json`` JSON-RPC 2.0 response.
+        :raises HTTPException: 503 when no ``runner_router`` is configured.
+        """
+        if runner_router is None:
+            raise HTTPException(
+                status_code=503,
+                detail="MCP proxy requires a runner_router; none configured on this server",
+            )
+
+        user_id = _require_user(request, auth_provider)
+        await _require_access(
+            user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
+        )
+
+        # Parse JSON-RPC body. Return a parse-error response (not HTTP
+        # 400) on failure — JSON-RPC errors travel in the body.
+        try:
+            body = await request.json()
+        except Exception:
+            return _mcp_error_response(None, -32700, "Parse error: invalid JSON")
+
+        if not isinstance(body, dict):
+            return _mcp_error_response(None, -32600, "Invalid Request: expected JSON object")
+
+        rpc_id: int | str | None = body.get("id")
+        method: str = body.get("method") or ""
+        params: dict[str, Any] = body.get("params") or {}
+
+        _logger.debug(
+            "MCP proxy: session=%r method=%r rpc_id=%r",
+            session_id,
+            method,
+            rpc_id,
+        )
+
+        if method == "initialize":
+            # Minimal capability negotiation response. We declare
+            # ``tools`` capability so MCP clients know to call
+            # ``tools/list`` and ``tools/call``.
+            return _mcp_ok_response(
+                rpc_id,
+                {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {"tools": {}},
+                    "serverInfo": {"name": "omnigent-mcp-proxy", "version": "1.0.0"},
+                },
+            )
+
+        if method == "tools/list":
+            response = await _handle_mcp_tools_list(
+                rpc_id,
+                session_id,
+                runner_router,
+            )
+            registry = getattr(request.app.state, "mcp_registry", None)
+            if registry is not None and not params.get("_omnigent_skip_registry"):
+                import json
+
+                from omnigent.server.registry_gateway import registry_tools
+                from omnigent.server.routes._sessions.helpers import _load_agent_spec_for_session
+
+                data = json.loads(bytes(response.body))
+                if "error" in data:
+                    return response
+                conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+                if conv is not None and not conv.archived:
+                    spec = await asyncio.to_thread(_load_agent_spec_for_session, conv, agent_store)
+                    if spec is not None and any(
+                        c.transport == "registry" for c in spec.mcp_servers
+                    ):
+                        extra = await registry_tools(
+                            registry,
+                            request,
+                            spec,
+                            user_id,
+                        )
+                        tools = data.get("result", {}).get("tools", [])
+                        return _mcp_ok_response(rpc_id, {**data["result"], "tools": tools + extra})
+            return response
+
+        if method == "tools/call":
+            from omnigent.server.mcp_identity import mcp_policy_actor
+
+            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            actor = mcp_policy_actor(request, conv, user_id) if conv else _build_actor(user_id)
+            return await _handle_mcp_tools_call(
+                rpc_id,
+                session_id,
+                params,
+                conversation_store,
+                agent_store,
+                runner_router,
+                actor=actor,
+                credential_user=user_id,
+                request=request,
+            )
+
+        return _mcp_error_response(rpc_id, -32601, f"Method not found: {method!r}")

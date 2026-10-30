@@ -16,7 +16,9 @@
 // id list is NEVER trusted from the client for authorization — the server
 // access-checks every watched id against the connection's user.
 
-import { resolveWebSocketUrl } from "@/lib/host";
+import { isHostRoutingEnabled, resolveWebSocketUrl } from "@/lib/host";
+import { isPageHidden, nextReconnectDelay } from "@/lib/reconnectBackoff";
+import { modalHostId } from "@/lib/sessionHost";
 import type { SessionListWireItem } from "@/lib/sessionListCache";
 
 /** A frame pushed by the server over the updates stream. */
@@ -25,15 +27,10 @@ export type SessionUpdatesFrame =
   | { type: "changed"; items: SessionListWireItem[] }
   | { type: "removed"; ids: string[] }
   | { type: "hosts_changed" }
+  | { type: "projects_changed" }
   | { type: "heartbeat" };
 
 type FrameListener = (frame: SessionUpdatesFrame) => void;
-
-// Reconnect backoff — mirrors the chat stream pump (chatStore.ts): 250 ms
-// base, doubling, capped at 5 s, with ±50% jitter so many tabs reconnecting
-// after a server blip don't synchronize into a thundering herd.
-const RECONNECT_BASE_MS = 250;
-const RECONNECT_MAX_MS = 5_000;
 
 // The server pushes a heartbeat every 30 s when a watch-set is idle (see
 // `_SESSION_UPDATES_HEARTBEAT_INTERVAL_S`). If we go appreciably longer than
@@ -48,10 +45,9 @@ const RECONNECT_MAX_MS = 5_000;
 // threshold rather than hard-coding the literal.
 export const HEARTBEAT_WATCHDOG_MS = 70_000;
 
-function nextReconnectDelay(failedAttempts: number): number {
-  const base = Math.min(RECONNECT_BASE_MS * 2 ** (failedAttempts - 1), RECONNECT_MAX_MS);
-  return base / 2 + Math.random() * (base / 2);
-}
+// A socket must stay open this long before its close earns the fast retry while
+// hidden, so a server that accepts and then drops every socket still backs off.
+export const HEALTHY_CONNECTION_MS = 5_000;
 
 /**
  * Build the `ws(s)://` URL for the session-updates endpoint.
@@ -61,10 +57,32 @@ function nextReconnectDelay(failedAttempts: number): number {
  * (whether served by the Omnigent server directly or through the Vite dev proxy),
  * and an embedding host rebases it onto its proxied WS surface.
  *
+ * When host routing is enabled, append `?omnigent_slice_key=<frozen modal
+ * host>`. A browser WebSocket handshake can't set request headers, so the
+ * routing key rides the query string (the same seam the terminal-attach WS
+ * uses). This WS watches sessions across MANY hosts, so no single key is
+ * "correct" — it's a NICE-TO-HAVE load/perf lever: keying by the modal host
+ * (the one backing most of the user's sessions) lands the standing rescan on
+ * the replica most likely holding their sessions' tunnels, so the per-session
+ * status read hits that replica's warm relay cache instead of the cross-replica
+ * fallback, and spreads the standing connections finer than per-tenant.
+ * Correctness is unaffected (the rescan reads are replica-safe).
+ *
+ * The key comes from {@link modalHostId}, which is resolved once and never
+ * changes for the page — so every auto-reconnect rebuilds the identical URL and
+ * never re-keys (no connection churn). The provider only calls `start()` once
+ * the modal host is resolved (see `isModalHostResolved`), so this reads a
+ * settled value. Omitted on an unsharded server and when no host was picked.
+ *
  * @returns The fully-qualified WebSocket URL.
  */
 function buildUpdatesUrl(): string {
-  return resolveWebSocketUrl("/v1/sessions/updates");
+  const path = "/v1/sessions/updates";
+  if (!isHostRoutingEnabled()) return resolveWebSocketUrl(path);
+  const sliceKey = modalHostId();
+  return resolveWebSocketUrl(
+    sliceKey ? `${path}?omnigent_slice_key=${encodeURIComponent(sliceKey)}` : path,
+  );
 }
 
 /**
@@ -80,6 +98,10 @@ class SessionUpdatesSocket {
   private connected = false;
   private failedAttempts = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  // When the current socket opened; null until its handshake completes.
+  private openedAt: number | null = null;
+  // Set when the pending reconnect timer was scheduled on the hidden cadence.
+  private hiddenRetryPending = false;
   private watchdogTimer: ReturnType<typeof setTimeout> | null = null;
   private started = false;
 
@@ -87,22 +109,35 @@ class SessionUpdatesSocket {
   start(): void {
     if (this.started) return;
     this.started = true;
+    if (typeof document !== "undefined") {
+      document.addEventListener("visibilitychange", this.onVisibilityChange);
+    }
     this.connect();
   }
 
   /** Close the connection and stop reconnecting. */
   stop(): void {
     this.started = false;
+    // A later start() ramps from the base again instead of inheriting a
+    // saturated delay from an outage that may be long over.
+    this.failedAttempts = 0;
+    if (typeof document !== "undefined") {
+      document.removeEventListener("visibilitychange", this.onVisibilityChange);
+    }
     this.clearWatchdog();
     if (this.reconnectTimer !== null) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
     }
+    this.hiddenRetryPending = false;
     const ws = this.ws;
     this.ws = null;
     if (ws) {
       // Drop handlers first so the close doesn't schedule a reconnect.
-      ws.onopen = ws.onmessage = ws.onerror = ws.onclose = null;
+      ws.onopen = null;
+      ws.onmessage = null;
+      ws.onerror = null;
+      ws.onclose = null;
       ws.close();
     }
     this.setConnected(false);
@@ -174,7 +209,9 @@ class SessionUpdatesSocket {
       return;
     }
     this.ws = ws;
+    this.openedAt = null;
     ws.onopen = () => {
+      this.openedAt = Date.now();
       this.failedAttempts = 0;
       this.setConnected(true);
       // Start the silence watchdog: from here we expect at least a
@@ -187,10 +224,12 @@ class SessionUpdatesSocket {
       // `onerror` is always followed by `onclose`; let close drive retry.
     };
     ws.onclose = () => {
+      const wasHealthy =
+        this.openedAt !== null && Date.now() - this.openedAt >= HEALTHY_CONNECTION_MS;
       this.ws = null;
       this.clearWatchdog();
       this.setConnected(false);
-      if (this.started) this.scheduleReconnect();
+      if (this.started) this.scheduleReconnect(wasHealthy);
     };
   }
 
@@ -228,12 +267,36 @@ class SessionUpdatesSocket {
     this.ws.close();
   }
 
-  private scheduleReconnect(): void {
+  /**
+   * When the page becomes visible, skip the long wait only for a retry
+   * scheduled on the hidden cadence (see reconnectBackoff.ts); a retry
+   * scheduled while visible keeps its short ramp, so a hide/show flap can't
+   * bypass the backoff.
+   */
+  private readonly onVisibilityChange = (): void => {
+    if (document.hidden || !this.started) return;
+    if (this.reconnectTimer !== null && this.ws === null && this.hiddenRetryPending) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+      this.hiddenRetryPending = false;
+      this.connect();
+    }
+  };
+
+  /**
+   * @param afterHealthyConnection - The closed socket stayed open for
+   *   {@link HEALTHY_CONNECTION_MS}. Its retry keeps the visible ramp even while
+   *   hidden: the socket is a hidden tab's only feed for notifications.
+   */
+  private scheduleReconnect(afterHealthyConnection = false): void {
     if (!this.started || this.reconnectTimer !== null) return;
     this.failedAttempts += 1;
-    const delay = nextReconnectDelay(this.failedAttempts);
+    const hidden = !afterHealthyConnection && isPageHidden();
+    this.hiddenRetryPending = hidden;
+    const delay = nextReconnectDelay(this.failedAttempts, hidden);
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
+      this.hiddenRetryPending = false;
       if (this.started) this.connect();
     }, delay);
   }
@@ -261,3 +324,46 @@ class SessionUpdatesSocket {
 
 /** Shared transport instance for the current tab. */
 export const sessionUpdatesSocket = new SessionUpdatesSocket();
+
+/**
+ * Resolve with the first pushed session row matching `match`.
+ *
+ * The server announces a session on this stream as soon as its row is
+ * written — well before a `POST /v1/sessions` that waits on a host runner
+ * launch answers with the same id. A caller that knows what it just asked
+ * for can use this to learn its own session's id early and open the chat
+ * without waiting for the create.
+ *
+ * The stream carries EVERY session that becomes visible to this user —
+ * created in another tab, started by a scheduled task, or just shared with
+ * them — and restates rows already on screen on each snapshot. So `match`
+ * must identify one specific expected session; "anything new" would hand
+ * back somebody else's.
+ *
+ * @param match - Predicate over each row of a snapshot/changed frame.
+ * @param signal - Stops listening when aborted, resolving `null` so the
+ *   caller can fall back to its own result.
+ * @returns The first matching row, or `null` if aborted before one arrived.
+ */
+export function nextPushedSession(
+  match: (item: SessionListWireItem) => boolean,
+  signal: AbortSignal,
+): Promise<SessionListWireItem | null> {
+  if (signal.aborted) return Promise.resolve(null);
+  return new Promise((resolve) => {
+    let unsubscribe = () => {};
+    const onAbort = () => {
+      unsubscribe();
+      resolve(null);
+    };
+    unsubscribe = sessionUpdatesSocket.subscribe((frame) => {
+      if (frame.type !== "snapshot" && frame.type !== "changed") return;
+      const found = frame.items.find(match);
+      if (found === undefined) return;
+      unsubscribe();
+      signal.removeEventListener("abort", onAbort);
+      resolve(found);
+    });
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}

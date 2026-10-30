@@ -2,15 +2,21 @@
 
 from __future__ import annotations
 
+import atexit
 import contextlib
 import logging
 import os
+import re
 import sys
-from collections.abc import Iterator, Sequence
+import threading
+import time
+import weakref
+from collections import deque
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import BinaryIO
+from typing import BinaryIO, TextIO, TypedDict, cast
 
 from omnigent._platform import IS_POSIX
 
@@ -20,6 +26,65 @@ LOG_TO_STDERR_ENV_VAR = "OMNIGENT_LOG_TO_STDERR"
 LOG_FORCE_COLOR_ENV_VAR = "OMNIGENT_LOG_FORCE_COLOR"
 PROCESS_LOG_FILE_ENV_VAR = "OMNIGENT_PROCESS_LOG_FILE"
 LOG_TTY_FD_ENV_VAR = "OMNIGENT_LOG_TTY_FD"
+HARNESS_STDERR_ENABLED_ENV_VAR = "OMNIGENT_HARNESS_STDERR_ENABLED"
+
+
+class ChildLoggingPopenKwargs(TypedDict, total=False):
+    """Keyword arguments forwarded to :class:`subprocess.Popen`."""
+
+    pass_fds: tuple[int, ...]
+
+
+_log_once_seen: set[str] = set()
+_log_once_lock = threading.Lock()
+
+
+def _mark_once(formatted: str) -> bool:
+    """Return ``True`` the first time *formatted* is seen this process, then remember it."""
+    with _log_once_lock:
+        if formatted in _log_once_seen:
+            return False
+        _log_once_seen.add(formatted)
+        return True
+
+
+def log_once(
+    logger: logging.Logger,
+    level: int,
+    msg: str,
+    *args: object,
+    exc_info: bool = False,
+) -> None:
+    """Log *msg* at *level* the first time this exact line is seen in the process.
+
+    For near-static diagnostics a hot path recomputes and would otherwise re-log
+    on every call -- a harness routing decision resolved on every turn, or a
+    best-effort probe that fails identically on every catalog fetch. The
+    formatted message is the dedup key, so a *changed* line logs again while
+    identical repeats are dropped. Per-process and thread-safe (these callers run
+    under ``asyncio.to_thread``). ``stacklevel=2`` attributes the record to the
+    caller (correct ``func_name`` in the debug-logs table); ``exc_info`` is
+    forwarded so the first occurrence of a failure keeps its traceback.
+    """
+    formatted = msg % args if args else msg
+    if _mark_once(formatted):
+        logger.log(level, formatted, exc_info=exc_info, stacklevel=2)
+
+
+def log_info_once(logger: logging.Logger, msg: str, *args: object) -> None:
+    """INFO convenience wrapper around :func:`log_once`; see it for semantics."""
+    formatted = msg % args if args else msg
+    if _mark_once(formatted):
+        logger.info(formatted, stacklevel=2)
+
+
+class _ProcessLogStreamHandler(logging.StreamHandler[TextIO]):
+    _omnigent_process_log_stderr: bool
+
+
+class _ProcessLogFileHandler(logging.FileHandler):
+    _omnigent_process_log_path: str
+
 
 DEFAULT_LOG_SOURCE_WIDTH = 32
 DEFAULT_LOG_FUNC_WIDTH = 18
@@ -43,6 +108,78 @@ _LEVEL_COLORS = {
     logging.ERROR: "\x1b[31m",
     logging.CRITICAL: "\x1b[91m",
 }
+_REDACTED = "[REDACTED]"
+_QUOTED_OR_NONSPACE_VALUE = r'(?:"[^"\r\n]*"|\'[^\'\r\n]*\'|\S+)'
+_AUTHORIZATION_VALUE = r'(?:(?:"[^"\r\n]*"|\'[^\'\r\n]*\')|(?:bearer\s+)?\S+)'
+_AUTHORIZATION_PATTERN = re.compile(
+    rf"(?i)(\bauthorization\b[\"']?\s*[:=]\s*)({_AUTHORIZATION_VALUE})"
+)
+_NAMED_SECRET_PATTERN = re.compile(
+    # Start once per possible key, avoiding retries within long dotted/hyphenated values.
+    rf"(?i)((?<![\w.-])[\w.-]*(?:token|api(?:[_-]|[ \t]+)?key|secret|password|credential)"
+    rf"\b[\"']?\s*[:=]\s*)({_AUTHORIZATION_VALUE})"
+)
+_WHITESPACE_SECRET_PATTERN = re.compile(
+    # Scan prefixes only from each key's start, as for assignment keys above.
+    # Generic token/secret/credential labels require a prefix to distinguish them from prose.
+    r"(?i)((?<![\w.-])(?:[\w.-]*(?:password|passwd|api(?:[_-]|[ \t]+)?key"
+    r"|(?:access|refresh|auth)(?:[_-]|[ \t]+)token|client(?:[_-]|[ \t]+)secret)"
+    r"|[\w.-]+(?:token|secret|credential))"
+    r"\b[\"']?[ \t]+)"
+    # Preserve clear diagnostic phrases, but still redact quoted or ambiguous single values.
+    r"(?!(?:(?:is|was)[ \t]+(?:missing|invalid|required|expired|not[ \t]+(?:set|found|configured))"
+    r"|has[ \t]+expired|(?:authentication|validation|refresh)[ \t]+failed)\b)"
+    rf"(?![:=])({_AUTHORIZATION_VALUE})"
+)
+_SECRET_PATTERNS: tuple[re.Pattern[str], ...] = (
+    # Keep the broad standalone-bearer behavior: short or punctuation-heavy
+    # credentials are still secrets.
+    re.compile(r"(?i)(\bbearer\s+)\S+"),
+    # URL userinfo (``scheme://user:pass@host``): keep the "@" and the host.
+    re.compile(r"(://)[^\s/?#@]+(?=@)"),
+    # Common provider-specific token shapes.
+    re.compile(r"\bsk-[A-Za-z0-9_-]{10,}\b"),
+    re.compile(r"\bdapi[A-Za-z0-9]{10,}\b"),
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9]{16,}\b"),
+    re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b"),
+    re.compile(r"\bAIza[A-Za-z0-9_-]{20,}\b"),
+    # JWTs and long mixed-case opaque values are token-like even without a
+    # nearby label. Requiring lower, upper, and numeric characters avoids
+    # treating UUIDs, hashes, and normal lower-case identifiers as secrets.
+    re.compile(r"\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\b"),
+    re.compile(
+        r"(?<![A-Za-z0-9_])"
+        r"(?=[A-Za-z0-9_]{32,}(?![A-Za-z0-9_]))"
+        r"(?=[A-Za-z0-9_]*[a-z])"
+        r"(?=[A-Za-z0-9_]*[A-Z])"
+        r"(?=[A-Za-z0-9_]*[0-9])"
+        r"[A-Za-z0-9_]{32,}"
+        r"(?![A-Za-z0-9_])"
+    ),
+)
+
+
+def _replace_named_secret(match: re.Match[str]) -> str:
+    value = match.group(2)
+    if len(value) >= 2 and value[0] in "\"'" and value[-1] == value[0]:
+        replacement = f"{value[0]}{_REDACTED}{value[0]}"
+    else:
+        replacement = _REDACTED
+    return match.group(1) + replacement
+
+
+def redact_log_text(text: str, *, include_whitespace_credentials: bool = False) -> str:
+    """Redact secrets, optionally including ambiguous whitespace labels in diagnostics."""
+    text = _AUTHORIZATION_PATTERN.sub(_replace_named_secret, text)
+    text = _NAMED_SECRET_PATTERN.sub(_replace_named_secret, text)
+    if include_whitespace_credentials:
+        text = _WHITESPACE_SECRET_PATTERN.sub(_replace_named_secret, text)
+    for pattern in _SECRET_PATTERNS:
+        text = pattern.sub(
+            lambda match: match.group(1) + _REDACTED if match.lastindex else _REDACTED,
+            text,
+        )
+    return text
 
 
 def format_log_level_name(levelno: int, levelname: str, *, use_colors: bool) -> str:
@@ -67,7 +204,7 @@ def _color_field(value: str, color: str, *, use_colors: bool) -> str:
 
 def short_logger_name(name: str) -> str:
     """Return a compact, fixed-column logger source name."""
-    for prefix in ("omnigent.", "omnigent_ui_sdk."):
+    for prefix in ("omnigent.harnesses.", "omnigent.", "omnigent_ui_sdk."):
         if name.startswith(prefix):
             name = name[len(prefix) :]
             break
@@ -141,6 +278,13 @@ class TerminalLogFormatter(logging.Formatter):
             return super().format(record)
 
 
+class RedactingLogFormatter(TerminalLogFormatter):
+    """Format a complete record, then remove token-like strings from it."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        return redact_log_text(super().format(record))
+
+
 def data_dir() -> Path:
     """Return the runtime data directory used for DBs, artifacts, and logs."""
     value = os.environ.get(DATA_DIR_ENV_VAR)
@@ -158,8 +302,24 @@ def process_log_dir(destination: str, *, root: str | Path | None = None) -> Path
     return base / destination
 
 
+def display_log_path(path: Path) -> str:
+    """Format a log path for display, collapsing the home prefix to ``~``.
+
+    :param path: Absolute path, typically under the runtime data dir, e.g.
+        ``Path("/Users/alice/.omnigent/logs/runner/runner-ab12.log")``.
+    :returns: ``"~/.omnigent/..."`` when *path* is under ``$HOME``,
+        otherwise ``str(path)``.
+    """
+    try:
+        return f"~/{path.relative_to(Path.home())}"
+    except (ValueError, RuntimeError):
+        # Not under $HOME (e.g. an OMNIGENT_DATA_DIR outside home), or no
+        # resolvable home directory (container with no HOME/passwd entry).
+        return str(path)
+
+
 def _timestamp() -> str:
-    return datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    return datetime.now(UTC).astimezone().strftime("%Y%m%d-%H%M%S-%f")
 
 
 def create_process_log_path(
@@ -212,12 +372,293 @@ def should_log_to_stderr() -> bool:
     return env_truthy(os.environ.get(LOG_TO_STDERR_ENV_VAR))
 
 
+def harness_stderr_capture_enabled() -> bool:
+    """Return whether harness diagnostics may include captured stderr text."""
+    return os.environ.get(HARNESS_STDERR_ENABLED_ENV_VAR, "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 def _process_log_file_from_env() -> Path | None:
     value = os.environ.get(PROCESS_LOG_FILE_ENV_VAR)
     return Path(value).expanduser() if value else None
 
 
-def _terminal_stream() -> object | None:
+# Log file this process writes to, published by configure_process_logging so
+# error paths can point the user at it.
+_current_process_log_path: Path | None = None
+
+
+def current_process_log_path() -> Path | None:
+    """Return the log file this process writes to, or ``None`` if unset.
+
+    Set by :func:`configure_process_logging`; falls back to the path the
+    spawning parent published in ``OMNIGENT_PROCESS_LOG_FILE`` so callers
+    work before logging is configured.
+
+    :returns: Absolute log path, e.g.
+        ``Path("/Users/alice/.omnigent/logs/runner/runner-conv_ab12.log")``,
+        or ``None`` when this process's output is not captured to a file.
+    """
+    return _current_process_log_path or _process_log_file_from_env()
+
+
+def process_log_dir_reference(destination: str) -> str:
+    """Return a user-facing pointer to a process-log *directory*.
+
+    Resolved through :func:`process_log_dir`, so the path tracks
+    ``OMNIGENT_DATA_DIR`` instead of assuming the default tree. Use this
+    rather than :func:`process_log_reference` when the message is about a
+    different process than the caller. The CLI naming where the host daemon
+    logs must point at the host directory, not the CLI's own log file.
+
+    :param destination: Process-log destination, e.g. ``"host"``.
+    :returns: A display path with a trailing separator, e.g.
+        ``"~/.omnigent/logs/host/"``.
+    """
+    return f"{display_log_path(process_log_dir(destination))}/"
+
+
+def process_log_reference(destination: str) -> str:
+    """Return a user-facing pointer to this process's log for error messages.
+
+    Falls back to the destination's log directory when the process has no
+    captured log file (stdio inherited), so an error can always tell the
+    reader where to look.
+
+    :param destination: Process-log destination used for the directory
+        fallback, e.g. ``"runner"``.
+    :returns: A display path, e.g.
+        ``"~/.omnigent/logs/runner/runner-conv_ab12-20260806-101500.log"``,
+        or ``"~/.omnigent/logs/runner/"`` when no log file is configured.
+    """
+    path = current_process_log_path()
+    if path is not None:
+        return display_log_path(path)
+    return process_log_dir_reference(destination)
+
+
+#: Soft limit on characters a stalled terminal may fall behind before new lines are
+#: dropped; one larger write into an empty queue is still kept.
+_TERMINAL_BACKLOG_CHARS = 1 << 20
+#: Text without a newline is queued once it reaches this many characters.
+_TERMINAL_PARTIAL_LINE_CHARS = 8192
+#: Total timeout for a restore, and again for the exit-time drain.
+_TERMINAL_EXIT_DRAIN_S = 1.0
+
+
+class TerminalWriter:
+    """Text stream that writes queued lines from a daemon thread.
+
+    Callers never wait on a terminal that stopped reading. Past
+    :data:`_TERMINAL_BACKLOG_CHARS` queued characters, new lines are dropped and
+    counted. Other attributes, such as ``buffer`` and ``close``, go to the wrapped
+    stream unqueued, so they stay synchronous. ``flush()`` only queues, so text
+    written to the terminal by other means, or through another writer, can
+    appear before queued text.
+    """
+
+    def __init__(self, stream: TextIO) -> None:
+        """:param stream: Terminal stream to write to, e.g. ``sys.stderr``."""
+        self._stream = stream
+        self._reset()
+        with _live_terminal_writers_lock:
+            _live_terminal_writers.add(self)
+
+    def _reset(self) -> None:
+        self._condition = threading.Condition()
+        self._chunks: deque[str] = deque()
+        self._partial_line = ""
+        self._queued_chars = 0
+        self._writing = False
+        self._dropped_lines = 0
+        self._stream_failed = False
+        self._gave_up = False
+        self._thread: threading.Thread | None = None
+
+    def _reopen_after_fork(self) -> None:
+        """In a forked child, write to a dup of the fd; a parent writer may hold the old lock."""
+        self._reset()
+        try:
+            reopened = os.fdopen(
+                os.dup(self._stream.fileno()),
+                "w",
+                buffering=1,
+                encoding=self._stream.encoding,
+                errors=self._stream.errors,
+            )
+        except (AttributeError, OSError, ValueError):
+            # Writing to the inherited stream could wait on that lock forever.
+            self._stream_failed = True
+            return
+        # Freeing the old stream would flush it, which waits on that lock.
+        _streams_replaced_at_fork.append(self._stream)
+        self._stream = reopened
+
+    def write(self, text: str) -> int:
+        """Queue *text* for the terminal and return at once."""
+        with self._condition:
+            complete, newline, self._partial_line = (self._partial_line + text).rpartition("\n")
+            if newline:
+                self._enqueue_locked(complete + newline)
+            if len(self._partial_line) >= _TERMINAL_PARTIAL_LINE_CHARS:
+                self._enqueue_locked(self._partial_line)
+                self._partial_line = ""
+        return len(text)
+
+    def writelines(self, lines: Iterable[str]) -> None:
+        """Queue each of *lines*; see :meth:`write`."""
+        for line in lines:
+            self.write(line)
+
+    def flush(self) -> None:
+        """Queue any partial line; never wait for the terminal."""
+        with self._condition:
+            if self._partial_line:
+                self._enqueue_locked(self._partial_line)
+                self._partial_line = ""
+
+    def drain(self, timeout: float) -> bool:
+        """Wait up to *timeout* seconds for queued output to be written.
+
+        :returns: ``True`` when nothing is left to write, including the notice
+            for dropped lines.
+        """
+        self.flush()
+        with self._condition:
+            # Wake the writer in case an interrupted queue skipped its notify.
+            self._condition.notify_all()
+            # Ignore _queued_chars, which an interrupted update can leave off.
+            drained = self._condition.wait_for(
+                lambda: not self._chunks and not self._writing and not self._dropped_lines,
+                timeout,
+            )
+            # Only an actual wait shows the terminal is not reading.
+            if drained or timeout > 0:
+                self._gave_up = not drained
+            return drained
+
+    def _enqueue_locked(self, chunk: str) -> None:
+        if self._stream_failed:
+            return
+        if self._queued_chars and self._queued_chars + len(chunk) > _TERMINAL_BACKLOG_CHARS:
+            self._dropped_lines += max(1, chunk.count("\n"))
+            return
+        self._queue_dropped_notice_locked()
+        self._queue_locked(chunk)
+        if self._thread is None:
+            thread = threading.Thread(
+                target=self._write_chunks, name="omnigent-terminal-writer", daemon=True
+            )
+            try:
+                thread.start()
+            except RuntimeError:
+                # E.g. interpreter shutdown refuses new threads: drop this output, not later.
+                self._chunks.clear()
+                self._queued_chars = 0
+                self._condition.notify_all()
+                return
+            self._thread = thread
+
+    def _queue_dropped_notice_locked(self) -> None:
+        if self._dropped_lines:
+            count = self._dropped_lines
+            lines = "1 line was" if count == 1 else f"{count} lines were"
+            self._queue_locked(
+                f"[omnigent] {lines} not shown because this terminal stopped reading "
+                "output; any log lines among them are in the log file.\n"
+            )
+            self._dropped_lines = 0
+
+    def _queue_locked(self, chunk: str) -> None:
+        self._chunks.append(chunk)
+        self._queued_chars += len(chunk)
+        self._condition.notify_all()
+
+    def _fail_locked(self) -> None:
+        self._stream_failed = True
+        self._writing = False
+        self._chunks.clear()
+        self._queued_chars = 0
+        self._dropped_lines = 0
+        self._condition.notify_all()
+
+    def _write_chunks(self) -> None:
+        while True:
+            with self._condition:
+                self._condition.wait_for(lambda: bool(self._chunks))
+                chunk = self._chunks.popleft()
+                self._writing = True
+            try:
+                self._stream.write(chunk)
+                self._stream.flush()
+            except Exception as exc:  # noqa: BLE001 — any write error ends the mirror, never the caller
+                # The terminal hung up, the stream closed, or it can't encode the text.
+                with self._condition:
+                    self._fail_locked()
+                # Not the repr: an encode error's repr holds the whole rejected chunk.
+                detail = getattr(exc, "reason", None) or getattr(exc, "strerror", None)
+                _logger.warning(
+                    "terminal output stopped after a write error: %s%s",
+                    type(exc).__name__,
+                    f": {detail}" if detail else "",
+                )
+                return
+            with self._condition:
+                self._writing = False
+                self._queued_chars = max(0, self._queued_chars - len(chunk))
+                if not self._chunks:
+                    # Caught up: report lines dropped since the last accepted one.
+                    self._queue_dropped_notice_locked()
+                    self._gave_up = False
+                self._condition.notify_all()
+
+    def writable(self) -> bool:
+        """Report whether output can still reach the terminal."""
+        return not self._stream_failed
+
+    def isatty(self) -> bool:
+        """Return whether the wrapped stream is a terminal."""
+        return self._stream.isatty()
+
+    def fileno(self) -> int:
+        """Return the wrapped stream's file descriptor."""
+        return self._stream.fileno()
+
+    @property
+    def encoding(self) -> str | None:
+        """Return the wrapped stream's encoding, if it has one."""
+        return self._stream.encoding
+
+    @property
+    def errors(self) -> str | None:
+        """Return the wrapped stream's encoding error handler."""
+        return self._stream.errors
+
+    def __getattr__(self, name: str) -> object:
+        if name == "_stream":
+            raise AttributeError(name)
+        return getattr(self._stream, name)
+
+
+_logger = logging.getLogger(__name__)
+_live_terminal_writers: weakref.WeakSet[TerminalWriter] = weakref.WeakSet()
+_live_terminal_writers_lock = threading.Lock()
+# One writer per stream object or mirror-fd file, so its callers share a thread and line order.
+_shared_terminal_writers: dict[tuple[object, ...], TerminalWriter] = {}
+_shared_terminal_writers_lock = threading.Lock()
+# Kept open in a forked child, so a reader of the old fd sees EOF only when the child exits.
+_streams_replaced_at_fork: list[TextIO] = []
+
+
+# Active nonblocking_terminal_stdio() installs; nonzero routes mirrors through writers.
+_threaded_terminal_mirrors = 0
+
+
+def _terminal_stream() -> TextIO | None:
     fd_value = os.environ.get(LOG_TTY_FD_ENV_VAR)
     if fd_value and IS_POSIX:
         try:
@@ -229,6 +670,205 @@ def _terminal_stream() -> object | None:
     if sys.stderr.isatty():
         return sys.stderr
     return None
+
+
+def _terminal_writer(stream: TextIO) -> TerminalWriter:
+    if isinstance(stream, TerminalWriter):
+        return stream
+    # The cached writer keeps *stream* alive, so its id is not reused meanwhile.
+    key = ("stream", id(stream))
+    with _shared_terminal_writers_lock:
+        writer = _shared_terminal_writers.get(key)
+        if writer is None:
+            writer = _shared_terminal_writers[key] = TerminalWriter(stream)
+        return writer
+
+
+def _mirror_fd_key(fd: int) -> tuple[object, ...]:
+    status = os.fstat(fd)
+    return ("fd", status.st_dev, status.st_ino)
+
+
+def _terminal_mirror_writer() -> TerminalWriter | None:
+    fd_value = os.environ.get(LOG_TTY_FD_ENV_VAR)
+    if fd_value and IS_POSIX:
+        try:
+            fd = int(fd_value)
+            with _shared_terminal_writers_lock:
+                writer = _shared_terminal_writers.get(_mirror_fd_key(fd))
+                if writer is not None:
+                    return writer
+                # Key by the dup, in case fd is closed and reused meanwhile.
+                duplicate = os.dup(fd)
+                try:
+                    key = _mirror_fd_key(duplicate)
+                    writer = _shared_terminal_writers.get(key)
+                    stream = None
+                    if writer is None:
+                        stream = os.fdopen(
+                            duplicate, "w", buffering=1, encoding="utf-8", errors="replace"
+                        )
+                except BaseException:
+                    os.close(duplicate)
+                    raise
+                if stream is None:
+                    os.close(duplicate)
+                    return writer
+                writer = _shared_terminal_writers[key] = TerminalWriter(stream)
+                return writer
+        except (OSError, ValueError):
+            return None
+    if sys.stderr.isatty():
+        return _terminal_writer(sys.stderr)
+    return None
+
+
+def _existing_mirror_writer(stream: TextIO) -> TerminalWriter:
+    """Return the writer for a mirror stream opened earlier, shared by its file's later mirrors."""
+    try:
+        key = _mirror_fd_key(stream.fileno())
+    except (AttributeError, OSError, ValueError):
+        return _terminal_writer(stream)
+    with _shared_terminal_writers_lock:
+        writer = _shared_terminal_writers.get(key)
+        if writer is None:
+            writer = _shared_terminal_writers[key] = TerminalWriter(stream)
+        return writer
+
+
+def _reset_terminal_writers_after_fork() -> None:
+    global _shared_terminal_writers_lock, _live_terminal_writers_lock
+    _shared_terminal_writers_lock = threading.Lock()
+    _live_terminal_writers_lock = threading.Lock()
+    for writer in list(_live_terminal_writers):
+        writer._reopen_after_fork()
+
+
+# Reset inherited writers so a forked child cannot deadlock; no host path forks this way yet.
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_terminal_writers_after_fork)
+
+
+def _drain_terminal_writers(writers: Iterable[TerminalWriter], timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    drained = True
+    for writer in list(writers):
+        drained = writer.drain(max(0.0, deadline - time.monotonic())) and drained
+    return drained
+
+
+def drain_terminal_output(timeout: float | None = None) -> bool:
+    """Wait for every :class:`TerminalWriter` to write its queued output.
+
+    Writers whose last drain timed out are not waited for again; their
+    terminal has already shown it is not reading.
+
+    :param timeout: Total seconds to wait; defaults to :data:`_TERMINAL_EXIT_DRAIN_S`.
+    :returns: ``True`` when nothing is left to write.
+    """
+    wait_s = _TERMINAL_EXIT_DRAIN_S if timeout is None else timeout
+    with _live_terminal_writers_lock:
+        writers = list(_live_terminal_writers)
+    waiting = [writer for writer in writers if not writer._gave_up]
+    return _drain_terminal_writers(waiting, wait_s) and len(waiting) == len(writers)
+
+
+# Runs before atexit callbacks registered earlier, so output they queue is not drained.
+atexit.register(drain_terminal_output)
+
+
+def _is_terminal(stream: TextIO | None) -> bool:
+    try:
+        return stream is not None and stream.isatty()
+    except (AttributeError, OSError, ValueError):
+        return False
+
+
+def nonblocking_terminal_stdio() -> Callable[[], None]:
+    """Route terminal stdio and terminal log handlers through :class:`TerminalWriter`.
+
+    ``sys.stdout`` and ``sys.stderr`` are wrapped only when they are terminals.
+    While installed, terminal mirrors (``OMNIGENT_LOG_TTY_FD`` too) write through
+    writers, including handlers that existed before the install.
+
+    :returns: A restore callable that waits briefly for queued output, leaves
+        the writers in place while a terminal is stalled, and does nothing once
+        it has restored. Nested installs must be restored latest first.
+    """
+    global _threaded_terminal_mirrors
+    _threaded_terminal_mirrors += 1
+    originals = (sys.stdout, sys.stderr)
+    wrapped = tuple(
+        _terminal_writer(stream) if _is_terminal(stream) else stream for stream in originals
+    )
+    sys.stdout, sys.stderr = cast(tuple[TextIO, TextIO], wrapped)
+    writers_by_stream = {
+        id(original): writer
+        for original, writer in zip(originals, wrapped, strict=True)
+        if isinstance(writer, TerminalWriter)
+    }
+    for handler in _terminal_stream_handlers():
+        if isinstance(handler.stream, TerminalWriter):
+            continue  # an outer install already moved it
+        writer = writers_by_stream.get(id(handler.stream))
+        if writer is None and getattr(handler, "_omnigent_process_log_stderr", False):
+            writer = _existing_mirror_writer(handler.stream)
+        if writer is not None:
+            # Two mirrors of one file share a writer, so remember each one's own stream.
+            handler.__dict__["_omnigent_stream_before_writer"] = handler.stream
+            _swap_handler_stream(handler, cast(TextIO, writer))
+    restored = False
+
+    def restore() -> None:
+        nonlocal restored
+        global _threaded_terminal_mirrors
+        if restored:
+            return
+        # Drain every writer first; one blocked mid-write holds its stream's lock.
+        with _live_terminal_writers_lock:
+            writers = list(_live_terminal_writers)
+        if not _drain_terminal_writers(writers, _TERMINAL_EXIT_DRAIN_S):
+            return
+        restored = True
+        _threaded_terminal_mirrors -= 1
+        # A stream someone else replaced meanwhile is theirs to restore.
+        if sys.stdout is wrapped[0]:
+            sys.stdout = originals[0]
+        if sys.stderr is wrapped[1]:
+            sys.stderr = originals[1]
+        if not _threaded_terminal_mirrors:
+            for handler in _terminal_stream_handlers():
+                if isinstance(handler.stream, TerminalWriter):
+                    original = handler.__dict__.pop("_omnigent_stream_before_writer", None)
+                    _swap_handler_stream(handler, original or handler.stream._stream)
+
+    return restore
+
+
+def _terminal_stream_handlers() -> list[logging.StreamHandler[TextIO]]:
+    """Return every logging handler that writes to a stream other than a log file."""
+    loggers = [logging.getLogger()]
+    loggers += [
+        logger
+        for logger in list(logging.Logger.manager.loggerDict.values())
+        if isinstance(logger, logging.Logger)
+    ]
+    return [
+        handler
+        for logger in loggers
+        for handler in list(logger.handlers)
+        if isinstance(handler, logging.StreamHandler)
+        and not isinstance(handler, logging.FileHandler)
+    ]
+
+
+def _swap_handler_stream(handler: logging.StreamHandler[TextIO], stream: TextIO) -> None:
+    # Unlike setStream(), this never flushes the old stream, which may be a stalled terminal.
+    handler.acquire()
+    try:
+        handler.stream = stream
+    finally:
+        handler.release()
 
 
 def terminal_supports_color() -> bool:
@@ -250,18 +890,64 @@ def terminal_supports_color() -> bool:
 
 
 def terminal_stream_handler() -> logging.Handler:
-    """Return a stream handler for the requested terminal mirror."""
-    stream = _terminal_stream()
+    """Return a stream handler for the requested terminal mirror.
+
+    While :func:`nonblocking_terminal_stdio` is installed, the handler writes
+    through a :class:`TerminalWriter`, so logging never waits for a terminal
+    that stopped reading. Otherwise it writes synchronously.
+    """
+    if _threaded_terminal_mirrors:
+        stream = cast(TextIO | None, _terminal_mirror_writer())
+    else:
+        stream = _terminal_stream()
     if stream is None:
         return logging.NullHandler()
-    handler = logging.StreamHandler(stream)
+    handler = _ProcessLogStreamHandler(stream)
     handler._omnigent_process_log_stderr = True
     return handler
 
 
 def terminal_log_formatter() -> logging.Formatter:
     """Return the formatter used by mirrored terminal process logs."""
-    return TerminalLogFormatter(use_colors=terminal_supports_color())
+    return RedactingLogFormatter(use_colors=terminal_supports_color())
+
+
+def _unlink_if_empty(path: Path) -> None:
+    """Remove *path* if it is still an empty file.
+
+    :param path: Log file to sweep, e.g. a self-allocated host log.
+    """
+    with contextlib.suppress(OSError):
+        if path.stat().st_size == 0:
+            path.unlink()
+
+
+def ensure_stdio_survives_unencodable_output() -> None:
+    """Keep stdio writes from aborting when the stream encoding is legacy.
+
+    A non-UTF-8 stdio encoding (a Windows ANSI code page like cp1252, or a
+    C/latin-1 locale) can't encode Omnigent's decorative glyphs (``✓``, ``⚠``),
+    so a plain ``print`` raises ``UnicodeEncodeError`` and kills the process --
+    mid-command in the CLI, or in a background daemon whose stdio is its log
+    file. Relax the error handler to ``replace`` (and switch to UTF-8 on
+    Windows) so the glyph degrades to a placeholder. ``PYTHONUTF8`` can't help:
+    PEP 540 reads it only at interpreter startup.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        encoding = (getattr(stream, "encoding", "") or "").lower().replace("_", "-")
+        if encoding in {"utf-8", "utf8"}:
+            continue
+        # errors="replace" is process-wide: unencodable output degrades to "?"
+        # rather than raising. Detached or captured streams can't be
+        # reconfigured, which is fine -- their writes keep their old behavior.
+        with contextlib.suppress(ValueError, OSError):
+            if sys.platform == "win32":
+                reconfigure(encoding="utf-8", errors="replace")
+            else:
+                reconfigure(errors="replace")
 
 
 def configure_process_logging(
@@ -273,22 +959,33 @@ def configure_process_logging(
     logger_names: Sequence[str] = ("omnigent",),
     root: bool = True,
     force: bool = False,
+    debug_log_send: Callable[[list[dict[str, object]]], None] | None = None,
 ) -> Path:
     """Configure Python logging for one process destination.
 
     The returned file always receives logs. Stderr receives logs only when
-    requested and an interactive terminal stream is available.
+    requested and an interactive terminal stream is available. When provided,
+    ``debug_log_send`` receives prepared debug-log batches on a daemon thread;
+    otherwise the environment-gated ZeroBus sender remains the default.
     """
+    global _current_process_log_path
+
     resolved_level = effective_log_level() if level is None else level
     path = Path(log_path).expanduser() if log_path is not None else _process_log_file_from_env()
     if path is None:
         path = create_process_log_path(destination)
+        # A process that dies before its first record would leave this
+        # freshly created file empty forever (crash-at-birth hosts littered
+        # dozens a day); sweep it on exit. Self-allocated paths only — a
+        # parent-published or explicit path is the caller's to manage.
+        atexit.register(_unlink_if_empty, path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    _current_process_log_path = path
 
-    formatter = TerminalLogFormatter(use_colors=False)
+    formatter = RedactingLogFormatter(use_colors=False)
     handlers: list[logging.Handler] = []
 
-    file_handler = logging.FileHandler(path, encoding="utf-8")
+    file_handler = _ProcessLogFileHandler(path, encoding="utf-8")
     file_handler.setLevel(resolved_level)
     file_handler.setFormatter(formatter)
     file_handler._omnigent_process_log_path = str(path)
@@ -325,8 +1022,43 @@ def configure_process_logging(
             for handler in handlers:
                 _add_handler_once(logger, handler)
 
+    # Mirror the file handler's reach with the optional debug-log upload sink,
+    # so it captures the same records this process writes to disk.
+    from omnigent.debug_logging import attach_debug_log_sink, attach_sse_file_sink
+
+    sink_targets = _debug_sink_target_loggers(logger_names, root=root)
+    attach_debug_log_sink(
+        sink_targets,
+        source=destination,
+        level=resolved_level,
+        send=debug_log_send,
+    )
+    # Opt-in local SSE-event file sink (OMNIGENT_SSE_LOG_TO_FILE), independent of
+    # the debug-log table above; a no-op when the env var is not truthy.
+    attach_sse_file_sink(source=destination, level=resolved_level)
+
     logging.captureWarnings(True)
     return path
+
+
+def _debug_sink_target_loggers(logger_names: Sequence[str], *, root: bool) -> list[logging.Logger]:
+    """Loggers the debug-log sink must attach to, mirroring the file handler.
+
+    The sink has to sit wherever a record is actually handled. A package logger
+    with ``propagate=False`` (e.g. ``omnigent`` under the CLI diagnostics setup)
+    never reaches root, so a root-only sink would miss every record logged under
+    it. This matches the file-handler placement in
+    :func:`configure_process_logging` exactly, so the sink captures the same
+    records the process writes to disk.
+    """
+    targets: list[logging.Logger] = []
+    if root:
+        targets.append(logging.getLogger())
+    for name in logger_names:
+        logger = logging.getLogger(name)
+        if not logger.propagate or not root:
+            targets.append(logger)
+    return targets
 
 
 def _add_handler_once(logger: logging.Logger, handler: logging.Handler) -> None:
@@ -343,7 +1075,7 @@ def _add_handler_once(logger: logging.Logger, handler: logging.Handler) -> None:
 
 
 @contextmanager
-def child_logging_popen_kwargs(env: dict[str, str]) -> Iterator[dict[str, object]]:
+def child_logging_popen_kwargs(env: dict[str, str]) -> Iterator[ChildLoggingPopenKwargs]:
     """Prepare inherited terminal-fd kwargs for a child process.
 
     Mutates *env* only when ``--log-to-stderr`` requested a mirror and the

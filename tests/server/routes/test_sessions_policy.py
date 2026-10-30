@@ -8,6 +8,7 @@ spec's guardrails and returns the correct verdict.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from typing import Any
 from unittest.mock import patch
@@ -17,7 +18,10 @@ import pytest
 from omnigent.entities import Conversation, ConversationItem
 from omnigent.entities.agent import Agent, LoadedAgent
 from omnigent.entities.conversation import FunctionCallData
-from omnigent.policies.types import PolicyAction, PolicyResult
+from omnigent.policies.types import EvaluationContext, PolicyAction, PolicyResult
+from omnigent.server.routes._sessions.orchestration import (
+    _evaluate_policy_with_fresh_engine,
+)
 from omnigent.server.routes.sessions import (
     _build_evaluation_context,
     _build_skill_slash_command_policy_body,
@@ -210,6 +214,47 @@ _CACHE_PATCH = "omnigent.server.routes.sessions.get_agent_cache"
 _ENGINE_PATCH = "omnigent.server.routes.sessions.build_policy_engine"
 _HOLD_GATE_PATCH = "omnigent.server.routes.sessions._hold_native_ask_gate"
 _STREAM_PATCH = "omnigent.server.routes.sessions.session_stream"
+
+
+@pytest.mark.asyncio
+async def test_fresh_policy_engines_are_serialized_per_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Concurrent deployed tool calls cannot race persisted policy state."""
+    active = 0
+    max_active = 0
+
+    class _Engine:
+        async def evaluate(self, _ctx: Any) -> PolicyResult:
+            nonlocal active, max_active
+            active += 1
+            max_active = max(max_active, active)
+            await asyncio.sleep(0)
+            active -= 1
+            return PolicyResult(action=PolicyAction.ALLOW)
+
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._build_policy_engine_from_spec",
+        lambda *_args: _Engine(),
+    )
+    conversation_store = _FakeConversationStore()
+    conv = conversation_store.get_conversation("sess_serialized")
+    ctx = EvaluationContext(phase=Phase.TOOL_CALL, content={}, tool_name="tool")
+
+    await asyncio.gather(
+        *(
+            _evaluate_policy_with_fresh_engine(
+                "sess_serialized",
+                _make_spec_no_guardrails(),
+                conversation_store,
+                conv,
+                ctx,
+            )
+            for _ in range(5)
+        )
+    )
+
+    assert max_active == 1
 
 
 @pytest.mark.asyncio
@@ -602,7 +647,10 @@ async def test_skill_slash_command_policy_body_uses_typed_command_text():
             None,
         )
 
-    assert seen_content == ["/grill-me review Canada rollout"]
+    # REQUEST content is the structured dict ({"user_content", "attachments"})
+    # so policies can reason about attachments per-file; a slash command carries
+    # no attachments.
+    assert seen_content == [{"user_content": "/grill-me review Canada rollout", "attachments": []}]
     assert result["verdict"] == "deny"
     assert result["reason"] == "Input mentions Canada"
 
@@ -867,22 +915,24 @@ def _make_assistant_message_body(
 
 
 @pytest.mark.asyncio
-async def test_output_allow_verdict():
-    """OUTPUT policy evaluation returns allow when the engine
-    ALLOWs the assistant response.
-    """
+@pytest.mark.parametrize("turn_final", [True, False, None])
+@pytest.mark.parametrize("text", ["This is a safe response.", ""])
+async def test_output_allow_verdict(text: str, turn_final: bool | None) -> None:
+    """Nonempty responses forward finality; empty responses skip evaluation."""
     from omnigent.server.routes.sessions import _evaluate_output_policy
 
     conv_store = _FakeConversationStore()
     agent_store = _FakeAgentStore(agent=_make_agent())
     conv = conv_store.get_conversation("sess_1")
-    body = _make_assistant_message_body("This is a safe response.")
+    body = _make_assistant_message_body(text)
 
     spec = _make_spec_with_guardrails()
     loaded = LoadedAgent(spec=spec, workdir="/tmp/fake")
     allow_result = PolicyResult(action=PolicyAction.ALLOW)
+    captured: list[EvaluationContext] = []
 
-    async def _eval(_ctx: Any) -> PolicyResult:
+    async def _eval(ctx: EvaluationContext) -> PolicyResult:
+        captured.append(ctx)
         return allow_result
 
     with (
@@ -901,9 +951,18 @@ async def test_output_allow_verdict():
             conv_store,
             agent_store,
             None,
+            turn_final=turn_final,
         )
 
     assert result is None
+    if text:
+        mock_build.assert_called_once()
+        assert len(captured) == 1
+        ctx = captured[0]
+        assert (ctx.phase, ctx.content, ctx.turn_final) == (Phase.RESPONSE, text, turn_final)
+    else:
+        mock_build.assert_not_called()
+        assert not captured
 
 
 @pytest.mark.asyncio
@@ -959,20 +1018,24 @@ async def test_output_deny_replaces_text():
 def test_build_evaluation_context_request_accepts_string_data() -> None:
     """REQUEST-phase ``data`` may be a bare string and must NOT raise.
 
-    opencode's policy plugin sends the prompt text directly as ``data`` for
-    PHASE_REQUEST (``{"event": {"type": "PHASE_REQUEST", "data": "<prompt>"}}``).
+    A bare string is accepted for compatibility with older or third-party
+    callers that send the prompt text directly rather than wrapped in an
+    object — OpenCode's own plugin used to be one of these, but now sends
+    ``{"text": ...}`` like the native hooks (see the dict-data test below).
     The old code did ``data.get("text")`` unconditionally and ``AttributeError``ed
     on a string, 500ing the evaluate endpoint — which silently failed the
     request-phase gate OPEN (cost-over-budget terminal prompts sailed through).
     """
     ctx = _build_evaluation_context(Phase.REQUEST, "delete the prod database", {})
-    assert ctx.content == "delete the prod database"
+    # REQUEST content is the structured dict ({"user_content", "attachments"}); the
+    # native / opencode path carries no attachments.
+    assert ctx.content == {"user_content": "delete the prod database", "attachments": []}
 
 
 def test_build_evaluation_context_request_dict_still_works() -> None:
     """The native-hook convention (dict with ``text``) still resolves."""
     ctx = _build_evaluation_context(Phase.REQUEST, {"text": "hello"}, {})
-    assert ctx.content == "hello"
+    assert ctx.content == {"user_content": "hello", "attachments": []}
     # ``content`` fallback also honored.
     ctx2 = _build_evaluation_context(Phase.REQUEST, {"content": "hi"}, {})
-    assert ctx2.content == "hi"
+    assert ctx2.content == {"user_content": "hi", "attachments": []}

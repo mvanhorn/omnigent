@@ -3,17 +3,81 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
+import re
+import sqlite3
+import subprocess
+from collections.abc import Iterable, Iterator, Sequence
+from hashlib import sha256
+from itertools import chain
 from pathlib import Path
+from typing import NamedTuple, cast, get_args
 
-from omnigent.claude_native_bridge import read_transcript_items_from_offset
-from omnigent.codex_native import _CODEX_THREAD_ID_RE, _find_codex_rollout
 from omnigent.entities import NewConversationItem, parse_item_data
+from omnigent.harnesses.claude_native.bridge import (
+    RESUME_COPY_MARKER_SUFFIX,
+    ClaudeTranscriptItem,
+    read_transcript_items_from_offset,
+)
+from omnigent.harnesses.codex_native.bridge import bridge_root
+from omnigent.harnesses.kimi_native.credentials import resolve_user_kimi_home
+from omnigent.harnesses.kimi_native.forwarder import (
+    read_kimi_wire_items,
+    workdirs_for_kimi_sessions,
+)
+from omnigent.harnesses.kiro_native.session_forwarder import (
+    kiro_cli_sessions_dir,
+    parse_kiro_jsonl_line,
+)
+from omnigent.harnesses.opencode_native.app_server import (
+    OpenCodeCliNotFoundError,
+    find_opencode_cli,
+)
+from omnigent.harnesses.opencode_native.forwarder import opencode_tool_output_text
+from omnigent.host.frames import IMPORT_SESSION_MAX_REASSEMBLED_CHARS
 from omnigent.session_import.models import (
+    MAX_IMPORT_ITEMS,
     ImportSource,
     LocalSessionImport,
     SessionImportNotFoundError,
+    from_last_compaction,
+    import_item_payload,
 )
+
+_logger = logging.getLogger(__name__)
+
+_PI_IMPORT_SESSION_ID_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?")
+_OPENCODE_IMPORT_SESSION_ID_RE = re.compile(r"ses_[A-Za-z0-9_-]+")
+_MAX_EXTERNAL_SESSION_ID_LENGTH = 128
+_MAX_RESPONSE_ID_LENGTH = 64
+_OPENCODE_COMMAND_TIMEOUT_SECONDS = 120
+
+# Claude transcript size above which import keeps only the last compaction onward.
+# See docs/session-compaction.md.
+_IMPORT_COMPACT_TRIM_BYTES = 2 * 1024 * 1024
+
+
+def _exceeds_compaction_trim_size(path: Path) -> bool:
+    """Whether a transcript is large enough to trim to its last compaction.
+
+    An unreadable size falls back to ``False`` — import the whole transcript
+    rather than drop history on a failed ``stat``.
+    """
+    try:
+        return path.stat().st_size > _IMPORT_COMPACT_TRIM_BYTES
+    except OSError:
+        return False
+
+
+def _bounded_response_id(response_id: str) -> str:
+    """Keep short native ids readable and hash long ids without collisions."""
+    if len(response_id) <= _MAX_RESPONSE_ID_LENGTH:
+        return response_id
+    harness, separator, _ = response_id.partition(":")
+    prefix = f"{harness}:sha256:" if separator else "sha256:"
+    digest_length = _MAX_RESPONSE_ID_LENGTH - len(prefix)
+    return prefix + sha256(response_id.encode()).hexdigest()[:digest_length]
 
 
 def _find_transcript(root: Path, session_id: str) -> Path | None:
@@ -26,12 +90,16 @@ def _find_transcript(root: Path, session_id: str) -> Path | None:
     return max(matches, key=lambda path: path.stat().st_mtime) if matches else None
 
 
-def _recent_unique_session_ids(
+def _recent_unique_sessions_with_recency(
     candidates: list[tuple[Path, str]],
     *,
     limit: int,
-) -> tuple[str, ...]:
-    """Return unique session ids ordered from newest transcript to oldest."""
+) -> list[tuple[str, float]]:
+    """Return ``(session_id, recency)`` pairs, newest transcript first.
+
+    ``recency`` is the newest mtime seen for that id, kept so callers can merge
+    sessions across harnesses by a single global recency order.
+    """
     newest_by_id: dict[str, float] = {}
     for path, session_id in candidates:
         try:
@@ -44,28 +112,182 @@ def _recent_unique_session_ids(
         key=lambda session_id: (newest_by_id[session_id], session_id),
         reverse=True,
     )
-    return tuple(ordered[:limit])
+    return [(session_id, newest_by_id[session_id]) for session_id in ordered[:limit]]
 
 
-def list_recent_local_session_ids(
-    source: ImportSource,
+def _recent_unique_session_ids(
+    candidates: list[tuple[Path, str]],
     *,
     limit: int,
 ) -> tuple[str, ...]:
-    """List recent parent session ids for one local harness."""
-    if source == "claude":
-        configured_home = os.environ.get("CLAUDE_CONFIG_DIR")
-        home = Path(configured_home).expanduser() if configured_home else Path.home() / ".claude"
-        root = home / "projects"
-        candidates = [
-            (path, path.stem)
-            for path in root.rglob("*.jsonl")
-            if "subagents" not in path.parts and path.is_file()
-        ]
-        return _recent_unique_session_ids(candidates, limit=limit)
+    """Return unique session ids ordered from newest transcript to oldest."""
+    return tuple(sid for sid, _ in _recent_unique_sessions_with_recency(candidates, limit=limit))
 
-    configured_home = os.environ.get("CODEX_HOME")
-    home = Path(configured_home).expanduser() if configured_home else Path.home() / ".codex"
+
+def _pi_session_id_from_path(path: Path) -> str | None:
+    """Read a safe native session id from a Pi transcript header."""
+    try:
+        with path.open(encoding="utf-8") as handle:
+            header = json.loads(handle.readline())
+    except (OSError, ValueError):
+        return None
+    session_id = header.get("id") if isinstance(header, dict) else None
+    if not isinstance(session_id, str) or not _is_safe_pi_import_session_id(session_id):
+        return None
+    return session_id
+
+
+def _is_safe_pi_import_session_id(session_id: str) -> bool:
+    """Match Pi's safe syntax within the import API's identity limit."""
+    return (
+        len(session_id) <= _MAX_EXTERNAL_SESSION_ID_LENGTH
+        and _PI_IMPORT_SESSION_ID_RE.fullmatch(session_id) is not None
+    )
+
+
+def _is_safe_opencode_import_session_id(session_id: str) -> bool:
+    """Accept native OpenCode ids without permitting CLI option injection."""
+    return (
+        len(session_id) <= _MAX_EXTERNAL_SESSION_ID_LENGTH
+        and _OPENCODE_IMPORT_SESSION_ID_RE.fullmatch(session_id) is not None
+    )
+
+
+def _run_opencode_json(
+    *arguments: str,
+    opencode_path: str | None = None,
+    empty_ok: bool = False,
+) -> object:
+    """Run one public OpenCode JSON command and decode stdout.
+
+    With no sessions, ``session list`` prints nothing (exit 0) rather than
+    ``[]``; ``empty_ok`` treats that empty stdout as an empty result instead of
+    an "invalid JSON" error.
+    """
+    try:
+        cli = find_opencode_cli(opencode_path)
+    except OpenCodeCliNotFoundError as exc:
+        raise SessionImportNotFoundError(str(exc)) from exc
+    try:
+        completed = subprocess.run(
+            [cli, *arguments],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=_OPENCODE_COMMAND_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise SessionImportNotFoundError(f"OpenCode export could not run: {exc}") from exc
+    if completed.returncode != 0:
+        detail = completed.stderr.strip().splitlines()
+        suffix = f": {detail[-1]}" if detail else ""
+        raise SessionImportNotFoundError(f"OpenCode command failed{suffix}")
+    if empty_ok and not completed.stdout.strip():
+        return []
+    try:
+        return json.loads(completed.stdout)
+    except ValueError as exc:
+        raise SessionImportNotFoundError("OpenCode returned invalid JSON") from exc
+
+
+def _qwen_session_locator(path: Path) -> str:
+    """Qualify a Qwen id by project while staying within API limits."""
+    project = path.parent.parent.name
+    session_id = path.stem
+    locator = f"{project}:{session_id}"
+    if len(locator) <= _MAX_EXTERNAL_SESSION_ID_LENGTH:
+        return locator
+    project_digest = sha256(project.encode()).hexdigest()[:16]
+    locator = f"{project_digest}:{session_id}"
+    if len(locator) <= _MAX_EXTERNAL_SESSION_ID_LENGTH:
+        return locator
+    return f"{project_digest}:{sha256(session_id.encode()).hexdigest()}"
+
+
+# Codex records the session's origin in ``session_meta.source``. Its own resume
+# picker lists only interactive sources (Cli, VSCode); ``exec`` runs, ``mcp``
+# sessions, and sub-agent / internal threads are automation the user never
+# opened interactively. Match that so recent-import doesn't flood the sidebar
+# with headless ``codex exec`` runs, whose first message is an injected
+# instruction, which is what produced the "many instruction-like titles" report.
+_CODEX_INTERACTIVE_SOURCES = frozenset({"cli", "vscode"})
+
+
+def _codex_rollout_meta(path: Path) -> dict[str, object] | None:
+    """Return a Codex rollout's ``session_meta`` payload, if present.
+
+    ``session_meta`` is the first record in a rollout, so only the first line is
+    read. ``None`` when the file is unreadable or does not start with one.
+    """
+    try:
+        with path.open(encoding="utf-8") as handle:
+            first = handle.readline()
+    except OSError:
+        return None
+    try:
+        record = json.loads(first)
+    except ValueError:
+        return None
+    if not isinstance(record, dict) or record.get("type") != "session_meta":
+        return None
+    payload = record.get("payload")
+    return payload if isinstance(payload, dict) else None
+
+
+def _codex_source_is_interactive(source: object) -> bool:
+    """Whether a Codex session source is one the interactive picker shows.
+
+    Mirrors Codex's resume picker (interactive = ``Cli`` / ``VSCode``). A missing
+    source (very old rollouts predating the field) defaults to interactive so
+    genuine history isn't dropped; any recorded non-interactive value (``exec``,
+    ``mcp``, or a sub-agent / internal object) is excluded.
+    """
+    if source is None:
+        return True
+    return isinstance(source, str) and source.lower() in _CODEX_INTERACTIVE_SOURCES
+
+
+def _unique_paths(paths: Sequence[Path]) -> tuple[Path, ...]:
+    """Keep the first occurrence of each configured storage path."""
+    unique: list[Path] = []
+    for path in paths:
+        if path not in unique:
+            unique.append(path)
+    return tuple(unique)
+
+
+def _codex_native_storage_homes() -> tuple[Path, ...]:
+    """Return private Codex homes under the producer's bridge root."""
+    root = bridge_root()
+    try:
+        bridge_dirs = tuple(root.iterdir())
+    except OSError:
+        return ()
+    homes: list[Path] = []
+    for bridge_dir in bridge_dirs:
+        try:
+            if not bridge_dir.is_dir() or bridge_dir.is_symlink():
+                continue
+            codex_home = bridge_dir / "codex-home"
+            if codex_home.is_dir() and not codex_home.is_symlink():
+                homes.append(codex_home)
+        except OSError:
+            continue
+    return tuple(homes)
+
+
+def _codex_storage_homes(codex_home: Path | None = None) -> tuple[Path, ...]:
+    """Return configured, normal, and native private Codex homes."""
+    if codex_home is not None:
+        return (codex_home,)
+    configured = os.environ.get("CODEX_HOME")
+    normal = Path.home() / ".codex"
+    configured_home = Path(configured).expanduser() if configured else normal
+    return _unique_paths((configured_home, normal, *_codex_native_storage_homes()))
+
+
+def _codex_rollout_paths(home: Path) -> list[Path]:
+    """Return active and archived Codex rollout files in one home."""
     rollouts: list[Path] = []
     sessions = home / "sessions"
     archived_sessions = home / "archived_sessions"
@@ -75,12 +297,168 @@ def list_recent_local_session_ids(
         rollouts.extend(
             path for path in archived_sessions.glob("rollout-*.jsonl") if path.is_file()
         )
-    candidates = []
-    for path in rollouts:
-        session_id = path.stem[-36:]
-        if _CODEX_THREAD_ID_RE.fullmatch(session_id):
+    return rollouts
+
+
+class _CodexRolloutFile(NamedTuple):
+    """One rollout file, with the home holding it and the ids its filename carries."""
+
+    path: Path
+    home: Path
+    thread_id: str
+    rollout_id: str
+
+
+def _codex_rollout_candidates(homes: Sequence[Path]) -> list[_CodexRolloutFile]:
+    """Return rollout files with the thread and rollout ids parsed from their filenames."""
+    candidates: list[_CodexRolloutFile] = []
+    for home in homes:
+        for path in _codex_rollout_paths(home):
+            ids = _codex_rollout_ids(path)
+            if ids is not None:
+                candidates.append(_CodexRolloutFile(path, home, *ids))
+    return candidates
+
+
+def _recent_local_sessions_with_recency(
+    source: ImportSource,
+    *,
+    limit: int,
+) -> list[tuple[str, float]]:
+    """List recent ``(session_id, recency)`` pairs for one local harness, newest first."""
+    if source == "claude":
+        configured_home = os.environ.get("CLAUDE_CONFIG_DIR")
+        home = Path(configured_home).expanduser() if configured_home else Path.home() / ".claude"
+        root = home / "projects"
+        candidates = [
+            (path, path.stem)
+            for path in root.rglob("*.jsonl")
+            if "subagents" not in path.parts
+            and path.is_file()
+            and not path.with_suffix(RESUME_COPY_MARKER_SUFFIX).exists()
+        ]
+        return _recent_unique_sessions_with_recency(candidates, limit=limit)
+
+    if source == "qwen":
+        configured_home = os.environ.get("QWEN_HOME")
+        home = Path(configured_home).expanduser() if configured_home else Path.home() / ".qwen"
+        paths = [path for path in (home / "projects").glob("*/chats/*.jsonl") if path.is_file()]
+        candidates = [(path, _qwen_session_locator(path)) for path in paths]
+        return _recent_unique_sessions_with_recency(candidates, limit=limit)
+
+    if source == "kiro":
+        root = kiro_cli_sessions_dir()
+        candidates = [
+            (path, path.stem)
+            for path in root.glob("*.jsonl")
+            if path.is_file() and path.with_suffix(".json").is_file()
+        ]
+        return _recent_unique_sessions_with_recency(candidates, limit=limit)
+
+    if source == "opencode":
+        payload = _run_opencode_json(
+            "session",
+            "list",
+            "--format",
+            "json",
+            "--pure",
+            empty_ok=True,
+        )
+        if not isinstance(payload, list):
+            raise SessionImportNotFoundError("OpenCode returned an invalid session list")
+        updated_by_id: dict[str, int | float] = {}
+        for entry in payload:
+            if not isinstance(entry, dict) or isinstance(entry.get("parentID"), str):
+                continue
+            session_id = entry.get("id")
+            updated = entry.get("updated")
+            if not isinstance(session_id, str) or not _is_safe_opencode_import_session_id(
+                session_id
+            ):
+                continue
+            timestamp = updated if isinstance(updated, (int, float)) else 0
+            updated_by_id[session_id] = max(updated_by_id.get(session_id, 0), timestamp)
+        ordered = sorted(
+            updated_by_id,
+            key=lambda session_id: (updated_by_id[session_id], session_id),
+            reverse=True,
+        )
+        return [(session_id, float(updated_by_id[session_id])) for session_id in ordered[:limit]]
+
+    if source == "pi":
+        configured_home = os.environ.get("PI_CODING_AGENT_DIR")
+        home = (
+            Path(configured_home).expanduser()
+            if configured_home
+            else Path.home() / ".pi" / "agent"
+        )
+        # Pi stores ids in the header, so discovery intentionally reads one line per file.
+        candidates = [
+            (path, session_id)
+            for path in (home / "sessions").rglob("*.jsonl")
+            if path.is_file() and (session_id := _pi_session_id_from_path(path)) is not None
+        ]
+        return _recent_unique_sessions_with_recency(candidates, limit=limit)
+
+    if source == "kimi":
+        home = resolve_user_kimi_home()
+        candidates = [
+            (path, path.parent.parent.parent.name)
+            for path in (home / "sessions").glob("*/session_*/agents/main/wire.jsonl")
+            if path.is_file()
+        ]
+        return _recent_unique_sessions_with_recency(candidates, limit=limit)
+
+    if source == "codex":
+        candidates = []
+        for path, _, session_id, _ in _codex_rollout_candidates(_codex_storage_homes()):
+            meta = _codex_rollout_meta(path)
+            # Skip non-interactive runs (exec / mcp / sub-agent / internal)
+            # that Codex itself hides.
+            if not _codex_source_is_interactive(meta.get("source") if meta else None):
+                continue
             candidates.append((path, session_id))
-    return _recent_unique_session_ids(candidates, limit=limit)
+        return _recent_unique_sessions_with_recency(candidates, limit=limit)
+
+    raise ValueError(f"Unsupported import source: {source}")
+
+
+def list_recent_local_session_ids(
+    source: ImportSource,
+    *,
+    limit: int,
+) -> tuple[str, ...]:
+    """List recent parent session ids for one local harness, newest first."""
+    return tuple(sid for sid, _ in _recent_local_sessions_with_recency(source, limit=limit))
+
+
+def _normalize_recency(recency: float) -> float:
+    """Fold millisecond timestamps to seconds so harnesses compare on one scale.
+
+    File-based harnesses use mtime (Unix seconds ~1.7e9); OpenCode reports
+    ``updated`` in epoch millis (~1.7e12). Without this a millis timestamp would
+    always outrank a seconds one in a cross-harness merge.
+    """
+    return recency / 1000.0 if recency > 1e12 else recency
+
+
+def list_recent_sessions_across_harnesses(*, limit: int) -> list[tuple[ImportSource, str]]:
+    """Return the ``limit`` most recent sessions across every harness, newest first.
+
+    Unlike calling :func:`list_recent_local_session_ids` per harness (which would
+    yield ``limit`` *each*), this merges all harnesses into one global recency
+    order and keeps the top ``limit`` — so "last N" means N total. A harness with
+    no history or an unavailable CLI is skipped.
+    """
+    scored: list[tuple[float, ImportSource, str]] = []
+    for source in get_args(ImportSource):
+        try:
+            recent = _recent_local_sessions_with_recency(source, limit=limit)
+        except (SessionImportNotFoundError, OSError, ValueError, TypeError):
+            continue
+        scored.extend((_normalize_recency(recency), source, sid) for sid, recency in recent)
+    scored.sort(key=lambda entry: (entry[0], entry[2]), reverse=True)
+    return [(source, sid) for _, source, sid in scored[:limit]]
 
 
 def _claude_workspace(transcript_path: Path) -> str | None:
@@ -99,6 +477,75 @@ def _claude_workspace(transcript_path: Path) -> str | None:
     return None
 
 
+def _claude_native_title(transcript_path: Path) -> str | None:
+    """Return Claude Code's own session title, custom name over AI-generated.
+
+    Claude appends ``custom-title`` (user rename) and ``ai-title`` (generated)
+    lines to the JSONL as they change; the last of each wins. A user's rename
+    beats the AI title.
+    """
+    custom: str | None = None
+    ai: str | None = None
+    try:
+        with transcript_path.open(encoding="utf-8") as handle:
+            for line in handle:
+                if "-title" not in line:  # cheap prefilter; the type is custom-title / ai-title
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(record, dict):
+                    continue
+                if record.get("type") == "custom-title":
+                    value = record.get("customTitle")
+                    if isinstance(value, str) and value.strip():
+                        custom = value.strip()
+                elif record.get("type") == "ai-title":
+                    value = record.get("aiTitle")
+                    if isinstance(value, str) and value.strip():
+                        ai = value.strip()
+    except OSError:
+        return None
+    return custom or ai
+
+
+def _items_from_last_compaction(
+    items: Sequence[ClaudeTranscriptItem],
+) -> Sequence[ClaudeTranscriptItem]:
+    """Slice ``items`` from the last compaction summary onward.
+
+    Claude flags the continuation summary it writes after compacting its own
+    context with ``is_compact_summary`` — the durable compaction boundary (see
+    :mod:`omnigent.harnesses.claude_native.bridge`). The live agent resumes from
+    that summary, not the full transcript, so keeping the summary and everything
+    after it mirrors the agent's working context. Returns ``items`` unchanged
+    when the transcript was never compacted.
+    """
+    last = None
+    for index, item in enumerate(items):
+        if item.is_compact_summary:
+            last = index
+    return items if last is None else items[last:]
+
+
+def _claude_import_item_data(item: ClaudeTranscriptItem) -> dict[str, object]:
+    """Return an item's data, flagging a compaction summary as meta.
+
+    Claude writes a continuation summary after compacting its own context; a
+    large transcript is trimmed to start there, so the summary would otherwise
+    become the sidebar title ("This session is being continued…"). It is durable
+    context replayed to the agent, not a user turn; flag it ``is_meta`` so the
+    title falls through to a real user message (matching Pi's branch summaries).
+    """
+    data = item.data
+    if item.is_compact_summary and isinstance(data, dict) and not data.get("is_meta"):
+        return {**data, "is_meta": True}
+    if item.agent_message_candidate and not data.get("user_authored"):
+        return {**data, "is_meta": True}
+    return data
+
+
 def load_claude_session(
     session_id: str,
     *,
@@ -111,20 +558,31 @@ def load_claude_session(
     transcript_path = _find_transcript(root, session_id)
     if transcript_path is None:
         raise SessionImportNotFoundError(f"Claude Code session {session_id!r} was not found")
+    if transcript_path.with_suffix(RESUME_COPY_MARKER_SUFFIX).exists():
+        raise SessionImportNotFoundError(
+            f"Claude Code session {session_id!r} is an Omnigent resume copy"
+        )
 
     parsed = read_transcript_items_from_offset(
         transcript_path,
         0,
         start_line=0,
         agent_name="claude-native-ui",
+        legacy_agent_messages=True,
     )
+    # A large transcript has almost certainly compacted; import only what the
+    # agent would still see (from the last compaction boundary). See
+    # docs/session-compaction.md.
+    source_items: Sequence[ClaudeTranscriptItem] = parsed.items
+    if _exceeds_compaction_trim_size(transcript_path):
+        source_items = _items_from_last_compaction(parsed.items)
     items = tuple(
         NewConversationItem(
             type=item.item_type,
             response_id=item.response_id,
-            data=parse_item_data(item.item_type, item.data),
+            data=parse_item_data(item.item_type, _claude_import_item_data(item)),
         )
-        for item in parsed.items
+        for item in source_items
     )
     if not items:
         raise SessionImportNotFoundError(
@@ -135,6 +593,7 @@ def load_claude_session(
         external_session_id=session_id,
         workspace=_claude_workspace(transcript_path),
         items=items,
+        native_title=_claude_native_title(transcript_path),
     )
 
 
@@ -225,6 +684,9 @@ def _codex_response_item(
                 "arguments": arguments,
                 "call_id": call_id,
             }
+            namespace = payload.get("namespace")
+            if isinstance(namespace, str) and namespace:
+                data["namespace"] = namespace
             normalized_type = "function_call"
     elif item_type in {"function_call_output", "custom_tool_call_output"}:
         call_id = payload.get("call_id")
@@ -241,18 +703,337 @@ def _codex_response_item(
     )
 
 
-def _find_archived_codex_rollout(codex_home: Path, session_id: str) -> Path | None:
-    """Return the newest archived Codex rollout matching a session id."""
-    archived_sessions = codex_home / "archived_sessions"
-    if not archived_sessions.is_dir():
+_CODEX_UUID = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+# rollout-<timestamp>-<thread id>.jsonl; a reverted thread's new rollout adds _<rollout id>.
+_CODEX_ROLLOUT_NAME_RE = re.compile(rf"^rollout-.+-({_CODEX_UUID})(?:_({_CODEX_UUID}))?\.jsonl$")
+
+
+def _codex_rollout_ids(path: Path) -> tuple[str, str] | None:
+    """``(thread id, rollout id)`` from a rollout filename; they differ only after a revert.
+
+    Codex names every rollout for its thread, so a reverted thread's ``<thread>_<rollout>``
+    file lists under the thread id.
+    """
+    match = _CODEX_ROLLOUT_NAME_RE.match(path.name)
+    if match is None:
         return None
-    suffix = f"-{session_id}.jsonl"
-    matches = [
-        path
-        for path in archived_sessions.glob("rollout-*.jsonl")
-        if path.name.endswith(suffix) and path.is_file()
-    ]
-    return max(matches, key=lambda path: path.stat().st_mtime) if matches else None
+    thread_id, rollout_id = match.groups()
+    return thread_id, rollout_id or thread_id
+
+
+def _newest_codex_rollout(paths: Iterable[Path]) -> Path | None:
+    """Return the most recently modified of ``paths``, skipping files that cannot be read."""
+    selected: Path | None = None
+    selected_mtime = 0.0
+    for path in paths:
+        try:
+            modified_at = path.stat().st_mtime
+        except OSError:
+            continue
+        if selected is None or modified_at > selected_mtime:
+            selected = path
+            selected_mtime = modified_at
+    return selected
+
+
+def _codex_thread_name_from_index(home: Path, session_id: str) -> str | None:
+    """Return the user's thread rename from ``session_index.jsonl``, if any.
+
+    Renaming a Codex thread appends ``{id, thread_name, updated_at}`` here; it
+    is codex's authoritative rename store and, unlike ``threads.title`` in the
+    state DB, always reflects the rename. Last entry for the id wins.
+    """
+    index = home / "session_index.jsonl"
+    name: str | None = None
+    try:
+        with index.open(encoding="utf-8") as handle:
+            for line in handle:
+                if session_id not in line:  # cheap prefilter before JSON parse
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(record, dict) and record.get("id") == session_id:
+                    value = record.get("thread_name")
+                    if isinstance(value, str) and value.strip():
+                        name = value.strip()
+    except OSError:
+        return None
+    return name
+
+
+def _codex_state_db_version(path: Path) -> int:
+    match = re.search(r"state_(\d+)\.sqlite$", path.name)
+    return int(match.group(1)) if match else -1
+
+
+def _codex_thread_row(home: Path, session_id: str) -> dict[str, object] | None:
+    """Thread row from the newest ``state_<n>.sqlite``; its columns vary by Codex version.
+
+    Older stores answer only for a thread the newer, readable ones lack, such as one
+    recorded before a store upgrade. An unreadable store yields no row instead.
+    """
+    dbs = sorted(home.glob("state_*.sqlite"), key=_codex_state_db_version, reverse=True)
+    for db in dbs:
+        try:
+            # as_uri() percent-encodes path characters such as ? and # that a raw URI misparses.
+            con = sqlite3.connect(f"{db.resolve().as_uri()}?mode=ro", uri=True)
+            try:
+                con.row_factory = sqlite3.Row
+                row = con.execute("SELECT * FROM threads WHERE id = ?", (session_id,)).fetchone()
+            finally:
+                con.close()
+        except sqlite3.Error as exc:
+            _logger.warning("Codex thread store %s could not be read: %s", db, exc)
+            return None
+        if row is not None:
+            return dict(row)
+    return None
+
+
+def _codex_native_title(
+    home: Path, session_id: str, thread_row: dict[str, object] | None
+) -> str | None:
+    """Return the user's custom Codex thread title, or None if auto-derived.
+
+    A rename lands in ``session_index.jsonl`` (``thread_name``) — the reliable
+    source — so check that first. As a fallback, the thread store's
+    ``threads.title`` holds the raw first user message until renamed, so only a
+    title that diverges from ``first_user_message`` is a real custom name;
+    otherwise the first-message synthesis is better.
+    """
+    indexed = _codex_thread_name_from_index(home, session_id)
+    if indexed:
+        return indexed
+    if thread_row is None:
+        return None
+    title = str(thread_row.get("title") or "").strip()
+    first_message = str(thread_row.get("first_user_message") or "").strip()
+    return title if title and title != first_message else None
+
+
+def _codex_recorded_rollout(home: Path, thread_row: dict[str, object] | None) -> Path | None:
+    """Return the rollout the thread store names, if it is a file under this home's rollouts.
+
+    Both sides are resolved, as Codex checks a shared rollout, so a symlinked
+    ``sessions/`` root is followed.
+    """
+    recorded = thread_row.get("rollout_path") if thread_row else None
+    if not isinstance(recorded, str) or not recorded.strip():
+        return None
+    path = (home / Path(recorded.strip()).expanduser()).resolve()
+    roots = ((home / "sessions").resolve(), (home / "archived_sessions").resolve())
+    if not any(root in path.parents for root in roots):
+        return None
+    return path if path.suffix == ".jsonl" and path.is_file() else None
+
+
+def _codex_thread_location(
+    homes: Sequence[Path], session_id: str, rollouts: Sequence[_CodexRolloutFile]
+) -> tuple[Path, Path, dict[str, object] | None] | None:
+    """Resolve the thread's newest rollout across Codex homes, preferring ``threads.rollout_path``.
+
+    Returns that rollout, its home, and the home's thread row.
+    """
+    selected: tuple[Path, Path, dict[str, object] | None] | None = None
+    selected_mtime = 0.0
+    for home in homes:
+        thread_row = _codex_thread_row(home, session_id)
+        rollout_path = _codex_recorded_rollout(home, thread_row) or _newest_codex_rollout(
+            rollout.path
+            for rollout in rollouts
+            if rollout.home == home and rollout.thread_id == session_id
+        )
+        if rollout_path is None:
+            continue
+        try:
+            modified_at = rollout_path.stat().st_mtime
+        except OSError:
+            continue
+        if selected is None or modified_at > selected_mtime:
+            selected = (rollout_path, home, thread_row)
+            selected_mtime = modified_at
+    return selected
+
+
+def _codex_thread_archived(
+    home: Path, thread_row: dict[str, object] | None, rollout_path: Path
+) -> bool:
+    """Whether Codex archived the thread: ``threads.archived`` or an archived_sessions/ rollout."""
+    if thread_row is not None and thread_row.get("archived"):
+        return True
+    return (home / "archived_sessions").resolve() in rollout_path.resolve().parents
+
+
+def _codex_rollout_records(path: Path) -> Iterator[dict[str, object]]:
+    """Yield a rollout's records that carry a dict ``payload``, skipping malformed lines."""
+    with path.open(encoding="utf-8") as handle:
+        for line in handle:
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(record, dict) and isinstance(record.get("payload"), dict):
+                yield record
+
+
+def _codex_record_ordinal(record: dict[str, object], position: int) -> int:
+    """A paginated record's ``ordinal``; legacy rollouts fall back to ``position``."""
+    ordinal = record.get("ordinal")
+    if isinstance(ordinal, int) and not isinstance(ordinal, bool):
+        return ordinal
+    return position
+
+
+def _codex_history_base(meta: dict[str, object] | None) -> tuple[str, int] | None:
+    """``(base rollout id, exclusive end ordinal)`` from ``session_meta.history_base``."""
+    base = meta.get("history_base") if meta else None
+    if not isinstance(base, dict):
+        return None
+    base_id = base.get("thread_id")
+    end = base.get("end_ordinal_exclusive")
+    if not isinstance(base_id, str) or isinstance(end, bool) or not isinstance(end, int):
+        return None
+    return (base_id, end) if end > 0 else None
+
+
+def _codex_base_rollout(
+    homes: Sequence[Path], rollouts: Sequence[_CodexRolloutFile], rollout_id: str
+) -> Path | None:
+    """Return a fork base's newest rollout from the first home, in order, that holds it."""
+    for home in homes:
+        path = _newest_codex_rollout(
+            rollout.path
+            for rollout in rollouts
+            if rollout.home == home and rollout.rollout_id == rollout_id
+        )
+        if path is not None:
+            return path
+    return None
+
+
+def _codex_inherited_records(
+    homes: Sequence[Path],
+    rollouts: Sequence[_CodexRolloutFile],
+    meta: dict[str, object],
+    *,
+    seen: set[str],
+) -> Iterator[dict[str, object]]:
+    """Yield inherited rollout records oldest first; each cutoff is capped by its descendant's.
+
+    ``history_base.thread_id`` names the base rollout, and ``seen`` holds rollout ids so a
+    cycle stops. Bases are looked up in ``homes`` in order, the fork's own home first.
+    """
+    # (base rollout, cutoff, ordinal of its first record), nearest base first.
+    lineage: list[tuple[Path, int, int]] = []
+    base = _codex_history_base(meta)
+    while base is not None and base[0] not in seen:
+        base_id, end = base
+        seen.add(base_id)
+        path = _codex_base_rollout(homes, rollouts, base_id)
+        if path is None:
+            break
+        base = _codex_history_base(_codex_rollout_meta(path))
+        # A fork numbers its own records from its cutoff, which a legacy line position omits.
+        first_ordinal = base[1] if base is not None else 0
+        lineage.append((path, min(end, lineage[-1][1]) if lineage else end, first_ordinal))
+    for path, end, first_ordinal in reversed(lineage):
+        for position, record in enumerate(_codex_rollout_records(path), start=first_ordinal):
+            # Paginated rollouts append records in ordinal order.
+            if _codex_record_ordinal(record, position) >= end:
+                break
+            yield record
+
+
+_CODEX_COMPACTION_FALLBACK_SUMMARY = "[Codex compaction — context was compacted in Codex]"
+
+
+def _codex_compaction_item(payload: dict[str, object]) -> NewConversationItem | None:
+    """Carry a ``compacted`` record as a compaction item, as a live codex-native session does."""
+    history = payload.get("replacement_history")
+    if not isinstance(history, list):
+        return None
+    messages = [entry for entry in history if isinstance(entry, dict)]
+    if not messages:
+        return None
+    summary = payload.get("message")
+    data: dict[str, object] = {
+        "summary": (
+            summary.strip()
+            if isinstance(summary, str) and summary.strip()
+            else _CODEX_COMPACTION_FALLBACK_SUMMARY
+        ),
+        # Placeholder; the import route anchors it to the item stored before it.
+        "last_item_id": "codex:compaction",
+        "token_count": 0,
+        "compacted_messages": messages,
+    }
+    window_id = payload.get("window_id")
+    if isinstance(window_id, (int, str)) and not isinstance(window_id, bool):
+        data["window_id"] = window_id
+    return NewConversationItem(
+        type="compaction",
+        response_id="codex:compaction",
+        data=parse_item_data("compaction", data),
+    )
+
+
+def _codex_items_from_records(
+    records: Iterable[dict[str, object]],
+) -> tuple[list[NewConversationItem], str | None]:
+    """Convert rollout records to items; also returns the last recorded cwd."""
+    workspace: str | None = None
+    turn_id = "history"
+    items: list[NewConversationItem] = []
+    for record in records:
+        payload = cast(dict[str, object], record["payload"])
+        kind = record.get("type")
+        if kind == "session_meta":
+            cwd = payload.get("cwd")
+            if isinstance(cwd, str) and cwd.strip():
+                workspace = cwd.strip()
+        elif kind == "turn_context":
+            candidate = payload.get("turn_id")
+            if isinstance(candidate, str) and candidate:
+                turn_id = candidate
+        elif kind == "compacted":
+            compaction = _codex_compaction_item(payload)
+            if compaction is not None:
+                items.append(compaction)
+        elif kind == "response_item":
+            item = _codex_response_item(payload, response_id=f"codex:{turn_id}")
+            if item is not None:
+                items.append(item)
+    return items, workspace
+
+
+# Session JSON the server reassembles for one import, less room for its fields besides items.
+_MAX_IMPORT_ITEMS_JSON_CHARS = IMPORT_SESSION_MAX_REASSEMBLED_CHARS - 64 * 1024
+
+
+def _import_items_json_chars(items: Sequence[NewConversationItem]) -> int:
+    """Length of the items' JSON array as sent, without building the whole string."""
+    sizes = [len(json.dumps(import_item_payload(item))) for item in items]
+    return 2 + sum(sizes) + 2 * max(len(sizes) - 1, 0)
+
+
+def _codex_items_within_import_cap(
+    items: list[NewConversationItem],
+) -> list[NewConversationItem]:
+    """Trim an import too large to send whole to its last compaction onward.
+
+    Within ``MAX_IMPORT_ITEMS`` items and the server's session-size cap, the whole history
+    imports. Past either, keep the last compaction item and everything after it.
+    Without a compaction, nothing is trimmed.
+    """
+    if (
+        len(items) <= MAX_IMPORT_ITEMS
+        and _import_items_json_chars(items) <= _MAX_IMPORT_ITEMS_JSON_CHARS
+    ):
+        return items
+    trimmed = from_last_compaction(items)
+    return items if trimmed is None else list(trimmed)
 
 
 def load_codex_session(
@@ -260,44 +1041,32 @@ def load_codex_session(
     *,
     codex_home: Path | None = None,
 ) -> LocalSessionImport:
-    """Load one Codex session from its local rollout JSONL file."""
-    configured_home = os.environ.get("CODEX_HOME")
-    home = codex_home or (Path(configured_home).expanduser() if configured_home else None)
-    home = home or Path.home() / ".codex"
-    rollout_path = _find_codex_rollout(home, session_id) or _find_archived_codex_rollout(
-        home, session_id
-    )
-    if rollout_path is None:
+    """Load one Codex thread: thread-store rollout, inherited fork history, compaction items."""
+    homes = _codex_storage_homes(codex_home)
+    rollouts = _codex_rollout_candidates(homes)
+    selected = _codex_thread_location(homes, session_id, rollouts)
+    if selected is None:
         raise SessionImportNotFoundError(f"Codex session {session_id!r} was not found")
+    rollout_path, home, thread_row = selected
 
-    workspace: str | None = None
-    turn_id = "history"
-    items: list[NewConversationItem] = []
-    with rollout_path.open(encoding="utf-8") as handle:
-        for line in handle:
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(record, dict) or not isinstance(record.get("payload"), dict):
-                continue
-            payload = record["payload"]
-            if record.get("type") == "session_meta":
-                cwd = payload.get("cwd")
-                if isinstance(cwd, str) and cwd.strip():
-                    workspace = cwd.strip()
-                continue
-            if record.get("type") == "turn_context":
-                candidate = payload.get("turn_id")
-                if isinstance(candidate, str) and candidate:
-                    turn_id = candidate
-                continue
-            if record.get("type") != "response_item":
-                continue
-            item = _codex_response_item(payload, response_id=f"codex:{turn_id}")
-            if item is not None:
-                items.append(item)
-
+    own_records = _codex_rollout_records(rollout_path)
+    first = next(own_records, None)
+    meta: dict[str, object] = (
+        cast(dict[str, object], first["payload"])
+        if first is not None and first.get("type") == "session_meta"
+        else {}
+    )
+    own_ids = _codex_rollout_ids(rollout_path)
+    inherited = _codex_inherited_records(
+        _unique_paths((home, *homes)),
+        rollouts,
+        meta,
+        seen={own_ids[1] if own_ids is not None else session_id},
+    )
+    items, workspace = _codex_items_from_records(
+        chain(inherited, [] if first is None else [first], own_records)
+    )
+    items = _codex_items_within_import_cap(items)
     if not items:
         raise SessionImportNotFoundError(f"Codex session {session_id!r} has no importable history")
     return LocalSessionImport(
@@ -305,6 +1074,793 @@ def load_codex_session(
         external_session_id=session_id,
         workspace=workspace,
         items=tuple(items),
+        native_title=_codex_native_title(home, session_id, thread_row),
+        archived=_codex_thread_archived(home, thread_row, rollout_path),
+    )
+
+
+def _qwen_message_data(record: dict[str, object]) -> dict[str, object] | None:
+    """Convert one visible Qwen recording row to Omnigent message data."""
+    # Qwen records assistant events as type="assistant" while message.role is "model".
+    record_type = record.get("type")
+    if record_type == "user":
+        role = "user"
+        content_type = "input_text"
+    elif record_type == "assistant":
+        role = "assistant"
+        content_type = "output_text"
+    else:
+        return None
+    message = record.get("message")
+    if not isinstance(message, dict) or not isinstance(message.get("parts"), list):
+        return None
+    content = [
+        {"type": content_type, "text": part["text"]}
+        for part in message["parts"]
+        if isinstance(part, dict) and isinstance(part.get("text"), str) and part["text"]
+    ]
+    if not content:
+        return None
+    data: dict[str, object] = {"role": role, "content": content}
+    if role == "assistant":
+        data["agent"] = "qwen-native-ui"
+    return data
+
+
+def _qwen_active_branch(records: list[dict[str, object]]) -> list[dict[str, object]]:
+    """Return Qwen records on the current leaf's root-to-leaf path."""
+    linked = [record for record in records if isinstance(record.get("uuid"), str)]
+    if not linked or all("parentUuid" not in record for record in linked):
+        return records
+    by_id = {record["uuid"]: record for record in linked}
+    if len(by_id) != len(linked):
+        return []
+
+    branch: list[dict[str, object]] = []
+    current = linked[-1]
+    seen: set[str] = set()
+    while True:
+        record_id = current["uuid"]
+        if not isinstance(record_id, str) or record_id in seen:
+            return []
+        seen.add(record_id)
+        branch.append(current)
+        parent_id = current.get("parentUuid")
+        if parent_id is None:
+            branch.reverse()
+            return branch
+        if not isinstance(parent_id, str) or parent_id not in by_id:
+            return []
+        current = by_id[parent_id]
+
+
+def load_qwen_session(
+    session_id: str,
+    *,
+    qwen_home: Path | None = None,
+) -> LocalSessionImport:
+    """Load one Qwen Code session from its project chat recording."""
+    configured_home = os.environ.get("QWEN_HOME")
+    home = qwen_home or (Path(configured_home).expanduser() if configured_home else None)
+    root = (home or Path.home() / ".qwen") / "projects"
+    qualified = ":" in session_id
+    matches = [
+        path
+        for path in root.glob("*/chats/*.jsonl")
+        if path.is_file()
+        and (_qwen_session_locator(path) == session_id if qualified else path.stem == session_id)
+    ]
+    if not matches:
+        raise SessionImportNotFoundError(f"Qwen Code session {session_id!r} was not found")
+    if len(matches) > 1:
+        choices = ", ".join(sorted(_qwen_session_locator(path) for path in matches))
+        raise SessionImportNotFoundError(
+            f"Qwen Code session {session_id!r} is ambiguous; use one of: {choices}"
+        )
+    transcript_path = matches[0]
+
+    records: list[dict[str, object]] = []
+    with transcript_path.open(encoding="utf-8") as handle:
+        for line in handle:
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(record, dict):
+                continue
+            records.append(record)
+
+    workspace: str | None = None
+    items: list[NewConversationItem] = []
+    for record_number, record in enumerate(_qwen_active_branch(records), start=1):
+        if workspace is None:
+            cwd = record.get("cwd")
+            if isinstance(cwd, str) and cwd.strip():
+                workspace = cwd.strip()
+        data = _qwen_message_data(record)
+        if data is None:
+            continue
+        record_id = record.get("uuid")
+        response_id = (
+            f"qwen:{record_id}"
+            if isinstance(record_id, str) and record_id
+            else f"qwen:{record_number}"
+        )
+        items.append(
+            NewConversationItem(
+                type="message",
+                response_id=_bounded_response_id(response_id),
+                data=parse_item_data("message", data),
+            )
+        )
+    if not items:
+        raise SessionImportNotFoundError(
+            f"Qwen Code session {session_id!r} has no importable history"
+        )
+    return LocalSessionImport(
+        source="qwen",
+        external_session_id=_qwen_session_locator(transcript_path),
+        workspace=workspace,
+        items=tuple(items),
+    )
+
+
+def load_kiro_session(
+    session_id: str,
+    *,
+    kiro_home: Path | None = None,
+) -> LocalSessionImport:
+    """Load one Kiro CLI session from its metadata and JSONL transcript."""
+    root = kiro_cli_sessions_dir(kiro_home)
+    transcript_path = next(
+        (path for path in root.glob("*.jsonl") if path.is_file() and path.stem == session_id),
+        None,
+    )
+    if transcript_path is None:
+        raise SessionImportNotFoundError(f"Kiro session {session_id!r} was not found")
+    metadata_path = transcript_path.with_suffix(".json")
+    if not metadata_path.is_file():
+        raise SessionImportNotFoundError(f"Kiro session {session_id!r} was not found")
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise SessionImportNotFoundError(
+            f"Kiro session {session_id!r} has unreadable metadata"
+        ) from exc
+    workspace_value = metadata.get("cwd") if isinstance(metadata, dict) else None
+    workspace = workspace_value.strip() if isinstance(workspace_value, str) else None
+    try:
+        messages = [
+            message
+            for line in transcript_path.read_text(encoding="utf-8").splitlines()
+            if (message := parse_kiro_jsonl_line(line)) is not None
+        ]
+    except OSError as exc:
+        raise SessionImportNotFoundError(
+            f"Kiro session {session_id!r} has an unreadable transcript"
+        ) from exc
+    items = tuple(
+        NewConversationItem(
+            type="message",
+            response_id=_bounded_response_id(f"kiro:{message.message_id}"),
+            data=parse_item_data(
+                "message",
+                {
+                    "role": message.role,
+                    **({"agent": "kiro-native-ui"} if message.role == "assistant" else {}),
+                    "content": [
+                        {
+                            "type": "output_text" if message.role == "assistant" else "input_text",
+                            "text": message.text,
+                        }
+                    ],
+                },
+            ),
+        )
+        for message in messages
+    )
+    if not items:
+        raise SessionImportNotFoundError(f"Kiro session {session_id!r} has no importable history")
+    return LocalSessionImport(
+        source="kiro",
+        external_session_id=session_id,
+        workspace=workspace or None,
+        items=items,
+    )
+
+
+def _pi_text(content: object) -> str:
+    """Flatten Pi string or typed-text content."""
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    return "".join(
+        block["text"]
+        for block in content
+        if isinstance(block, dict)
+        and block.get("type") == "text"
+        and isinstance(block.get("text"), str)
+    )
+
+
+def _pi_message_content(content: object, *, role: str) -> list[dict[str, object]]:
+    """Map Pi text and user-image blocks without changing their order."""
+    content_type = "input_text" if role == "user" else "output_text"
+    if isinstance(content, str):
+        return [{"type": content_type, "text": content}] if content else []
+    if not isinstance(content, list):
+        return []
+    normalized: list[dict[str, object]] = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        text = block.get("text")
+        if block.get("type") == "text" and isinstance(text, str) and text:
+            normalized.append({"type": content_type, "text": text})
+            continue
+        data = block.get("data")
+        mime_type = block.get("mimeType")
+        if (
+            role == "user"
+            and block.get("type") == "image"
+            and isinstance(data, str)
+            and data
+            and isinstance(mime_type, str)
+            and mime_type.startswith("image/")
+        ):
+            normalized.append(
+                {"type": "input_image", "image_url": f"data:{mime_type};base64,{data}"}
+            )
+    return normalized
+
+
+def _pi_active_branch(records: list[dict[str, object]]) -> list[dict[str, object]]:
+    """Return Pi entries on the current leaf's root-to-leaf path."""
+    header = next((record for record in records if record.get("type") == "session"), {})
+    version = header.get("version")
+    if not isinstance(version, int) or version < 2:
+        legacy_parent_id: str | None = None
+        migrated: list[dict[str, object]] = []
+        for index, record in enumerate(records):
+            if record.get("type") == "session":
+                migrated.append(record)
+                continue
+            entry = dict(record)
+            legacy_entry_id = f"legacy-{index}"
+            entry["id"] = legacy_entry_id
+            entry["parentId"] = legacy_parent_id
+            if entry.get("type") == "compaction":
+                kept_index = entry.get("firstKeptEntryIndex")
+                if type(kept_index) is int and 0 < kept_index <= index:
+                    entry["firstKeptEntryId"] = f"legacy-{kept_index}"
+            migrated.append(entry)
+            legacy_parent_id = legacy_entry_id
+        records = migrated
+    entries = [
+        record
+        for record in records
+        if record.get("type") != "session" and isinstance(record.get("id"), str)
+    ]
+    if not entries:
+        return []
+    if all("parentId" not in entry for entry in entries):
+        return entries
+    by_id = {entry["id"]: entry for entry in entries}
+    if len(by_id) != len(entries):
+        return []
+    branch: list[dict[str, object]] = []
+    current = entries[-1]
+    seen: set[str] = set()
+    while True:
+        entry_id = current["id"]
+        if not isinstance(entry_id, str) or entry_id in seen:
+            return []
+        seen.add(entry_id)
+        branch.append(current)
+        parent_id = current.get("parentId")
+        if parent_id is None:
+            branch.reverse()
+            return branch
+        if not isinstance(parent_id, str) or parent_id not in by_id:
+            return []
+        current = by_id[parent_id]
+
+
+def _pi_message_items(
+    record: dict[str, object], *, text_only: bool = False
+) -> tuple[NewConversationItem, ...]:
+    """Convert one Pi message entry to visible Omnigent items."""
+    if record.get("type") == "branch_summary":
+        summary = record.get("summary")
+        if not isinstance(summary, str) or not summary:
+            return ()
+        entry_id = record.get("id")
+        response_id = f"pi:{entry_id}" if isinstance(entry_id, str) else "pi:history"
+        return (
+            NewConversationItem(
+                type="message",
+                response_id=_bounded_response_id(response_id),
+                data=parse_item_data(
+                    "message",
+                    {
+                        "role": "user",
+                        "is_meta": True,
+                        "content": [
+                            {
+                                "type": "input_text",
+                                "text": (
+                                    "The following is a summary of a branch that this "
+                                    "conversation came back from:\n\n<summary>\n"
+                                    f"{summary}\n</summary>"
+                                ),
+                            }
+                        ],
+                    },
+                ),
+            ),
+        )
+    message = record.get("message")
+    if record.get("type") != "message" or not isinstance(message, dict):
+        return ()
+    entry_id = record.get("id")
+    response_id = f"pi:{entry_id}" if isinstance(entry_id, str) else "pi:history"
+    role = message.get("role")
+    if role == "toolResult":
+        call_id = message.get("toolCallId")
+        if not isinstance(call_id, str) or not call_id:
+            return ()
+        return (
+            NewConversationItem(
+                type="function_call_output",
+                response_id=_bounded_response_id(response_id),
+                data=parse_item_data(
+                    "function_call_output",
+                    {"call_id": call_id, "output": _pi_text(message.get("content"))},
+                ),
+            ),
+        )
+    if role not in {"user", "assistant"}:
+        return ()
+
+    items: list[NewConversationItem] = []
+    content = message.get("content")
+    if role == "user":
+        normalized = _pi_message_content(_pi_text(content) if text_only else content, role=role)
+        if not normalized:
+            return ()
+        items.append(
+            NewConversationItem(
+                type="message",
+                response_id=_bounded_response_id(response_id),
+                data=parse_item_data(
+                    "message",
+                    {"role": "user", "content": normalized},
+                ),
+            )
+        )
+        return tuple(items)
+
+    interrupted = message.get("stopReason") == "aborted"
+
+    def append_assistant_text(blocks: list[dict[str, object]]) -> None:
+        if not blocks:
+            return
+        data: dict[str, object] = {
+            "role": "assistant",
+            "agent": "pi-native-ui",
+            "content": blocks,
+        }
+        if interrupted:
+            data["interrupted"] = True
+        items.append(
+            NewConversationItem(
+                type="message",
+                response_id=_bounded_response_id(response_id),
+                data=parse_item_data("message", data),
+            )
+        )
+
+    if isinstance(content, str):
+        append_assistant_text(_pi_message_content(content, role="assistant"))
+    elif isinstance(content, list):
+        pending_text: list[dict[str, object]] = []
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "text":
+                pending_text.extend(_pi_message_content([block], role="assistant"))
+                continue
+            if block.get("type") != "toolCall":
+                continue
+            append_assistant_text(pending_text)
+            pending_text = []
+            call_id = block.get("id")
+            name = block.get("name")
+            if (
+                not isinstance(call_id, str)
+                or not call_id
+                or not isinstance(name, str)
+                or not name
+            ):
+                continue
+            arguments = block.get("arguments")
+            serialized_arguments = (
+                arguments
+                if isinstance(arguments, str)
+                else json.dumps(arguments if arguments is not None else {}, separators=(",", ":"))
+            )
+            # Only message items support interrupted state; retain aborted-turn tool calls.
+            items.append(
+                NewConversationItem(
+                    type="function_call",
+                    response_id=_bounded_response_id(response_id),
+                    data=parse_item_data(
+                        "function_call",
+                        {
+                            "agent": "pi-native-ui",
+                            "name": name,
+                            "arguments": serialized_arguments,
+                            "call_id": call_id,
+                        },
+                    ),
+                )
+            )
+        append_assistant_text(pending_text)
+    return tuple(items)
+
+
+def _pi_compaction_item(
+    branch: list[dict[str, object]], index: int
+) -> tuple[NewConversationItem, ...]:
+    """Keep a checkpoint alongside history for the shared native resume converter."""
+    checkpoint = branch[index]
+    summary = checkpoint.get("summary")
+    if not isinstance(summary, str) or not summary.strip():
+        return ()
+    first_kept = checkpoint.get("firstKeptEntryId")
+    kept_index = next(
+        (position for position in range(index + 1) if branch[position]["id"] == first_kept),
+        None,
+    )
+    # A damaged boundary cannot justify discarding any of the readable history.
+    if kept_index is None:
+        return ()
+    # Match the live extension's text-only resume snapshot; keep images in history.
+    snapshot = [
+        {
+            "type": "message",
+            "role": "user",
+            "content": [
+                {
+                    "type": "input_text",
+                    "text": "The conversation history before this point was compacted into "
+                    f"the following summary:\n\n<summary>\n{summary}\n</summary>",
+                }
+            ],
+        },
+        *(
+            {"type": item.type, **item.data.model_dump()}
+            for record in branch[kept_index:index]
+            for item in _pi_message_items(record, text_only=True)
+        ),
+    ]
+    return (
+        NewConversationItem(
+            type="compaction",
+            response_id=_bounded_response_id(f"pi:{checkpoint['id']}"),
+            data=parse_item_data(
+                "compaction",
+                {
+                    "summary": summary,
+                    "last_item_id": "",
+                    "token_count": (len(summary) + 3) // 4,
+                    "window_id": checkpoint["id"],
+                    "compacted_messages": snapshot,
+                },
+            ),
+        ),
+    )
+
+
+def load_pi_session(
+    session_id: str,
+    *,
+    pi_home: Path | None = None,
+) -> LocalSessionImport:
+    """Load the active branch of one Pi coding-agent JSONL session."""
+    configured_home = os.environ.get("PI_CODING_AGENT_DIR")
+    home = pi_home or (Path(configured_home).expanduser() if configured_home else None)
+    root = (home or Path.home() / ".pi" / "agent") / "sessions"
+    if not _is_safe_pi_import_session_id(session_id):
+        raise SessionImportNotFoundError(f"Pi session {session_id!r} was not found")
+    matches = [
+        path
+        for path in root.rglob("*.jsonl")
+        if path.is_file() and _pi_session_id_from_path(path) == session_id
+    ]
+    if not matches:
+        raise SessionImportNotFoundError(f"Pi session {session_id!r} was not found")
+    if len(matches) > 1:
+        raise SessionImportNotFoundError(f"Pi session {session_id!r} is ambiguous across projects")
+    transcript_path = matches[0]
+    records: list[dict[str, object]] = []
+    with transcript_path.open(encoding="utf-8") as handle:
+        for line in handle:
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(record, dict):
+                records.append(record)
+    header = next((record for record in records if record.get("type") == "session"), {})
+    if header.get("id") != session_id:
+        raise SessionImportNotFoundError(
+            f"Pi session {session_id!r} has mismatched transcript metadata"
+        )
+    workspace_value = header.get("cwd")
+    workspace = workspace_value.strip() if isinstance(workspace_value, str) else None
+    branch = _pi_active_branch(records)
+    items = tuple(
+        item
+        for index, record in enumerate(branch)
+        for item in (
+            _pi_compaction_item(branch, index)
+            if record.get("type") == "compaction"
+            else _pi_message_items(record)
+        )
+    )
+    if not items:
+        raise SessionImportNotFoundError(f"Pi session {session_id!r} has no importable history")
+    return LocalSessionImport(
+        source="pi",
+        external_session_id=session_id,
+        workspace=workspace or None,
+        items=items,
+    )
+
+
+def load_kimi_session(
+    session_id: str,
+    *,
+    kimi_home: Path | None = None,
+) -> LocalSessionImport:
+    """Load one Kimi Code session from its append-only wire log."""
+    home = kimi_home or resolve_user_kimi_home()
+    matches = [
+        path
+        for path in (home / "sessions").glob("*/session_*/agents/main/wire.jsonl")
+        if path.is_file() and path.parent.parent.parent.name == session_id
+    ]
+    if not matches:
+        raise SessionImportNotFoundError(f"Kimi session {session_id!r} was not found")
+    if len(matches) > 1:
+        raise SessionImportNotFoundError(
+            f"Kimi session {session_id!r} is ambiguous across workspaces"
+        )
+    wire_path = matches[0]
+    session_dir = wire_path.parent.parent.parent
+    workspace_value = workdirs_for_kimi_sessions(home).get(str(session_dir))
+    workspace = workspace_value.strip() if isinstance(workspace_value, str) else None
+    mirrored = read_kimi_wire_items(wire_path, 0)
+    items = tuple(
+        NewConversationItem(
+            type="message",
+            response_id=_bounded_response_id(item.response_id),
+            data=parse_item_data(
+                "message",
+                {
+                    "role": item.role,
+                    **({"agent": "kimi-native-ui"} if item.role == "assistant" else {}),
+                    "content": [
+                        {
+                            "type": "output_text" if item.role == "assistant" else "input_text",
+                            "text": item.text,
+                        }
+                    ],
+                },
+            ),
+        )
+        for item in mirrored
+        if item.kind == "message"
+    )
+    if not items:
+        raise SessionImportNotFoundError(f"Kimi session {session_id!r} has no importable history")
+    return LocalSessionImport(
+        source="kimi",
+        external_session_id=session_id,
+        workspace=workspace or None,
+        items=items,
+    )
+
+
+def _opencode_file_content(
+    part: dict[str, object],
+    *,
+    role: str,
+) -> dict[str, object] | None:
+    """Convert one exported OpenCode file part to a durable content block."""
+    mime = part.get("mime")
+    url = part.get("url")
+    if isinstance(mime, str) and mime.startswith("image/") and isinstance(url, str) and url:
+        return {
+            "type": "input_image" if role == "user" else "output_image",
+            "image_url": url,
+        }
+    filename = part.get("filename")
+    label = filename if isinstance(filename, str) and filename else mime
+    if not isinstance(label, str) or not label:
+        label = "attachment"
+    return {
+        "type": "input_text" if role == "user" else "output_text",
+        "text": f"[attachment: {label}]",
+    }
+
+
+def _opencode_message_items(
+    message: dict[str, object],
+    *,
+    message_number: int,
+) -> tuple[NewConversationItem, ...]:
+    """Normalize one exported OpenCode message while preserving part order."""
+    info = message.get("info")
+    parts = message.get("parts")
+    if not isinstance(info, dict) or not isinstance(parts, list):
+        return ()
+    role = info.get("role")
+    if role not in {"user", "assistant"}:
+        return ()
+    message_id = info.get("id")
+    native_id = message_id if isinstance(message_id, str) and message_id else str(message_number)
+    response_id = _bounded_response_id(f"opencode:{native_id}")
+    items: list[NewConversationItem] = []
+    pending_content: list[dict[str, object]] = []
+
+    def flush_content() -> None:
+        if not pending_content:
+            return
+        data: dict[str, object] = {"role": role, "content": list(pending_content)}
+        if role == "assistant":
+            data["agent"] = "opencode-native-ui"
+        items.append(
+            NewConversationItem(
+                type="message",
+                response_id=response_id,
+                data=parse_item_data("message", data),
+            )
+        )
+        pending_content.clear()
+
+    for raw_part in parts:
+        if not isinstance(raw_part, dict):
+            continue
+        part: dict[str, object] = raw_part
+        part_type = part.get("type")
+        if part_type == "text":
+            text = part.get("text")
+            if isinstance(text, str) and text:
+                pending_content.append(
+                    {
+                        "type": "input_text" if role == "user" else "output_text",
+                        "text": text,
+                    }
+                )
+            continue
+        if part_type == "file":
+            content = _opencode_file_content(part, role=role)
+            if content is not None:
+                pending_content.append(content)
+            continue
+        if part_type == "step-finish":
+            flush_content()
+            continue
+        if part_type != "tool" or role != "assistant":
+            continue
+        flush_content()
+        call_id = part.get("callID")
+        name = part.get("tool")
+        state = part.get("state")
+        if (
+            not isinstance(call_id, str)
+            or not call_id
+            or not isinstance(name, str)
+            or not name
+            or not isinstance(state, dict)
+        ):
+            continue
+        arguments = state.get("input")
+        serialized_arguments = (
+            arguments
+            if isinstance(arguments, str)
+            else json.dumps(
+                arguments if arguments is not None else {},
+                separators=(",", ":"),
+                ensure_ascii=True,
+            )
+        )
+        items.append(
+            NewConversationItem(
+                type="function_call",
+                response_id=response_id,
+                data=parse_item_data(
+                    "function_call",
+                    {
+                        "agent": "opencode-native-ui",
+                        "name": name,
+                        "arguments": serialized_arguments,
+                        "call_id": call_id,
+                    },
+                ),
+            )
+        )
+        status = state.get("status")
+        output: str | None = None
+        if status == "completed":
+            output = opencode_tool_output_text(state)
+        elif status == "error":
+            error = state.get("error")
+            output = f"[error] {error}" if error else "[error]"
+        if output is not None:
+            items.append(
+                NewConversationItem(
+                    type="function_call_output",
+                    response_id=response_id,
+                    data=parse_item_data(
+                        "function_call_output",
+                        {"call_id": call_id, "output": output},
+                    ),
+                )
+            )
+    flush_content()
+    return tuple(items)
+
+
+def load_opencode_session(
+    session_id: str,
+    *,
+    opencode_path: str | None = None,
+) -> LocalSessionImport:
+    """Load one session through OpenCode's supported JSON export command."""
+    if not _is_safe_opencode_import_session_id(session_id):
+        raise SessionImportNotFoundError(f"OpenCode session {session_id!r} was not found")
+    payload = _run_opencode_json("export", session_id, "--pure", opencode_path=opencode_path)
+    if not isinstance(payload, dict):
+        raise SessionImportNotFoundError(
+            f"OpenCode session {session_id!r} returned an invalid export"
+        )
+    info = payload.get("info")
+    exported_id = info.get("id") if isinstance(info, dict) else None
+    if exported_id != session_id:
+        raise SessionImportNotFoundError(
+            f"OpenCode export id {exported_id!r} did not match {session_id!r}"
+        )
+    messages = payload.get("messages")
+    if not isinstance(messages, list):
+        messages = []
+    items = tuple(
+        item
+        for message_number, message in enumerate(messages, start=1)
+        if isinstance(message, dict)
+        for item in _opencode_message_items(message, message_number=message_number)
+    )
+    if not items:
+        raise SessionImportNotFoundError(
+            f"OpenCode session {session_id!r} has no importable history"
+        )
+    workspace_value = info.get("directory") if isinstance(info, dict) else None
+    workspace = workspace_value.strip() if isinstance(workspace_value, str) else None
+    # OpenCode auto-generates a session title (info.title); carry it as the
+    # native title instead of synthesizing from the first message.
+    title_value = info.get("title") if isinstance(info, dict) else None
+    native_title = (
+        title_value.strip() if isinstance(title_value, str) and title_value.strip() else None
+    )
+    return LocalSessionImport(
+        source="opencode",
+        external_session_id=session_id,
+        workspace=workspace or None,
+        items=items,
+        native_title=native_title,
     )
 
 
@@ -312,12 +1868,29 @@ def load_local_session(source: ImportSource, session_id: str) -> LocalSessionImp
     """Load one local session from the selected first-party harness."""
     if source == "claude":
         return load_claude_session(session_id)
-    return load_codex_session(session_id)
+    if source == "codex":
+        return load_codex_session(session_id)
+    if source == "qwen":
+        return load_qwen_session(session_id)
+    if source == "kiro":
+        return load_kiro_session(session_id)
+    if source == "pi":
+        return load_pi_session(session_id)
+    if source == "kimi":
+        return load_kimi_session(session_id)
+    if source == "opencode":
+        return load_opencode_session(session_id)
+    raise ValueError(f"Unsupported import source: {source}")
 
 
 __all__ = [
     "list_recent_local_session_ids",
     "load_claude_session",
     "load_codex_session",
+    "load_kimi_session",
+    "load_kiro_session",
     "load_local_session",
+    "load_opencode_session",
+    "load_pi_session",
+    "load_qwen_session",
 ]

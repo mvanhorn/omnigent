@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import secrets
 from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -273,6 +274,7 @@ class _FakeReq:
     ) -> None:
         self.cookies = cookies or {}
         self.headers = headers or {}
+        self.scope: dict[str, object] = {}
 
 
 def test_accounts_source_reads_valid_cookie() -> None:
@@ -437,7 +439,6 @@ def test_resolve_auth_source_defaults_to_header(
     """
     monkeypatch.delenv("OMNIGENT_AUTH_PROVIDER", raising=False)
     monkeypatch.delenv("OMNIGENT_AUTH_ENABLED", raising=False)
-    monkeypatch.delenv("OMNIGENT_ACCOUNTS_ENABLED", raising=False)
     assert resolve_auth_source() == "header"
 
 
@@ -483,40 +484,7 @@ def test_resolve_auth_source_oidc_issuer_ignored_when_auth_disabled(
     """
     monkeypatch.delenv("OMNIGENT_AUTH_PROVIDER", raising=False)
     monkeypatch.delenv("OMNIGENT_AUTH_ENABLED", raising=False)
-    monkeypatch.delenv("OMNIGENT_ACCOUNTS_ENABLED", raising=False)
     monkeypatch.setenv("OMNIGENT_OIDC_ISSUER", "https://accounts.google.com")
-    assert resolve_auth_source() == "header"
-
-
-def test_resolve_auth_source_deprecated_alias_still_selects_accounts(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The pre-rename ``OMNIGENT_ACCOUNTS_ENABLED`` alias still works.
-
-    Existing deploys that set the old name must keep booting in accounts
-    mode after the rename. If this regressed, an upgrade would silently
-    drop those deploys back to single-user header mode (no login).
-    """
-    monkeypatch.delenv("OMNIGENT_AUTH_PROVIDER", raising=False)
-    monkeypatch.delenv("OMNIGENT_AUTH_ENABLED", raising=False)
-    monkeypatch.setenv("OMNIGENT_ACCOUNTS_ENABLED", "1")
-    assert resolve_auth_source() == "accounts"
-
-
-def test_resolve_auth_source_new_var_wins_over_deprecated_alias(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The current name wins when both names are set.
-
-    A deploy migrating to ``OMNIGENT_AUTH_ENABLED`` can leave the old
-    ``OMNIGENT_ACCOUNTS_ENABLED`` in place: an explicit ``=0`` on the
-    new name disables auth even though the old name is truthy. If the
-    alias took precedence the new value would be unsettable while the
-    old one lingered.
-    """
-    monkeypatch.delenv("OMNIGENT_AUTH_PROVIDER", raising=False)
-    monkeypatch.setenv("OMNIGENT_AUTH_ENABLED", "0")
-    monkeypatch.setenv("OMNIGENT_ACCOUNTS_ENABLED", "1")
     assert resolve_auth_source() == "header"
 
 
@@ -551,7 +519,6 @@ def test_factory_defaults_to_header_when_env_unset(
     """
     monkeypatch.delenv("OMNIGENT_AUTH_PROVIDER", raising=False)
     monkeypatch.delenv("OMNIGENT_AUTH_ENABLED", raising=False)
-    monkeypatch.delenv("OMNIGENT_ACCOUNTS_ENABLED", raising=False)
 
     provider = create_auth_provider()
 
@@ -1004,6 +971,7 @@ def _build_accounts_app(
         admin is created and ``/v1/info`` reports ``needs_setup``.
     """
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / ".omnigent"))
     # Accounts is the default provider now, but pin it explicitly
     # so this fixture doesn't depend on the global default.
     monkeypatch.setenv("OMNIGENT_AUTH_PROVIDER", "accounts")
@@ -1585,6 +1553,52 @@ def test_admin_cannot_delete_last_admin(accounts_app: TestClient) -> None:
     assert "self" in resp.json()["error"].lower() or "last admin" in resp.json()["error"].lower()
 
 
+def test_concurrent_deletes_cannot_leave_zero_admins(tmp_path: Path) -> None:
+    """Two concurrent deletes of two *different* admins can't both apply.
+
+    Regression test for a TOCTOU race: a naive read-then-delete
+    ("are there other admins? if so, delete") checks and writes in
+    two separate transactions. If two admins are deleted at once,
+    each request's read can see the *other* as the remaining admin,
+    both checks pass, and the deploy ends up with zero admins and no
+    recovery path. ``AccountStore.delete_user`` closes this by
+    locking the admin set before counting it (``BEGIN IMMEDIATE`` on
+    SQLite), so the second writer blocks and re-observes the
+    up-to-date count instead of the stale one.
+
+    Runs the two deletes as real concurrent threads against the same
+    on-disk SQLite database — not a simulated interleave — so it
+    actually exercises the locking, not just the application logic.
+    """
+    import threading
+
+    db_url = f"sqlite:///{tmp_path}/test.db"
+    store = SqlAlchemyAccountStore(db_url)
+    store.create_user_with_password("alice", hash_password("alice-pw-1234"), is_admin=True)
+    store.create_user_with_password("bob", hash_password("bob-pw-1234"), is_admin=True)
+
+    results: dict[str, bool | None] = {}
+    barrier = threading.Barrier(2)
+
+    def delete(user_id: str) -> None:
+        barrier.wait()  # maximize the chance both threads race the same window
+        results[user_id] = store.delete_user(user_id)
+
+    threads = [threading.Thread(target=delete, args=(uid,)) for uid in ("alice", "bob")]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+
+    remaining_admins = {u.id for u in store.list_users() if u.is_admin}
+    assert remaining_admins, (
+        f"last-admin invariant violated: {remaining_admins=} results={results}"
+    )
+    # Exactly one delete should have been refused (whichever ran second
+    # relative to the DB lock); the other applied.
+    assert sorted(results.values()) == [False, True]
+
+
 def test_admin_reset_returns_new_plaintext_once(
     accounts_app: TestClient,
 ) -> None:
@@ -1645,6 +1659,65 @@ def test_admin_can_delete_normal_member(accounts_app: TestClient) -> None:
 
     post = admin.get("/auth/users").json()
     assert "alice" not in {u["id"] for u in post["users"]}
+
+
+def test_delete_user_revokes_durable_authority(accounts_app: TestClient, tmp_path: Path) -> None:
+    """Deleting a user also kills everything that could act as them later.
+
+    Scheduled tasks are disabled, refresh grants revoked, hosts removed,
+    and an already-issued session cookie stops authenticating — all in
+    the same request, so a deleted identity cannot keep running
+    unattended work or minting new tokens.
+    """
+    import os
+    import uuid
+
+    from omnigent.server.device_grant_store import DeviceGrantStore, hash_secret
+    from omnigent.stores.host_store import HostStore
+    from omnigent.stores.scheduled_task_store.sqlalchemy_store import (
+        SqlAlchemyScheduledTaskStore,
+    )
+
+    db_url = f"sqlite:///{tmp_path}/test.db"
+    cookie_secret = bytes.fromhex(os.environ["OMNIGENT_ACCOUNTS_COOKIE_SECRET"])
+    admin = _login(accounts_app, "admin", "admin-pw-12345")
+    invite = admin.post("/auth/invite", json={}).json()["token"]
+    alice = TestClient(accounts_app.app)
+    r = alice.post(
+        "/auth/register",
+        json={"invite": invite, "username": "alice", "password": "alice-pw-1234"},
+    )
+    assert r.status_code == 200, r.text
+    r = alice.post(
+        "/auth/login",
+        json={"username": "alice", "password": "alice-pw-1234", "issue_refresh": True},
+    )
+    assert r.status_code == 200, r.text
+    refresh_token = r.json()["refresh_token"]
+    assert alice.get("/auth/me").status_code == 200
+
+    tasks = SqlAlchemyScheduledTaskStore(db_url)
+    task = tasks.create(
+        uuid.uuid4().hex, "nightly", "do it", "FREQ=DAILY", "alice", uuid.uuid4().hex, "UTC"
+    )
+    hosts = HostStore(db_url)
+    host = hosts.upsert_on_connect(uuid.uuid4().hex, "laptop", "alice")
+    grants = DeviceGrantStore(db_url)
+    grant = grants.get_by_refresh_hash(hash_secret(refresh_token, cookie_secret))
+    assert grant is not None and grant.user_id == "alice"
+
+    resp = admin.delete("/auth/users/alice")
+    assert resp.status_code == 204, resp.text
+
+    got = tasks.get(task.id)
+    assert got is not None and got.state == "deleted"
+    assert tasks.list_active() == []
+    assert grants.is_revoked(grant.id)
+    assert grants.get_by_refresh_hash(hash_secret(refresh_token, cookie_secret)) is None
+    assert hosts.get_host(host.host_id) is None
+    assert hosts.list_hosts("alice") == []
+    # The still-signed cookie no longer authenticates.
+    assert alice.get("/auth/me").status_code == 401
 
 
 def test_change_own_password_round_trip(accounts_app: TestClient) -> None:
@@ -1796,13 +1869,18 @@ def test_cli_accounts_login_happy_path_stores_token(
         calls["n"] += 1
         assert url.endswith("/auth/login")
         body = kw["json"]
-        assert body == {"username": "alice", "password": "alice-pw-1234"}
+        assert body == {
+            "username": "alice",
+            "password": "alice-pw-1234",
+            "issue_refresh": True,
+        }
         return _FakeResponse(
             200,
             {
                 "token": "fake.jwt.token",
                 "user": {"id": "alice", "is_admin": False},
                 "expires_in": 8 * 3600,
+                "refresh_token": "fake.refresh.token",
             },
         )
 
@@ -1821,6 +1899,9 @@ def test_cli_accounts_login_happy_path_stores_token(
     assert "Logged in as alice" in result.output
     # The store_token side effect lands in ~/.omnigent/auth_tokens.json.
     assert cli_auth.load_token("http://localhost:8000") == "fake.jwt.token"
+    # The refresh token from /auth/login must also be persisted when present.
+    entry = cli_auth._load_entry("http://localhost:8000")
+    assert entry is not None and entry.get("refresh_token") == "fake.refresh.token"
 
 
 def test_cli_accounts_login_wrong_password_surfaces_clean_error(
@@ -1955,6 +2036,45 @@ def test_setup_creates_first_admin_and_signs_in(
     assert info_after["needs_setup"] is False
 
 
+def test_setup_after_saving_no_auth_project_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Saved local preferences must not prevent first-admin setup."""
+    from sqlalchemy.orm import Session
+
+    from omnigent.db.db_models import SqlUser
+    from omnigent.db.utils import get_or_create_engine
+    from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
+
+    db_url = f"sqlite:///{tmp_path}/test.db"
+    project_store = SqlAlchemyProjectStore(db_url)
+    # Migrations seed a local admin; exercise preferences without an account.
+    with Session(get_or_create_engine(db_url)) as session:
+        local = session.get(SqlUser, (0, "local"))
+        if local is not None:
+            session.delete(local)
+            session.commit()
+    project = project_store.create("a" * 32, "Local project", None)
+    project_store.save_order([project.id], user_id=None)
+    with Session(get_or_create_engine(db_url)) as session:
+        assert session.get(SqlUser, (0, "local")) is None
+
+    with contextmanager(_build_accounts_app)(
+        tmp_path, monkeypatch, init_admin_password=None
+    ) as client:
+        assert client.get("/v1/info").json()["needs_setup"] is True
+        response = client.post(
+            "/auth/setup", json={"username": "alice", "password": "alice-pw-12345"}
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["user"]["is_admin"] is True
+        me = client.get("/auth/me")
+        assert me.status_code == 200, me.text
+        assert me.json()["id"] == "alice"
+        assert client.get("/v1/info").json()["needs_setup"] is False
+        assert project_store.get_order(user_id=None) == [project.id]
+
+
 def test_setup_writes_loopback_cli_token(
     accounts_app_needs_setup: TestClient,
 ) -> None:
@@ -2010,3 +2130,47 @@ def test_setup_is_single_use(accounts_app_needs_setup: TestClient) -> None:
     user_ids = {u["id"] for u in client.get("/auth/users").json()["users"]}
     assert "alice" in user_ids
     assert "bob" not in user_ids
+
+
+def test_browser_login_never_issues_refresh_token(accounts_app: TestClient) -> None:
+    """Regression: browser /auth/login (no issue_refresh) must never return a
+    refresh_token. Gating is on the request field so the web form, which never
+    sends it, cannot receive long-lived unattended credentials under XSS or
+    form-hijack.
+    """
+    resp = accounts_app.post(
+        "/auth/login",
+        json={"username": "admin", "password": "admin-pw-12345"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert "refresh_token" not in resp.json()
+
+
+def test_cli_login_with_issue_refresh_issues_grant(accounts_app: TestClient) -> None:
+    """``POST /auth/login`` with ``issue_refresh=True`` returns a usable refresh_token.
+
+    The CLI sends this flag; unattended hosts can renew past session-JWT expiry
+    via /oauth/token without a human re-running ``omnigent login``.
+    """
+    resp = accounts_app.post(
+        "/auth/login",
+        json={"username": "admin", "password": "admin-pw-12345", "issue_refresh": True},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+
+    assert "token" in body
+    assert "refresh_token" in body
+    refresh_token = body["refresh_token"]
+    assert isinstance(refresh_token, str) and len(refresh_token) > 10
+
+    # The refresh token must be immediately usable at /oauth/token.
+    refresh_resp = accounts_app.post(
+        "/oauth/token",
+        data={"grant_type": "refresh_token", "refresh_token": refresh_token},
+    )
+    assert refresh_resp.status_code == 200, refresh_resp.text
+    refresh_body = refresh_resp.json()
+    assert "access_token" in refresh_body
+    # Login grants don't rotate — same token is returned.
+    assert refresh_body["refresh_token"] == refresh_token

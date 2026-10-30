@@ -1,9 +1,20 @@
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
+
+_logger = logging.getLogger(__name__)
+
+# How a session gets its host, in the server's own ``host_type`` vocabulary.
+# ``external``: the session runs on a host the caller registered with
+# ``omni host`` and keeps online. ``managed``: the server provisions a sandbox
+# from its ``sandbox:`` config, chooses the host and workspace itself, and binds
+# the session to it — so the bot must not send a host id or a workspace path,
+# and must not launch a runner.
+HostType = Literal["external", "managed"]
 
 
 class OmnigentError(RuntimeError):
@@ -410,8 +421,13 @@ def _decode_sse_event(
         return data
     try:
         payload = json.loads(data)
-    except json.JSONDecodeError as exc:
-        raise OmnigentError(f"Invalid SSE JSON payload: {data}") from exc
+    except json.JSONDecodeError:
+        # Skip a single malformed frame (e.g. a proxy injecting a partial chunk)
+        # rather than failing the whole turn — a good answer may have already
+        # streamed. Log for operators; keep the raw payload out of any user-facing
+        # text. The stream's own turn-end / idle detection still terminates it.
+        _logger.warning("Skipping malformed SSE JSON payload (%d chars)", len(data))
+        return None
     if not isinstance(payload, dict):
         return None
     if event_name and "type" not in payload:
@@ -444,7 +460,12 @@ def _extract_runner_id(payload: Any) -> str | None:
     return _first_str(payload, ("id", "runner_id"), nested=("runner", "data"))
 
 
-def _host_id(host: dict[str, Any]) -> str | None:
+def host_id_of(host: dict[str, Any]) -> str | None:
+    """Return a host's id from either the ``id`` or ``host_id`` key, or None.
+
+    Shared by the client (host selection) and setup (host menu / workspace
+    default) so the "which key holds the id" knowledge lives in one place.
+    """
     return _first_str(host, ("id", "host_id"))
 
 

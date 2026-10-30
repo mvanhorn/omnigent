@@ -6,7 +6,8 @@ import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from types import SimpleNamespace
+from typing import Any, cast
 from unittest.mock import patch
 
 import pytest
@@ -20,12 +21,14 @@ from omnigent.spec.types import (
     MCPServerConfig,
     SharePolicy,
     SkillSpec,
+    ToolGroupsConfig,
     ToolRuntime,
     ToolsConfig,
 )
 from omnigent.tools import ToolManager
-from omnigent.tools.base import ToolContext
+from omnigent.tools.base import Tool, ToolContext
 from omnigent.tools.client_specified import ClientSideTool, ClientSideToolSpec
+from omnigent.tools.manager import _UCFunctionSchemaTool
 from omnigent.tools.mcp import clear_discovery_cache
 
 _TEST_CTX = ToolContext(task_id="task_test", agent_id="agent_test")
@@ -63,6 +66,10 @@ _ALWAYS_PRESENT_TOOLS: frozenset[str] = frozenset(
         "sys_session_list",
         "sys_session_get_info",
         "sys_session_rename",
+        # Peer messaging is advertised for every agent; the server
+        # enforces the orchestration flag and source authorization.
+        "sys_session_message",
+        "ui_open_file",
         # Read-only agent discovery tools are likewise always available
         # (global, permission-bounded reads of any accessible session's
         # agent / bundle).
@@ -119,10 +126,11 @@ def _non_lifecycle_schemas(
     ]
 
 
-def test_session_rename_is_registered_for_every_agent() -> None:
+@pytest.mark.parametrize("tool_name", ["sys_session_rename", "sys_session_message"])
+def test_session_tools_are_registered_for_every_agent(tool_name: str) -> None:
     names = {schema["function"]["name"] for schema in ToolManager(_make_spec()).get_tool_schemas()}
 
-    assert "sys_session_rename" in names
+    assert tool_name in names
 
 
 @pytest.fixture()
@@ -191,6 +199,10 @@ def _make_spec(
         skills=skills or [],
         mcp_servers=mcp_servers or [],
         local_tools=local_tools or [],
+        # Without this, ``LoadSkillTool`` merges in host-scope skills from
+        # ~/.claude/skills and every .claude/skills above cwd, and these tests
+        # assert on whatever the developer happens to have installed.
+        skills_filter="none",
     )
 
 
@@ -298,11 +310,18 @@ def test_schemas_include_read_skill_file_with_resources(
 
 def test_schemas_exclude_read_skill_file_without_resources(
     skill_no_resources: SkillSpec,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
     get_tool_schemas does NOT include read_skill_file when
     no skill has bundled resources.
     """
+    # Host-scope skill discovery falls back to cwd; run from an empty
+    # directory so this repo's own .claude/skills/ doesn't contribute
+    # resources to the check.
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path))
     mgr = ToolManager(
         _make_spec([skill_no_resources]),
     )
@@ -311,12 +330,20 @@ def test_schemas_exclude_read_skill_file_without_resources(
     assert "read_skill_file" not in names
 
 
-def test_schemas_empty_when_no_skills() -> None:
+def test_schemas_empty_when_no_skills(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """
     get_tool_schemas returns empty when agent has no skills,
     excluding the always-registered lifecycle tool
     (``sys_cancel_task``).
     """
+    # Host-scope skill discovery falls back to cwd; run from an empty
+    # directory so this repo's own .claude/skills/ doesn't contribute
+    # skills/resources to the check.
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path))
     mgr = ToolManager(_make_spec([]))
     assert _non_lifecycle_schemas(mgr) == []
 
@@ -529,12 +556,29 @@ def _spawn_spec() -> AgentSpec:
 
 
 def test_advise_models_hidden_when_routing_disabled() -> None:
-    """sys_advise_models must not appear when RuntimeCaps.routing_client is None."""
+    """sys_advise_models must not appear when no router is configured."""
     caps = _FakeRoutingCaps(routing_client=None)
     with patch("omnigent.runtime._globals._caps", new=caps):
         names = {s["function"]["name"] for s in ToolManager(_spawn_spec()).get_tool_schemas()}
     assert "sys_list_models" in names
     assert "sys_advise_models" not in names
+
+
+def test_advise_models_exposed_from_a_backends_only_deployment() -> None:
+    """The gate is "some source can answer", not "a legacy client is set".
+
+    A deployment that configures only ``routing_backends`` routes, so hiding the
+    tool there would advertise routing-off while the server routes anyway.
+    """
+    from omnigent.server.routing_backend import RoutingBackends
+
+    caps = SimpleNamespace(
+        routing_client=None,
+        routing_backends=RoutingBackends(local=cast("Any", object())),
+    )
+    with patch("omnigent.runtime._globals._caps", new=caps):
+        names = {s["function"]["name"] for s in ToolManager(_spawn_spec()).get_tool_schemas()}
+    assert "sys_advise_models" in names
 
 
 def test_advise_models_exposed_when_routing_enabled() -> None:
@@ -643,14 +687,14 @@ def test_agent_read_tools_registered_for_every_agent() -> None:
     assert "sys_agent_download" in names
     assert "sys_agent_list" in names
     # get/download require a session_id (an agent is only inspectable
-    # while running in some session); list takes no parameters.
+    # while running in some session); list exposes optional pagination.
     for tool_name in ("sys_agent_get", "sys_agent_download"):
         schema = next(s for s in mgr.get_tool_schemas() if s["function"]["name"] == tool_name)
         assert "session_id" in schema["function"]["parameters"]["required"]
     list_schema = next(
         s for s in mgr.get_tool_schemas() if s["function"]["name"] == "sys_agent_list"
     )
-    assert list_schema["function"]["parameters"]["properties"] == {}
+    assert set(list_schema["function"]["parameters"]["properties"]) == {"limit", "cursor"}
 
 
 # ── MCP integration ──────────────────────────────────────
@@ -761,7 +805,10 @@ def _make_client_side_spec(name: str) -> ClientSideToolSpec:
     )
 
 
-def test_client_tools_registered_in_schemas() -> None:
+def test_client_tools_registered_in_schemas(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """
     Client-specified tools appear in get_tool_schemas() alongside
     built-in tools without calling start().
@@ -769,6 +816,11 @@ def test_client_tools_registered_in_schemas() -> None:
     A failure here means the LLM never sees client tools — the
     client_tool_specs constructor arg is not being wired up.
     """
+    # Host-scope skill discovery falls back to cwd; run from an empty
+    # directory so this repo's own .claude/skills/ doesn't contribute
+    # extra tool schemas to the count below.
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path))
     spec = _make_spec()
     mgr = ToolManager(
         spec,
@@ -862,11 +914,19 @@ def test_client_tool_shadows_skill_tool(
     )
 
 
-def test_client_tools_none_equivalent_to_empty() -> None:
+def test_client_tools_none_equivalent_to_empty(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """
     Passing client_tool_specs=None and client_tool_specs=[] produce
     the same result: no client tools registered.
     """
+    # Host-scope skill discovery falls back to cwd; run from an empty
+    # directory so this repo's own .claude/skills/ doesn't contribute
+    # extra tool schemas to the empty-list check.
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path))
     spec = _make_spec()
     mgr_none = ToolManager(spec, client_tool_specs=None)
     mgr_empty = ToolManager(spec, client_tool_specs=[])
@@ -1170,11 +1230,19 @@ def test_local_tools_registered_and_callable(
     )
 
 
-def test_local_tools_skipped_without_workdir() -> None:
+def test_local_tools_skipped_without_workdir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """
     ToolManager with workdir=None skips local tool registration
     without error, even if spec has local_tools.
     """
+    # Host-scope skill discovery falls back to cwd (independent of
+    # workdir); run from an empty directory so this repo's own
+    # .claude/skills/ doesn't contribute extra tool schemas.
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path))
     info = LocalToolInfo(
         name="some_tool",
         path="tools/python/some_tool.py",
@@ -1195,9 +1263,19 @@ def test_local_tools_skipped_without_workdir() -> None:
 # ── web_search builtin: Databricks model does not emit web_search_preview ───
 
 
-def test_web_search_does_not_emit_web_search_preview_for_databricks_model() -> None:
+@pytest.mark.parametrize(
+    "model",
+    [
+        "databricks-gpt-5-4",
+        "system.ai.gpt-5-4",
+        "system.ai.glm-5-2",
+        "system.ai.kimi-k2-6",
+    ],
+)
+def test_web_search_does_not_emit_web_search_preview_for_databricks_model(model: str) -> None:
     """
-    When the agent's model is a ``databricks-*`` model, the ``web_search``
+    When the agent's model is a Databricks model (legacy ``databricks-*``
+    endpoint or Unity Catalog ``system.ai.*`` service), the ``web_search``
     builtin must NOT emit ``{"type": "web_search_preview"}`` in its schema.
     Databricks rejects that tool type at the API level with HTTP 400, killing
     the request before the agent runs.
@@ -1206,9 +1284,15 @@ def test_web_search_does_not_emit_web_search_preview_for_databricks_model() -> N
     ``ToolManager._create_web_search`` was removed or the prefix changed.
     The wrong schema would be ``{"type": "web_search_preview"}``.
     """
+    from omnigent.spec.types import ExecutorSpec
+
     spec = AgentSpec(
         spec_version=1,
-        llm=LLMConfig(model="databricks-gpt-5-4"),
+        llm=LLMConfig(model=model),
+        # An ``omnigent`` executor infers ``openai-agents`` from GPT/GLM/Kimi
+        # ids, so this exercises the passthrough guard rather than the
+        # no-model default.
+        executor=ExecutorSpec(type="omnigent", model=model),
         tools=ToolsConfig(builtins=[BuiltinToolConfig(name="web_search")]),
     )
     mgr = ToolManager(spec)
@@ -1218,6 +1302,459 @@ def test_web_search_does_not_emit_web_search_preview_for_databricks_model() -> N
     schema = tool.get_schema()
     assert schema.get("type") != "web_search_preview", (
         f'web_search emitted {{"type": "web_search_preview"}} for '
-        f"databricks-gpt-5-4 — Databricks does not support this tool type "
+        f"{model} — Databricks does not support this tool type "
         f"and rejects the request with HTTP 400. Got schema: {schema!r}"
     )
+
+
+def test_web_search_does_not_emit_web_search_preview_for_claude_sdk_harness() -> None:
+    """
+    When the agent's harness is ``claude-sdk``, the ``web_search`` builtin
+    must NOT emit ``{"type": "web_search_preview"}`` in its schema, even if
+    the model name (e.g. ``claude-opus-4-8``) has no provider prefix (which
+    would otherwise default to OpenAI).
+    """
+    from omnigent.spec.types import ExecutorSpec
+
+    spec = AgentSpec(
+        spec_version=1,
+        llm=LLMConfig(model="claude-opus-4-8"),
+        executor=ExecutorSpec(type="claude_sdk", model="claude-opus-4-8"),
+        tools=ToolsConfig(builtins=[BuiltinToolConfig(name="web_search")]),
+    )
+    mgr = ToolManager(spec)
+    tool = mgr.get_tool("web_search")
+
+    assert tool is not None, "web_search should be registered"
+    schema = tool.get_schema()
+    assert schema.get("type") != "web_search_preview", (
+        "web_search emitted web_search_preview schema on claude-sdk harness"
+    )
+
+
+def test_web_search_does_not_emit_web_search_preview_for_omnigent_claude_sdk_harness() -> None:
+    """
+    When the agent's executor is ``omnigent`` with ``harness: claude-sdk``,
+    the ``web_search`` builtin must NOT emit ``{"type": "web_search_preview"}``.
+    """
+    from omnigent.spec.types import ExecutorSpec
+
+    spec = AgentSpec(
+        spec_version=1,
+        llm=LLMConfig(model="claude-opus-4-8"),
+        executor=ExecutorSpec(
+            type="omnigent",
+            model="claude-opus-4-8",
+            config={"harness": "claude-sdk"},
+        ),
+        tools=ToolsConfig(builtins=[BuiltinToolConfig(name="web_search")]),
+    )
+    mgr = ToolManager(spec)
+    tool = mgr.get_tool("web_search")
+
+    assert tool is not None, "web_search should be registered"
+    schema = tool.get_schema()
+    assert schema.get("type") != "web_search_preview"
+
+
+def test_web_search_emits_web_search_preview_for_openai_agents_harness() -> None:
+    """
+    An ``agents_sdk`` executor with an OpenAI model keeps the native
+    ``web_search_preview`` passthrough (the OpenAI Responses API executes
+    the search server-side).
+    """
+    from omnigent.spec.types import ExecutorSpec
+
+    spec = AgentSpec(
+        spec_version=1,
+        llm=LLMConfig(model="gpt-5.4"),
+        executor=ExecutorSpec(type="agents_sdk", model="gpt-5.4"),
+        tools=ToolsConfig(builtins=[BuiltinToolConfig(name="web_search")]),
+    )
+    mgr = ToolManager(spec)
+    tool = mgr.get_tool("web_search")
+
+    assert tool is not None, "web_search should be registered"
+    schema = tool.get_schema()
+    assert schema.get("type") == "web_search_preview", (
+        f"OpenAI passthrough lost on the agents_sdk harness. Got schema: {schema!r}"
+    )
+
+
+def test_read_skill_file_registered_for_root_level_resources(tmp_path: Path) -> None:
+    """A skill whose only extra files sit beside SKILL.md still gets the tool."""
+    from omnigent.tools.builtins import any_skill_has_resources
+
+    skill_dir = tmp_path / "codebase-design"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text("body")
+    (skill_dir / "DEEPENING.md").write_text("deepening")
+    skill = SkillSpec(
+        name="codebase-design",
+        description="Designs codebases.",
+        content="body",
+        skill_dir=skill_dir,
+    )
+
+    assert any_skill_has_resources([skill]) is True
+
+
+def test_uc_function_schema_tool_description_falls_back_for_non_dict_function() -> None:
+    tool = _UCFunctionSchemaTool(tool_name="warehouse_query", schema={"function": "oops"})
+
+    assert tool.name() == "warehouse_query"
+    assert tool.description() == ""
+    assert tool.get_schema() == {"function": "oops"}
+
+
+def test_async_inbox_tools_not_registered_when_async_disabled() -> None:
+    mgr = ToolManager(AgentSpec(spec_version=1, async_enabled=False))
+    names = {schema["function"]["name"] for schema in mgr.get_tool_schemas()}
+
+    assert "sys_cancel_task" in names
+    assert "sys_call_async" not in names
+    assert "sys_read_inbox" not in names
+    assert "sys_cancel_async" not in names
+
+
+def test_timer_tools_registered_when_enabled() -> None:
+    mgr = ToolManager(AgentSpec(spec_version=1, timers=True))
+    names = {schema["function"]["name"] for schema in mgr.get_tool_schemas()}
+
+    assert "sys_timer_set" in names
+    assert "sys_timer_cancel" in names
+
+
+def test_unknown_builtin_logs_warning_and_skips(caplog: pytest.LogCaptureFixture) -> None:
+    spec = AgentSpec(
+        spec_version=1,
+        tools=ToolsConfig(builtins=[BuiltinToolConfig(name="definitely_missing")]),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.tools.manager"):
+        mgr = ToolManager(spec)
+
+    assert mgr.get_tool("definitely_missing") is None
+    assert "Unknown built-in tool 'definitely_missing'" in caplog.text
+
+
+def test_create_builtin_handles_web_fetch_and_upload_file() -> None:
+    from omnigent.spec.types import ExecutorSpec
+
+    spec = AgentSpec(spec_version=1, executor=ExecutorSpec(config={"harness": "pi"}))
+    mgr = ToolManager(spec)
+
+    web_fetch = mgr._create_builtin("web_fetch", None)
+    upload_file = mgr._create_builtin("upload_file", None)
+
+    assert web_fetch is not None
+    assert type(web_fetch).__name__ == "WebFetchTool"
+    assert web_fetch._parent_spec is spec
+    assert upload_file is not None
+    assert type(upload_file).__name__ == "UploadFileTool"
+
+
+def test_os_env_registration_noops_when_factory_returns_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.spec.types import OSEnvSpec
+
+    monkeypatch.setattr("omnigent.inner.os_env.create_os_environment", lambda _spec: None)
+
+    mgr = ToolManager(AgentSpec(spec_version=1, os_env=OSEnvSpec()))
+
+    assert mgr._os_env is None
+    assert all(not name.startswith("sys_os_") for name in mgr.get_tool_names())
+
+
+def test_invalid_spec_declared_client_local_tool_name_is_skipped(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    spec = AgentSpec(
+        spec_version=1,
+        local_tools=[
+            LocalToolInfo(
+                name="bad name",
+                path=None,
+                language="python",
+                runtime=ToolRuntime.CLIENT,
+                parameters={"type": "object", "properties": {}},
+            )
+        ],
+    )
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.tools.manager"):
+        mgr = ToolManager(spec)
+
+    assert mgr.get_tool("bad name") is None
+    assert "Spec-declared client local tool 'bad name' has invalid name" in caplog.text
+
+
+def test_spec_declared_client_local_tool_requires_parameters() -> None:
+    spec = AgentSpec(
+        spec_version=1,
+        local_tools=[
+            LocalToolInfo(
+                name="open_in_editor",
+                path=None,
+                language="python",
+                runtime=ToolRuntime.CLIENT,
+                parameters=None,
+            )
+        ],
+    )
+
+    with pytest.raises(ValueError, match="has no ``parameters`` block"):
+        ToolManager(spec)
+
+
+def test_uc_function_local_tool_registers_schema_defaults_and_description() -> None:
+    spec = AgentSpec(
+        spec_version=1,
+        local_tools=[
+            LocalToolInfo(
+                name="warehouse_query",
+                path=None,
+                language="python",
+                runtime=ToolRuntime.UC_FUNCTION,
+                parameters=None,
+                description="Run a warehouse SQL statement.",
+            )
+        ],
+    )
+    mgr = ToolManager(spec)
+
+    tool = mgr.get_tool("warehouse_query")
+
+    assert isinstance(tool, _UCFunctionSchemaTool)
+    assert tool.description() == "Run a warehouse SQL statement."
+    assert tool.get_schema() == {
+        "type": "function",
+        "function": {
+            "name": "warehouse_query",
+            "parameters": {"type": "object", "properties": {}},
+            "description": "Run a warehouse SQL statement.",
+        },
+    }
+
+
+def test_invalid_uc_function_name_is_skipped(caplog: pytest.LogCaptureFixture) -> None:
+    spec = AgentSpec(
+        spec_version=1,
+        local_tools=[
+            LocalToolInfo(
+                name="bad name",
+                path=None,
+                language="python",
+                runtime=ToolRuntime.UC_FUNCTION,
+            )
+        ],
+    )
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.tools.manager"):
+        mgr = ToolManager(spec)
+
+    assert mgr.get_tool("bad name") is None
+    assert "UC function tool 'bad name' has invalid name" in caplog.text
+
+
+def test_invalid_local_python_tool_name_is_skipped(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class _InvalidNameTool(Tool):
+        @classmethod
+        def name(cls) -> str:
+            return "bad name"
+
+        @classmethod
+        def description(cls) -> str:
+            return "invalid"
+
+        def get_schema(self) -> dict[str, Any]:
+            return {"type": "function", "function": {"name": self.name(), "parameters": {}}}
+
+    def _fake_load_local_python_tools(*_args: object, **_kwargs: object) -> list[Tool]:
+        return [_InvalidNameTool()]
+
+    monkeypatch.setattr(
+        "omnigent.tools.manager.load_local_python_tools",
+        _fake_load_local_python_tools,
+    )
+    monkeypatch.setattr(
+        "omnigent.tools.local_callable.load_local_callable_tools",
+        lambda _tools: [],
+    )
+
+    spec = AgentSpec(
+        spec_version=1,
+        local_tools=[
+            LocalToolInfo(
+                name="echo_tool",
+                path="tools/python/echo_tool.py",
+                language="python",
+            )
+        ],
+    )
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.tools.manager"):
+        mgr = ToolManager(spec, workdir=tmp_path)
+
+    assert mgr.get_tool("bad name") is None
+    assert "Local tool 'bad name' has invalid name" in caplog.text
+
+
+def test_omnigent_callable_tool_collision_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _CollidingCallableTool(Tool):
+        @classmethod
+        def name(cls) -> str:
+            return "load_skill"
+
+        @classmethod
+        def description(cls) -> str:
+            return "collides"
+
+        def get_schema(self) -> dict[str, Any]:
+            return {"type": "function", "function": {"name": self.name(), "parameters": {}}}
+
+    def _fake_load_local_python_tools(*_args: object, **_kwargs: object) -> list[Tool]:
+        return []
+
+    monkeypatch.setattr(
+        "omnigent.tools.manager.load_local_python_tools",
+        _fake_load_local_python_tools,
+    )
+    monkeypatch.setattr(
+        "omnigent.tools.local_callable.load_local_callable_tools",
+        lambda _tools: [_CollidingCallableTool()],
+    )
+
+    spec = AgentSpec(
+        spec_version=1,
+        local_tools=[
+            LocalToolInfo(
+                name="callable_tool",
+                path="pkg.module.callable_tool",
+                language="omnigent-python-callable",
+            )
+        ],
+    )
+
+    with pytest.raises(ValueError, match="omnigent callable tool 'load_skill' collides"):
+        ToolManager(spec)
+
+
+def test_shutdown_logs_close_and_tool_failures(caplog: pytest.LogCaptureFixture) -> None:
+    class _ExplodingOSEnv:
+        def close(self) -> None:
+            raise RuntimeError("close failed")
+
+    class _ExplodingTool(Tool):
+        @classmethod
+        def name(cls) -> str:
+            return "_exploding"
+
+        @classmethod
+        def description(cls) -> str:
+            return "exploding"
+
+        def get_schema(self) -> dict[str, Any]:
+            return {"type": "function", "function": {"name": "_exploding", "parameters": {}}}
+
+        def shutdown(self) -> None:
+            raise RuntimeError("shutdown failed")
+
+    mgr = ToolManager(AgentSpec(spec_version=1))
+    mgr._os_env = _ExplodingOSEnv()  # type: ignore[assignment]
+    mgr._pre_resolved_os_env = None
+    mgr._tools["_exploding"] = _ExplodingTool()
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.tools.manager"):
+        mgr.shutdown()
+
+    assert "os_env.close() failed during shutdown" in caplog.text
+    assert "tool _exploding shutdown failed" in caplog.text
+
+
+def test_get_tool_names_returns_registered_names() -> None:
+    mgr = ToolManager(AgentSpec(spec_version=1, timers=True))
+
+    names = mgr.get_tool_names()
+
+    assert "load_skill" in names
+    assert "sys_timer_set" in names
+
+
+# ─── ``tool_groups:`` — opting out of framework-owned groups ──────
+
+# Every tool each ``tool_groups`` key controls. Kept explicit so a group
+# quietly growing or shrinking a tool shows up here as a failure.
+_TOOL_GROUP_MEMBERS: dict[str, frozenset[str]] = {
+    "browser": frozenset(
+        {
+            "browser_navigate",
+            "browser_snapshot",
+            "browser_click",
+            "browser_type",
+            "browser_screenshot",
+        }
+    ),
+    "scheduled_tasks": frozenset(
+        {
+            "sys_scheduled_task_create",
+            "sys_scheduled_task_list",
+            "sys_scheduled_task_update",
+            "sys_scheduled_task_delete",
+        }
+    ),
+    "comments": frozenset({"list_comments", "update_comment"}),
+    "policies": frozenset({"sys_add_policy", "sys_policy_registry"}),
+    "agent_discovery": frozenset({"sys_agent_get", "sys_agent_download", "sys_agent_list"}),
+}
+
+
+def _tool_names(spec: AgentSpec) -> set[str]:
+    """Names of every tool a ``ToolManager`` registers for *spec*."""
+    return {s["function"]["name"] for s in ToolManager(spec).get_tool_schemas()}
+
+
+def _grouped_spec(**groups: bool) -> AgentSpec:
+    """A minimal spec with the given ``tool_groups`` overrides."""
+    return AgentSpec(spec_version=1, skills_filter="none", tool_groups=ToolGroupsConfig(**groups))
+
+
+def test_tool_groups_default_registers_every_group() -> None:
+    """An absent ``tool_groups:`` block changes nothing: all 16 register."""
+    names = _tool_names(_grouped_spec())
+    for group, members in _TOOL_GROUP_MEMBERS.items():
+        assert members <= names, f"{group} members missing by default: {members - names}"
+
+
+@pytest.mark.parametrize("group", sorted(_TOOL_GROUP_MEMBERS))
+def test_tool_groups_false_drops_only_that_group(group: str) -> None:
+    """Disabling one group removes exactly its tools and nothing else."""
+    names = _tool_names(_grouped_spec(**{group: False}))
+    assert not (_TOOL_GROUP_MEMBERS[group] & names), f"{group} still registered"
+    for other, members in _TOOL_GROUP_MEMBERS.items():
+        if other != group:
+            assert members <= names, f"disabling {group} also dropped {members - names}"
+
+
+def test_tool_groups_all_false_keeps_the_load_bearing_tools() -> None:
+    """
+    With every group off, the 16 gated tools are gone but the session
+    reads, ``sys_session_rename`` and ``sys_cancel_task`` stay: multi-agent
+    participation and async handles depend on them, so they have no key.
+    """
+    names = _tool_names(_grouped_spec(**dict.fromkeys(_TOOL_GROUP_MEMBERS, False)))
+    gated = frozenset().union(*_TOOL_GROUP_MEMBERS.values())
+    assert len(gated) == 16
+    assert not (gated & names)
+    assert {
+        "sys_session_list",
+        "sys_session_get_history",
+        "sys_session_get_info",
+        "sys_session_rename",
+        "sys_cancel_task",
+    } <= names

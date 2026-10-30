@@ -1,0 +1,460 @@
+import { describe, expect, it } from "vitest";
+
+import {
+  harnessAuthableOnHost,
+  harnessCredentialAdoptFamilies,
+  harnessCredentialFamily,
+  harnessInstallableOnHost,
+  harnessReadinessOnHost,
+  harnessUnavailableReasonOnHost,
+  harnessUnconfiguredOnHost,
+  missingHarnessCredentialCopy,
+  resolveSetupSteps,
+  skillInvocationPrefix,
+} from "./harnessSetup";
+import type { SetupStepWire } from "@/lib/agentLabels";
+import type { Host } from "@/hooks/useHosts";
+import type { ServerInfo } from "@/lib/capabilities";
+
+const hostWith = (configured: Record<string, boolean | string> | null | undefined): Host =>
+  ({
+    host_id: "host_1",
+    name: "laptop",
+    owner: "alice",
+    status: "online",
+    configured_harnesses: configured,
+  }) as Host;
+
+const info = (overrides: Partial<ServerInfo> = {}): ServerInfo =>
+  ({
+    harness_install_enabled: true,
+    features: { harness_install: overrides.harness_install_enabled ?? true },
+    installable_harnesses: ["codex", "codex-native", "pi", "pi-native"],
+    ...overrides,
+  }) as ServerInfo;
+
+describe("missingHarnessCredentialCopy", () => {
+  it.each([
+    ["codex-native", "Codex", "No ChatGPT account or API key on laptop"],
+    ["native-claude", "Claude Code", "No Claude subscription or API key on laptop"],
+    ["pi-native", "Pi", "No API key or gateway credential on laptop"],
+    ["cursor-native", "Cursor", "No credentials on laptop"],
+  ])("uses the credential wording for %s", (harness, harnessName, expectedStart) => {
+    expect(missingHarnessCredentialCopy(harness, harnessName, "laptop")).toBe(
+      `${expectedStart}, so new sessions can’t use ${harnessName}.`,
+    );
+  });
+});
+
+// A codex-shaped server descriptor: one-click install, then a UI-authable auth
+// step (the form lists subscription / API key / gateway; `command` is the
+// subscription option carried into it).
+const CODEX_STEPS: SetupStepWire[] = [
+  {
+    kind: "install",
+    title: "Install Codex",
+    detail: "We'll install Codex on the host for you.",
+    action: "install",
+    command: null,
+    status_key: "installed",
+  },
+  {
+    kind: "auth",
+    title: "Set up authentication",
+    detail: "Sign in with your ChatGPT subscription, an API key, or a gateway.",
+    action: "auth",
+    command: "codex login",
+    status_key: "authed",
+  },
+];
+
+// A pi-shaped descriptor: install, then a UI-authable credential step
+// (action "auth", tracked via status_key "authed", no CLI login command).
+const PI_STEPS: SetupStepWire[] = [
+  {
+    kind: "install",
+    title: "Install Pi",
+    detail: "We'll install Pi on the host for you.",
+    action: "install",
+    command: null,
+    status_key: "installed",
+  },
+  {
+    kind: "auth",
+    title: "Set up authentication",
+    detail: "Add an API key or a gateway so Pi can run.",
+    action: "auth",
+    command: null,
+    status_key: "authed",
+  },
+];
+
+// A qwen-shaped descriptor: install, then an UNTRACKED "omni setup"
+// signpost (env-auth, not UI-authable) — the case that should get dropped when
+// a trackable step anchors the list.
+const QWEN_STEPS: SetupStepWire[] = [
+  {
+    kind: "install",
+    title: "Install Qwen",
+    detail: "We'll install Qwen on the host for you.",
+    action: "install",
+    command: null,
+    status_key: "installed",
+  },
+  {
+    kind: "auth",
+    title: "Add a Qwen credential",
+    detail: "Qwen needs an API key or gateway. Set it up on the host for now.",
+    action: "setup",
+    command: "omni setup",
+    status_key: null,
+  },
+];
+
+describe("harnessUnavailableReasonOnHost", () => {
+  it("classifies structured reasons and generic unconfigured", () => {
+    expect(harnessUnavailableReasonOnHost("codex", hostWith({ codex: "binary-missing" }))).toBe(
+      "binary-missing",
+    );
+    expect(harnessUnavailableReasonOnHost("codex", hostWith({ codex: "needs-auth" }))).toBe(
+      "needs-auth",
+    );
+    expect(
+      harnessUnavailableReasonOnHost(
+        "cursor-native",
+        hostWith({ "cursor-native": "binary-missing" }),
+      ),
+    ).toBe("binary-missing");
+    expect(harnessUnavailableReasonOnHost("pi", hostWith({ pi: false }))).toBe("unconfigured");
+    expect(harnessUnavailableReasonOnHost("codex", hostWith({ codex: "version-too-low" }))).toBe(
+      "version-too-low",
+    );
+  });
+
+  it("returns null when ready or no host", () => {
+    expect(harnessUnavailableReasonOnHost("codex", hostWith({ codex: true }))).toBe(null);
+    expect(harnessUnavailableReasonOnHost("codex", hostWith({ codex: "future" }))).toBe(
+      "unconfigured",
+    );
+    expect(harnessUnavailableReasonOnHost("codex", hostWith(null))).toBe(null);
+    expect(harnessUnavailableReasonOnHost(null, hostWith({ codex: false }))).toBe(null);
+  });
+
+  it("treats a missing key on a readiness-reporting host as unconfigured", () => {
+    // Version skew: a host predating a harness reports the harnesses it knows but
+    // omits the new one. It can't launch what it never lists, so a missing key on
+    // a non-empty map is unconfigured — not silently "available". Regression for
+    // jcode showing on a pre-jcode host that only reports devin/grok.
+    expect(harnessUnavailableReasonOnHost("jcode", hostWith({ devin: false, grok: false }))).toBe(
+      "unconfigured",
+    );
+    // An absent or empty map still fails open (readiness genuinely unknown), so a
+    // host that reports nothing is never emptied out.
+    expect(harnessUnavailableReasonOnHost("jcode", hostWith(null))).toBe(null);
+    expect(harnessUnavailableReasonOnHost("jcode", hostWith({}))).toBe(null);
+  });
+
+  it("never treats the Smart Routing auto sentinel as unconfigured", () => {
+    // "auto" is a client-only sentinel — the daemon never reports a readiness key
+    // for it, so the missing-key branch must not sweep it in (else Smart Routing
+    // gets a spurious "needs setup" badge and is hidden under the toggle).
+    expect(harnessUnavailableReasonOnHost("auto", hostWith({ codex: false }))).toBe(null);
+  });
+});
+
+describe("harnessUnconfiguredOnHost", () => {
+  it("is true exactly when there's an unavailable reason", () => {
+    expect(harnessUnconfiguredOnHost("codex", hostWith({ codex: false }))).toBe(true);
+    expect(harnessUnconfiguredOnHost("codex", hostWith({ codex: true }))).toBe(false);
+  });
+});
+
+describe("harnessReadinessOnHost", () => {
+  it("keeps ready and legacy-unknown harnesses selectable", () => {
+    expect(harnessReadinessOnHost("codex-native", hostWith({ "codex-native": true }))).toEqual({
+      state: "available",
+      reason: "ready",
+      selectable: true,
+      fallbackRelevant: false,
+      explanation: null,
+    });
+    expect(harnessReadinessOnHost("codex-native", hostWith(null))).toMatchObject({
+      state: "available",
+      reason: "readiness-unknown",
+      selectable: true,
+      fallbackRelevant: false,
+    });
+  });
+
+  it("separates setup-required from broken conditions", () => {
+    expect(
+      harnessReadinessOnHost("codex-native", hostWith({ "codex-native": "needs-auth" })),
+    ).toMatchObject({
+      state: "setup-required",
+      reason: "needs-auth",
+      selectable: false,
+      fallbackRelevant: true,
+    });
+    expect(
+      harnessReadinessOnHost("codex-native", hostWith({ "codex-native": "version-too-low" })),
+    ).toMatchObject({
+      state: "broken",
+      reason: "version-too-low",
+      selectable: false,
+      fallbackRelevant: true,
+    });
+    expect(
+      harnessReadinessOnHost("codex-native", hostWith({ "codex-native": "probe-failed" })),
+    ).toMatchObject({
+      state: "broken",
+      reason: "readiness-error",
+    });
+  });
+
+  it("keeps needs-auth SDK harnesses selectable (advisory, not a gate)", () => {
+    // The daemon cannot see agent-level credentials (executor.auth) and its
+    // launch gate stays ungated for SDK harnesses, so needs-auth must warn
+    // without disabling the row.
+    expect(
+      harnessReadinessOnHost("claude-sdk", hostWith({ "claude-sdk": "needs-auth" })),
+    ).toMatchObject({
+      state: "available",
+      reason: "needs-auth",
+      selectable: true,
+      fallbackRelevant: false,
+    });
+    expect(
+      harnessReadinessOnHost("openai-agents", hostWith({ "openai-agents": "needs-auth" })),
+    ).toMatchObject({
+      state: "available",
+      reason: "needs-auth",
+      selectable: true,
+    });
+    // Every SDK spelling the daemon reports readiness for stays selectable,
+    // including the antigravity aliases (specs may use any spelling and the
+    // agents API preserves it).
+    for (const harness of ["antigravity", "agy", "google-antigravity", "openai-agents-sdk"]) {
+      expect(harnessReadinessOnHost(harness, hostWith({ [harness]: "needs-auth" }))).toMatchObject({
+        state: "available",
+        reason: "needs-auth",
+        selectable: true,
+        fallbackRelevant: false,
+      });
+    }
+    // CLI-backed harnesses keep the blocking setup-required mapping: their
+    // launch really is gated on host-side setup. The *native* antigravity
+    // spellings wrap the agy CLI and stay blocking too.
+    for (const harness of ["pi", "agy-native", "native-antigravity"]) {
+      expect(harnessReadinessOnHost(harness, hostWith({ [harness]: "needs-auth" }))).toMatchObject({
+        state: "setup-required",
+        reason: "needs-auth",
+        selectable: false,
+      });
+    }
+  });
+
+  it("marks host-wide unavailability as irrelevant to harness fallback", () => {
+    expect(
+      harnessReadinessOnHost("codex-native", {
+        ...hostWith({ "codex-native": true }),
+        status: "offline",
+      }),
+    ).toMatchObject({
+      state: "unavailable",
+      reason: "host-unavailable",
+      selectable: false,
+      fallbackRelevant: false,
+    });
+  });
+
+  it("provides explanation copy for disabled selection", () => {
+    expect(
+      harnessReadinessOnHost("codex-native", hostWith({ "codex-native": "binary-missing" }))
+        .explanation,
+    ).toEqual({
+      label: "Harness is not installed",
+      description: "Install this harness on the selected host before using it.",
+    });
+  });
+});
+
+describe("harnessInstallableOnHost", () => {
+  const online = hostWith({ codex: false });
+
+  it("true only when feature on, host online, and harness in the set", () => {
+    expect(harnessInstallableOnHost(info(), "codex-native", online)).toBe(true);
+  });
+
+  it("false when the feature is off, harness not listed, host offline, or loading", () => {
+    expect(
+      harnessInstallableOnHost(
+        info({ harness_install_enabled: false, installable_harnesses: [] }),
+        "codex",
+        online,
+      ),
+    ).toBe(false);
+    expect(harnessInstallableOnHost(info(), "cursor-native", online)).toBe(false);
+    expect(
+      harnessInstallableOnHost(info(), "codex", { ...online, status: "offline" } as Host),
+    ).toBe(false);
+    expect(harnessInstallableOnHost("loading", "codex", online)).toBe(false);
+  });
+});
+
+describe("harnessCredentialFamily", () => {
+  it("maps Claude/Codex/Pi spellings to their provider family", () => {
+    expect(harnessCredentialFamily("claude-native")).toBe("anthropic");
+    expect(harnessCredentialFamily("native-claude")).toBe("anthropic");
+    expect(harnessCredentialFamily("codex")).toBe("openai");
+    expect(harnessCredentialFamily("codex-native")).toBe("openai");
+    // Pi resolves to its preferred anthropic fallback family.
+    expect(harnessCredentialFamily("pi")).toBe("anthropic");
+    expect(harnessCredentialFamily("pi-native")).toBe("anthropic");
+  });
+
+  it("returns null for harnesses the UI can't authenticate", () => {
+    expect(harnessCredentialFamily("opencode-native")).toBe(null);
+    expect(harnessCredentialFamily("qwen")).toBe(null);
+    expect(harnessCredentialFamily("cursor-native")).toBe(null);
+    expect(harnessCredentialFamily(null)).toBe(null);
+    expect(harnessCredentialFamily(undefined)).toBe(null);
+  });
+});
+
+describe("harnessCredentialAdoptFamilies", () => {
+  it("returns the single own family for Claude/Codex", () => {
+    expect(harnessCredentialAdoptFamilies("claude-native")).toEqual(["anthropic"]);
+    expect(harnessCredentialAdoptFamilies("codex")).toEqual(["openai"]);
+    expect(harnessCredentialAdoptFamilies("codex-native")).toEqual(["openai"]);
+  });
+
+  it("returns BOTH families for Pi (it consumes anthropic + openai)", () => {
+    expect(harnessCredentialAdoptFamilies("pi")).toEqual(["anthropic", "openai"]);
+    expect(harnessCredentialAdoptFamilies("pi-native")).toEqual(["anthropic", "openai"]);
+  });
+
+  it("returns an empty list for harnesses the UI can't authenticate", () => {
+    expect(harnessCredentialAdoptFamilies("opencode-native")).toEqual([]);
+    expect(harnessCredentialAdoptFamilies(null)).toEqual([]);
+    expect(harnessCredentialAdoptFamilies(undefined)).toEqual([]);
+  });
+});
+
+describe("harnessAuthableOnHost", () => {
+  const online = hostWith({ codex: "needs-auth" });
+
+  it("true for Claude/Codex/Pi families when feature on and host online", () => {
+    expect(harnessAuthableOnHost(info(), "codex-native", online)).toBe(true);
+    expect(harnessAuthableOnHost(info(), "claude-native", online)).toBe(true);
+    expect(harnessAuthableOnHost(info(), "pi", online)).toBe(true);
+  });
+
+  it("false for env-auth / own-login harnesses, flag off, offline, or loading", () => {
+    // OpenCode/Qwen (env-auth) and Cursor (own-login) are NOT UI-authable.
+    expect(harnessAuthableOnHost(info(), "opencode-native", online)).toBe(false);
+    expect(harnessAuthableOnHost(info(), "qwen", online)).toBe(false);
+    expect(harnessAuthableOnHost(info(), "cursor-native", online)).toBe(false);
+    expect(harnessAuthableOnHost(info({ harness_install_enabled: false }), "codex", online)).toBe(
+      false,
+    );
+    expect(harnessAuthableOnHost(info(), "codex", { ...online, status: "offline" } as Host)).toBe(
+      false,
+    );
+    expect(harnessAuthableOnHost("loading", "codex", online)).toBe(false);
+  });
+});
+
+describe("resolveSetupSteps", () => {
+  it("marks install todo + auth todo when the binary is missing", () => {
+    const steps = resolveSetupSteps(CODEX_STEPS, "codex", hostWith({ codex: "binary-missing" }));
+    expect(steps.map((s) => [s.kind, s.status])).toEqual([
+      ["install", "todo"],
+      ["auth", "todo"],
+    ]);
+    expect(steps[0].action).toBe("install");
+    expect(steps[1].command).toBe("codex login");
+  });
+
+  it("marks install done + auth todo when installed but not signed in", () => {
+    const steps = resolveSetupSteps(CODEX_STEPS, "codex", hostWith({ codex: "needs-auth" }));
+    expect(steps.map((s) => s.status)).toEqual(["done", "todo"]);
+  });
+
+  it("marks install todo + auth todo when the binary is present but too old", () => {
+    const steps = resolveSetupSteps(CODEX_STEPS, "codex", hostWith({ codex: "version-too-low" }));
+    expect(steps.map((s) => [s.kind, s.status])).toEqual([
+      ["install", "todo"],
+      ["auth", "todo"],
+    ]);
+  });
+
+  it("marks both done when the harness is ready", () => {
+    const steps = resolveSetupSteps(CODEX_STEPS, "codex", hostWith({ codex: true }));
+    expect(steps.map((s) => s.status)).toEqual(["done", "done"]);
+  });
+
+  it("drops an untrackable step when a trackable step anchors the list", () => {
+    // Qwen's credential step (status_key: null) can't be tracked; showing it
+    // pre-install then vanishing post-install is confusing, so it's dropped —
+    // leaving just the trackable install step.
+    const steps = resolveSetupSteps(QWEN_STEPS, "qwen", hostWith({ qwen: false }));
+    expect(steps).toHaveLength(1);
+    expect(steps[0].kind).toBe("install");
+  });
+
+  it("keeps Pi's tracked auth step (needs-auth → todo, not dropped)", () => {
+    // Regression: Pi's auth step is now status-tracked ("authed"), so an
+    // installed-but-no-credential Pi must show BOTH steps — install ✓ and the
+    // auth step to-do — not collapse to a "ready" one-step list.
+    const steps = resolveSetupSteps(PI_STEPS, "pi", hostWith({ pi: "needs-auth" }));
+    expect(steps.map((s) => [s.kind, s.status])).toEqual([
+      ["install", "done"],
+      ["auth", "todo"],
+    ]);
+    expect(steps[1].action).toBe("auth");
+  });
+
+  it("keeps a sole untrackable step (non-installable harness fallback)", () => {
+    // A generic "run omni setup" step is untrackable but must still show —
+    // it's the only guidance for a harness the UI can't install.
+    const generic: SetupStepWire[] = [
+      {
+        kind: "install",
+        title: "Set up on the host",
+        detail: "Run omni setup on the host.",
+        action: "setup",
+        command: "omni setup",
+        status_key: null,
+      },
+    ];
+    const steps = resolveSetupSteps(generic, "cursor-native", hostWith({ "cursor-native": false }));
+    expect(steps).toHaveLength(1);
+    expect(steps[0].command).toBe("omni setup");
+  });
+
+  it("returns [] with no descriptor or no harness", () => {
+    expect(resolveSetupSteps(undefined, "codex", hostWith({ codex: false }))).toEqual([]);
+    expect(resolveSetupSteps(CODEX_STEPS, null, hostWith({ codex: false }))).toEqual([]);
+  });
+});
+
+describe("skillInvocationPrefix", () => {
+  it("returns $ for codex-native", () => {
+    expect(skillInvocationPrefix("codex-native")).toBe("$");
+  });
+
+  it("returns / for non-Codex native harnesses", () => {
+    expect(skillInvocationPrefix("claude-native")).toBe("/");
+    expect(skillInvocationPrefix("cursor-native")).toBe("/");
+  });
+
+  it("returns / for SDK and bare harness spellings", () => {
+    expect(skillInvocationPrefix("codex")).toBe("/");
+    expect(skillInvocationPrefix("claude")).toBe("/");
+  });
+
+  it("returns / for null and undefined", () => {
+    expect(skillInvocationPrefix(null)).toBe("/");
+    expect(skillInvocationPrefix(undefined)).toBe("/");
+  });
+});

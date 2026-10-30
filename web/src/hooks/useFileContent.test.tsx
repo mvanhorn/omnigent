@@ -1,7 +1,9 @@
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, render, waitFor } from "@testing-library/react";
+import { focusManager, QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { act, cleanup, render, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ReactNode } from "react";
+import type * as HostModule from "@/lib/host";
+import type * as NativeBridgeModule from "@/lib/nativeBridge";
 
 vi.mock("@/hooks/RunnerHealthProvider", () => ({
   useSessionRunnerOnline: vi.fn(),
@@ -10,16 +12,33 @@ vi.mock("@/hooks/RunnerHealthProvider", () => ({
 vi.mock("@/store/chatStore", () => ({
   useChatStore: vi.fn(),
 }));
+vi.mock("@/lib/host", async (importOriginal) => ({
+  ...(await importOriginal<typeof HostModule>()),
+  isDatabricksWorkspace: vi.fn(() => false),
+}));
+vi.mock("@/lib/nativeBridge", async (importOriginal) => ({
+  ...(await importOriginal<typeof NativeBridgeModule>()),
+  isAndroidShell: vi.fn(() => false),
+  isIOSShell: vi.fn(() => false),
+}));
 
 import { useSessionHostOnline, useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
+import { isDatabricksWorkspace } from "@/lib/host";
+import { isAndroidShell, isIOSShell } from "@/lib/nativeBridge";
 import { useChatStore } from "@/store/chatStore";
 import {
   downloadWorkspaceFile,
+  FILE_CONTENT_FAILING_POLL_MS,
+  FILE_CONTENT_POLL_MAX_BYTES,
+  FILE_CONTENT_POLL_MS,
+  fetchWorkspaceFileBlob,
+  fileContentPollInterval,
   fileContentToBlob,
   triggerBrowserDownload,
   useFileContent,
 } from "./useFileContent";
 import type { FileContentResponse } from "./useFileContent";
+import { useWriteFileContent } from "./useWriteFileContent";
 
 const onlineMock = vi.mocked(useSessionRunnerOnline);
 const hostOnlineMock = vi.mocked(useSessionHostOnline);
@@ -48,13 +67,15 @@ function Probe({ id, path }: { id: string | undefined; path: string | null }) {
 }
 
 async function flushMicrotasks() {
-  await new Promise((r) => setTimeout(r, 10));
+  await new Promise((resolve) => {
+    setTimeout(resolve, 10);
+  });
 }
 
-type ChatStoreState = {
+interface ChatStoreState {
   conversationId: string | null;
   sessionStatus: "idle" | "running" | "waiting" | "failed";
-};
+}
 
 // `useChatStore` is a selector hook: state in, derived value out.
 // Our consumer reads `s.conversationId` and `s.sessionStatus`.
@@ -198,77 +219,105 @@ describe("triggerBrowserDownload", () => {
 // downloadWorkspaceFile
 // ---------------------------------------------------------------------------
 
+function blobResponse(blob: Blob): Response {
+  return {
+    ok: true,
+    status: 200,
+    statusText: "OK",
+    blob: async () => blob,
+  } as unknown as Response;
+}
+
+/** Capture every synthetic download link the code clicks, as `[href, download]`. */
+function captureDownloadClicks(): [string, string][] {
+  const clicked: [string, string][] = [];
+  const origCreateElement = document.createElement.bind(document);
+  vi.spyOn(document, "createElement").mockImplementation((tag: string) => {
+    const el = origCreateElement(tag);
+    if (tag === "a")
+      vi.spyOn(el as HTMLAnchorElement, "click").mockImplementation(() => {
+        const a = el as HTMLAnchorElement;
+        clicked.push([a.getAttribute("href") ?? "", a.download]);
+      });
+    return el;
+  });
+  return clicked;
+}
+
+const DOWNLOAD_URL =
+  "/v1/sessions/sess_123/resources/environments/default/filesystem/src/main.py?download=true";
+
 describe("downloadWorkspaceFile", () => {
-  it("fetches the correct URL and triggers a download with the filename from the path", async () => {
-    fetchMock.mockResolvedValueOnce(
-      jsonResponse({
-        object: "session.environment.filesystem.file_content",
-        path: "src/main.py",
-        content_type: "text/x-python",
-        encoding: "utf-8",
-        content: "print('hi')",
-        bytes: 11,
-      }),
+  it("fetches complete video bytes with cancellation and encoded host paths", async () => {
+    const file = new Blob(["complete recording"], { type: "video/webm" });
+    fetchMock.mockResolvedValueOnce(blobResponse(file));
+    const signal = new AbortController().signal;
+    expect(await fetchWorkspaceFileBlob("sess_123", "/Users/me/demo clip.webm", signal)).toBe(file);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/v1/sessions/sess_123/resources/environments/default/filesystem/Users/me/demo%20clip.webm?download=true&base=host",
+      expect.objectContaining({ signal, cache: "no-store" }),
     );
-    const clickedLinks: string[] = [];
-    const origCreateElement = document.createElement.bind(document);
-    vi.spyOn(document, "createElement").mockImplementation((tag: string) => {
-      const el = origCreateElement(tag);
-      if (tag === "a")
-        vi.spyOn(el as HTMLAnchorElement, "click").mockImplementation(() => {
-          clickedLinks.push((el as HTMLAnchorElement).download);
-        });
-      return el;
-    });
-    vi.stubGlobal("URL", { createObjectURL: vi.fn(() => "blob:x"), revokeObjectURL: vi.fn() });
+  });
+
+  it("clicks a link to the raw download URL so the browser streams it to disk", async () => {
+    // A same-origin navigation shows in the browser's download UI at once and
+    // never buffers the file in the page, unlike a fetch-then-Blob.
+    const clicked = captureDownloadClicks();
 
     await downloadWorkspaceFile("sess_123", "src/main.py");
 
-    // fetchFileContent goes through authenticatedFetch, which adds auth headers
-    // and `cache: "no-store"` (see lib/identity.ts) — assert the URL plus that
-    // cache-bypass init rather than a bare single-arg call.
+    expect(clicked).toEqual([[DOWNLOAD_URL, "main.py"]]);
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    vi.restoreAllMocks();
+  });
+
+  it.each([
+    ["the managed embed", isDatabricksWorkspace],
+    ["the iOS shell", isIOSShell],
+    ["the Android shell", isAndroidShell],
+  ])("fetches the bytes through the app's transport in %s", async (_label, predicate) => {
+    // The embed host supplies auth headers and replica routing that a bare
+    // navigation lacks, and the mobile shells save http(s) downloads outside
+    // the WebView's session, so the bytes come through authenticatedFetch.
+    vi.mocked(predicate).mockReturnValueOnce(true);
+    const file = new Blob(["print('hi')"], { type: "text/x-python" });
+    fetchMock.mockResolvedValueOnce(blobResponse(file));
+    const clicked = captureDownloadClicks();
+    const createObjectURL = vi.fn(() => "blob:x");
+    vi.stubGlobal("URL", { createObjectURL, revokeObjectURL: vi.fn() });
+
+    await downloadWorkspaceFile("sess_123", "src/main.py");
+
+    // authenticatedFetch adds auth headers and `cache: "no-store"` (see
+    // lib/identity.ts) — assert the URL plus that cache-bypass init.
     expect(fetchMock).toHaveBeenCalledWith(
-      "/v1/sessions/sess_123/resources/environments/default/filesystem/src/main.py",
+      DOWNLOAD_URL,
       expect.objectContaining({ cache: "no-store" }),
     );
-    // The download filename is derived from the last path segment.
-    expect(clickedLinks).toEqual(["main.py"]);
+    expect(createObjectURL).toHaveBeenCalledWith(file);
+    expect(clicked).toEqual([["blob:x", "main.py"]]);
 
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
   });
 
-  it("logs a console warning when the server returns truncated: true", async () => {
-    fetchMock.mockResolvedValueOnce(
-      jsonResponse({
-        object: "session.environment.filesystem.file_content",
-        path: "big.txt",
-        content_type: "text/plain",
-        encoding: "utf-8",
-        content: "partial content",
-        bytes: 15,
-        truncated: true,
-      }),
-    );
-    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
-    const origCreateElement = document.createElement.bind(document);
-    vi.spyOn(document, "createElement").mockImplementation((tag: string) => {
-      const el = origCreateElement(tag);
-      if (tag === "a") vi.spyOn(el as HTMLAnchorElement, "click").mockImplementation(() => {});
-      return el;
-    });
-    vi.stubGlobal("URL", { createObjectURL: vi.fn(() => "blob:x"), revokeObjectURL: vi.fn() });
+  it("names the host base for an absolute path alongside download=true", async () => {
+    const clicked = captureDownloadClicks();
 
-    await downloadWorkspaceFile("sess_abc", "big.txt");
+    await downloadWorkspaceFile("sess_abc", "/Users/me/reports/q3.pdf");
 
-    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("big.txt"));
-    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("truncated"));
+    expect(clicked).toEqual([
+      [
+        "/v1/sessions/sess_abc/resources/environments/default/filesystem/Users/me/reports/q3.pdf?download=true&base=host",
+        "q3.pdf",
+      ],
+    ]);
 
     vi.restoreAllMocks();
-    vi.unstubAllGlobals();
   });
-
   it("propagates fetch errors to the caller", async () => {
+    vi.mocked(isDatabricksWorkspace).mockReturnValueOnce(true);
     fetchMock.mockResolvedValueOnce({
       ok: false,
       status: 404,
@@ -316,6 +365,28 @@ describe("useFileContent gating", () => {
 
     expect(fetchMock.mock.calls[0][0]).toBe(
       "/v1/sessions/conv_asleep/resources/environments/default/filesystem/src/a.txt",
+    );
+  });
+
+  it("fetches an absolute file path by its bare path plus base=host", async () => {
+    // A file opened while browsing OUTSIDE the workspace has an absolute path.
+    // It must be requested WITHOUT a leading "%2F" (which a reverse proxy such
+    // as the Databricks Apps front door would merge away) and named
+    // `base=host` -- otherwise it is looked up by its bare name under the
+    // workspace root and 404s (the regression this covers).
+    onlineMock.mockReturnValue(true);
+    hostOnlineMock.mockReturnValue(true);
+    stubChatStore();
+
+    render(
+      <Wrap>
+        <Probe id="conv_abs" path="/tmp/dbexec.log" />
+      </Wrap>,
+    );
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "/v1/sessions/conv_abs/resources/environments/default/filesystem/tmp/dbexec.log?base=host",
     );
   });
 
@@ -375,6 +446,23 @@ describe("useFileContent gating", () => {
     // Undefined conversationId gates the enabled flag — no session to fetch from.
     expect(fetchMock).not.toHaveBeenCalled();
   });
+
+  it("does not fetch for a temp id while the new session is still being created", async () => {
+    // The file viewer can stay open across a navigate-first new chat; its
+    // `temp:*` id names no server session, so the request could only fail.
+    onlineMock.mockReturnValue(true);
+    hostOnlineMock.mockReturnValue(true);
+    stubChatStore({ conversationId: "temp:0a1b2c3d", sessionStatus: "running" });
+
+    render(
+      <Wrap>
+        <Probe id="temp:0a1b2c3d" path="src/a.txt" />
+      </Wrap>,
+    );
+    await flushMicrotasks();
+
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -387,16 +475,16 @@ describe("useFileContent gating", () => {
 // client).  Using the Wrap helper instead would create a new QueryClient on
 // every rerender call, racing with the invalidation under test.
 
-describe("useFileContent trailing invalidation", () => {
-  // Returns a wrapper component that always uses the given QueryClient.
-  // Call once per test and reuse the returned reference for both render()
-  // and rerender() so the QueryClient is stable across all renders.
-  function stableWrap(qc: QueryClient) {
-    return function StableWrap({ children }: { children: ReactNode }) {
-      return <QueryClientProvider client={qc}>{children}</QueryClientProvider>;
-    };
-  }
+// Returns a wrapper component that always uses the given QueryClient.
+// Call once per test and reuse the returned reference for both render()
+// and rerender() so the QueryClient is stable across all renders.
+function stableWrap(qc: QueryClient) {
+  return function StableWrap({ children }: { children: ReactNode }) {
+    return <QueryClientProvider client={qc}>{children}</QueryClientProvider>;
+  };
+}
 
+describe("useFileContent trailing invalidation", () => {
   it("refetches once when session transitions from running to idle", async () => {
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false, staleTime: 0 } } });
     const StableWrap = stableWrap(qc);
@@ -535,5 +623,303 @@ describe("useFileContent trailing invalidation", () => {
     await flushMicrotasks();
 
     expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// useFileContent refresh while on screen
+// ---------------------------------------------------------------------------
+
+function textFile(content: string, bytes = content.length): FileContentResponse {
+  return {
+    object: "session.environment.filesystem.file_content",
+    path: "notes.md",
+    content_type: "text/markdown",
+    encoding: "utf-8",
+    content,
+    bytes,
+  };
+}
+
+describe("fileContentPollInterval", () => {
+  it.each([
+    ["a small text file", textFile("hi"), false, FILE_CONTENT_POLL_MS],
+    [
+      "a text file at the size limit",
+      textFile("", FILE_CONTENT_POLL_MAX_BYTES),
+      false,
+      FILE_CONTENT_POLL_MS,
+    ],
+    ["a small text file whose refresh fails", textFile("hi"), true, FILE_CONTENT_FAILING_POLL_MS],
+    [
+      "a larger or truncated text file",
+      textFile("", FILE_CONTENT_POLL_MAX_BYTES + 1),
+      false,
+      false,
+    ],
+    ["a binary preview", { ...textFile("YWJj"), encoding: "base64" as const }, false, false],
+    ["a file that has not loaded", undefined, false, false],
+  ])("%s", (_name, data, failing, expected) => {
+    expect(fileContentPollInterval(data, failing)).toBe(expected);
+  });
+});
+
+describe("useFileContent on-screen refresh", () => {
+  // Fake timers drive both React Query's poll interval and its notify scheduler.
+  beforeEach(() => {
+    vi.useFakeTimers();
+    onlineMock.mockReturnValue(true);
+    stubChatStore({ conversationId: "conv_poll", sessionStatus: "idle" });
+  });
+  afterEach(() => {
+    focusManager.setFocused(undefined);
+    vi.useRealTimers();
+  });
+
+  function ScreenProbe({ visible }: { visible: boolean }) {
+    useFileContent("conv_poll", "notes.md", { visible });
+    return null;
+  }
+
+  it("re-reads an idle session's file only while it is on screen", async () => {
+    const StableWrap = stableWrap(
+      new QueryClient({ defaultOptions: { queries: { retry: false } } }),
+    );
+    const view = (visible: boolean) => (
+      <StableWrap>
+        <ScreenProbe visible={visible} />
+      </StableWrap>
+    );
+    const { rerender } = render(view(true));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(FILE_CONTENT_POLL_MS);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+
+    rerender(view(false));
+    await vi.advanceTimersByTimeAsync(FILE_CONTENT_POLL_MS * 3);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+
+    // Shown again: catch up at once, then keep polling.
+    rerender(view(true));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    await vi.advanceTimersByTimeAsync(FILE_CONTENT_POLL_MS);
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+  });
+
+  it.each([
+    ["a large text file", textFile("", FILE_CONTENT_POLL_MAX_BYTES + 1)],
+    ["a binary preview", { ...textFile("YWJj"), encoding: "base64" as const }],
+  ])("does not poll %s, but re-reads it when shown again", async (_name, file) => {
+    fetchMock.mockResolvedValue(jsonResponse(file));
+    const StableWrap = stableWrap(
+      new QueryClient({ defaultOptions: { queries: { retry: false } } }),
+    );
+    const view = (visible: boolean) => (
+      <StableWrap>
+        <ScreenProbe visible={visible} />
+      </StableWrap>
+    );
+    const { rerender } = render(view(true));
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(FILE_CONTENT_POLL_MS * 3);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    rerender(view(false));
+    rerender(view(true));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("re-checks less often while refreshes fail, e.g. after the file is deleted", async () => {
+    render(
+      <Wrap>
+        <ScreenProbe visible />
+      </Wrap>,
+    );
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    fetchMock.mockResolvedValue({ ok: false, status: 404, statusText: "Not Found" } as Response);
+    await vi.advanceTimersByTimeAsync(FILE_CONTENT_POLL_MS);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+
+    await vi.advanceTimersByTimeAsync(FILE_CONTENT_POLL_MS * 3);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    // Recovery: once a re-check succeeds, polling returns to the normal interval.
+    fetchMock.mockResolvedValue(jsonResponse(textFile("back")));
+    await vi.advanceTimersByTimeAsync(FILE_CONTENT_FAILING_POLL_MS);
+    const afterRecovery = fetchMock.mock.calls.length;
+    expect(afterRecovery).toBeGreaterThan(2);
+    await vi.advanceTimersByTimeAsync(FILE_CONTENT_POLL_MS);
+    expect(fetchMock).toHaveBeenCalledTimes(afterRecovery + 1);
+  });
+
+  it("pauses in a hidden browser tab and catches up when the tab returns", async () => {
+    render(
+      <Wrap>
+        <ScreenProbe visible />
+      </Wrap>,
+    );
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    // Hidden for less than staleTime: returning still re-reads at once.
+    act(() => focusManager.setFocused(false));
+    await vi.advanceTimersByTimeAsync(FILE_CONTENT_POLL_MS * 2);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    act(() => focusManager.setFocused(true));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// useFileContent reads never overlap this tab's own write
+// ---------------------------------------------------------------------------
+
+describe("useFileContent and this tab's writes", () => {
+  const KEY = ["file-content", "conv_w", "notes.md"];
+  let serverContent: string;
+  let finishWrite: () => void;
+  let failWrite: () => void;
+  let answerRead: (content: string) => void;
+  let holdReads: boolean;
+
+  // A one-file server: a write lands when finishWrite() runs; held reads answer
+  // whenever the test chooses.
+  beforeEach(() => {
+    onlineMock.mockReturnValue(true);
+    stubChatStore();
+    serverContent = "before";
+    holdReads = false;
+    fetchMock.mockImplementation((_url: string, init?: RequestInit) => {
+      if (init?.method === "PUT") {
+        const { content } = JSON.parse(init.body as string) as { content: string };
+        return new Promise((resolve) => {
+          finishWrite = () => {
+            serverContent = content;
+            resolve(jsonResponse({}));
+          };
+          failWrite = () =>
+            resolve({ ok: false, status: 500, statusText: "Internal Server Error" } as Response);
+        });
+      }
+      if (!holdReads) return Promise.resolve(jsonResponse(textFile(serverContent)));
+      return new Promise((resolve) => {
+        answerRead = (content) => resolve(jsonResponse(textFile(content)));
+      });
+    });
+  });
+
+  const calls = (method: "GET" | "PUT") =>
+    fetchMock.mock.calls.filter(([, init]) => (init?.method ?? "GET") === method).length;
+
+  function renderFile() {
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+    });
+    const hook = renderHook(
+      () => ({
+        read: useFileContent("conv_w", "notes.md"),
+        write: useWriteFileContent("conv_w"),
+      }),
+      { wrapper: stableWrap(qc) },
+    );
+    return { qc, ...hook };
+  }
+
+  it("waits for the write before re-reading the file", async () => {
+    const { qc, result } = renderFile();
+    await waitFor(() => expect(result.current.read.data?.content).toBe("before"));
+    let saving!: Promise<void>;
+    act(() => {
+      saving = result.current.write.mutateAsync({ path: "notes.md", content: "saved" });
+    });
+    await waitFor(() => expect(calls("PUT")).toBe(1));
+
+    void qc.invalidateQueries({ queryKey: KEY });
+    await flushMicrotasks();
+    expect(calls("GET")).toBe(1);
+
+    await act(async () => {
+      finishWrite();
+      await saving;
+    });
+    await waitFor(() => expect(calls("GET")).toBeGreaterThan(1));
+    await waitFor(() => expect(result.current.read.data?.content).toBe("saved"));
+  });
+
+  it("still re-reads after a write that fails", async () => {
+    const { qc, result } = renderFile();
+    await waitFor(() => expect(result.current.read.data?.content).toBe("before"));
+    let saving!: Promise<void>;
+    act(() => {
+      saving = result.current.write.mutateAsync({ path: "notes.md", content: "rejected" });
+    });
+    await waitFor(() => expect(calls("PUT")).toBe(1));
+    void qc.invalidateQueries({ queryKey: KEY });
+    await flushMicrotasks();
+    expect(calls("GET")).toBe(1);
+
+    await act(async () => {
+      failWrite();
+      await saving.catch(() => {});
+    });
+    await waitFor(() => expect(calls("GET")).toBeGreaterThan(1));
+    expect(result.current.read.data?.content).toBe("before");
+  });
+
+  it("never sends a read that was cancelled while waiting for the write", async () => {
+    const { qc, result } = renderFile();
+    await waitFor(() => expect(result.current.read.data?.content).toBe("before"));
+    let saving!: Promise<void>;
+    act(() => {
+      saving = result.current.write.mutateAsync({ path: "notes.md", content: "saved" });
+    });
+    await waitFor(() => expect(calls("PUT")).toBe(1));
+    void qc.refetchQueries({ queryKey: KEY });
+    await flushMicrotasks();
+    await qc.cancelQueries({ queryKey: KEY });
+
+    holdReads = true;
+    await act(async () => {
+      finishWrite();
+      await saving;
+    });
+    // Only the save's own follow-up read goes out; the cancelled one never did.
+    await waitFor(() => expect(calls("GET")).toBe(2));
+    await flushMicrotasks();
+    expect(calls("GET")).toBe(2);
+  });
+
+  it("drops a read that was in flight when the write started", async () => {
+    const { qc, result } = renderFile();
+    await waitFor(() => expect(result.current.read.data?.content).toBe("before"));
+    holdReads = true;
+    void qc.invalidateQueries({ queryKey: KEY });
+    await waitFor(() => expect(calls("GET")).toBe(2));
+    let saving!: Promise<void>;
+    act(() => {
+      saving = result.current.write.mutateAsync({ path: "notes.md", content: "saved" });
+    });
+    await waitFor(() => expect(calls("PUT")).toBe(1));
+
+    // The request is aborted, and an answer sent anyway is ignored.
+    const [, heldReadInit] = fetchMock.mock.calls
+      .filter(([, init]) => init?.method !== "PUT")
+      .at(-1)!;
+    expect((heldReadInit as RequestInit).signal?.aborted).toBe(true);
+    answerRead("saved");
+    await flushMicrotasks();
+    expect(qc.getQueryData<FileContentResponse>(KEY)?.content).toBe("before");
+
+    holdReads = false;
+    await act(async () => {
+      finishWrite();
+      await saving;
+    });
+    expect(qc.getQueryData<FileContentResponse>(KEY)?.content).toBe("saved");
   });
 });

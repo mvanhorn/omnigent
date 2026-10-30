@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import logging
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urlsplit, urlunsplit
 
 from omnigent_slack.models import ThreadKey
 from omnigent_slack.omnigent import OutputFile
-from omnigent_slack.text import truncate_for_slack
+from omnigent_slack.text import GENERIC_FAILURE_TEXT, truncate_for_slack
 
 if TYPE_CHECKING:
     from omnigent_slack.streaming import SlackClientProtocol
@@ -71,7 +72,7 @@ class SlackNotifier:
         # Best-effort: a failed ack must not abort the turn.
         try:
             response = await client.chat_postMessage(
-                channel=key.channel_id, thread_ts=key.thread_ts, text=text
+                channel=key.channel_id, thread_ts=key.reply_ts, text=text
             )
         except Exception:
             self._logger.warning("Ack post failed thread=%s; continuing", key.display())
@@ -82,19 +83,19 @@ class SlackNotifier:
     async def post_reply(self, client: SlackClientProtocol, key: ThreadKey, text: str) -> None:
         await client.chat_postMessage(
             channel=key.channel_id,
-            thread_ts=key.thread_ts,
+            thread_ts=key.reply_ts,
             text=truncate_for_slack(text),
         )
 
-    async def post_failure_reply(
-        self, client: SlackClientProtocol, key: ThreadKey, error_text: str
-    ) -> None:
+    async def post_failure_reply(self, client: SlackClientProtocol, key: ThreadKey) -> None:
         # Post the failure as its own thread reply so the streamed answer stays
-        # intact.
+        # intact. A GENERIC message only — the raw error detail is logged
+        # server-side and never echoed to the channel (it can carry stack traces
+        # / internal paths, and the thread is visible to everyone).
         await client.chat_postMessage(
             channel=key.channel_id,
-            thread_ts=key.thread_ts,
-            text=f":warning: Omnigent request failed: {error_text}",
+            thread_ts=key.reply_ts,
+            text=GENERIC_FAILURE_TEXT,
         )
 
     async def post_session_info(
@@ -121,7 +122,7 @@ class SlackNotifier:
         try:
             await client.chat_postMessage(
                 channel=key.channel_id,
-                thread_ts=key.thread_ts,
+                thread_ts=key.reply_ts,
                 text="\n".join(lines),
             )
         except Exception:
@@ -137,7 +138,7 @@ class SlackNotifier:
             await client.chat_postEphemeral(
                 channel=key.channel_id,
                 user=user_id,
-                thread_ts=key.thread_ts,
+                thread_ts=key.reply_ts,
                 text=text,
             )
         except Exception:
@@ -159,7 +160,7 @@ class SlackNotifier:
         try:
             if todos_ts is None:
                 response = await client.chat_postMessage(
-                    channel=key.channel_id, thread_ts=key.thread_ts, text=text
+                    channel=key.channel_id, thread_ts=key.reply_ts, text=text
                 )
                 ts = response.get("ts")
                 return str(ts) if ts else None
@@ -176,8 +177,8 @@ class SlackNotifier:
             client,
             key,
             user_id,
-            "This Omnigent thread belongs to whoever started it, so I can't "
-            "add your message to it. Start a new thread by mentioning me "
+            "This thread's Omnigent session belongs to whoever started it, so I "
+            "can't add your message to it. Start a new thread by mentioning me "
             "(or DM me) to get your own session.",
         )
 
@@ -214,9 +215,53 @@ class SlackNotifier:
             text += f", or wait / interrupt in the <{link}|web UI>." if link else "."
         await self.post_ephemeral(client, key, user_id, text)
 
+    async def notify_stale_turn_dropped(
+        self,
+        client: SlackClientProtocol,
+        key: ThreadKey,
+        user_id: str,
+        *,
+        session_id: str | None = None,
+    ) -> None:
+        """Tell the owner their earlier message died with a bot restart.
+
+        The honest counterpart of :meth:`notify_thread_busy` for a turn a
+        restart abandoned mid-stream: the server may still report the session
+        busy, but no process is listening for that turn, so no reply is ever
+        coming to Slack — say so instead of promising one. The new message is
+        NOT run either: while the session is busy the bot cannot prove the
+        running response is the abandoned Slack turn (it may be a web-UI turn
+        started after the restart), and rendering the session-wide stream
+        could leak another surface's output into the channel — so ask for a
+        resend once the session frees, like :meth:`notify_thread_busy` does.
+        """
+        link = self._session_web_link(session_id) if session_id else None
+        text = (
+            ":wave: I lost my connection to your previous message in this "
+            "thread when I restarted, so I've stopped working on it and won't "
+            "be replying to it. The session is still busy right now, so "
+            "please send this message again in a moment"
+        )
+        text += f", or wait / interrupt in the <{link}|web UI>." if link else "."
+        await self.post_ephemeral(client, key, user_id, text)
+
     def _session_web_link(self, session_id: str) -> str:
         # Link to the session's conversation page in the Omnigent web UI, where a
         # user can continue a thread that's mid-turn in Slack (the web UI accepts
         # concurrent input and shows any pending actions).
-        base = self._server_url.rstrip("/")
+        #
+        # A Databricks workspace-hosted server is configured by its API proxy
+        # mount (``https://<ws>/api/2.0/omnigent``), but the web UI lives on the
+        # workspace SPA mount (``https://<ws>/omnigent``) — linking to the API
+        # mount answers JSON, not the UI. Map the path and keep any ``?o=<org>``
+        # workspace selector from the configured URL so multi-workspace (SPOG)
+        # hosts open in the right workspace. (This bot is standalone — it can't
+        # import ``omnigent.util.server_url`` — so the mount mapping is mirrored
+        # here.)
+        parts = urlsplit(self._server_url.rstrip("/"))
+        if parts.path == "/api/2.0/omnigent":
+            return urlunsplit(
+                (parts.scheme, parts.netloc, f"/omnigent/c/{session_id}", parts.query, "")
+            )
+        base = urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
         return f"{base}/c/{session_id}"

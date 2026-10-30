@@ -2,6 +2,8 @@ import asyncio
 from collections.abc import AsyncIterator
 
 import httpx
+import omnigent_slack.omnigent as omnigent_module
+import pytest
 import respx
 from omnigent_slack.omnigent import (
     AuthRequiredError,
@@ -12,6 +14,7 @@ from omnigent_slack.omnigent import (
     OmnigentError,
     RunnerUnavailableError,
     ServerUnreachableError,
+    StreamInterruptedError,
     extract_assistant_text,
     extract_elicitation_request,
     extract_output_file,
@@ -84,6 +87,31 @@ async def test_iter_sse_events_parses_json_and_done() -> None:
     ]
 
 
+async def test_iter_sse_events_skips_malformed_frame() -> None:
+    # A single corrupt frame (e.g. a proxy injecting a partial chunk) is skipped,
+    # not fatal — the good events before and after it still yield, so a turn
+    # whose answer already streamed isn't discarded by one bad frame.
+    events = [
+        event
+        async for event in iter_sse_events(
+            _lines(
+                [
+                    'data: {"type":"response.output_text.delta","delta":"good1"}',
+                    "",
+                    "data: {not valid json",
+                    "",
+                    'data: {"type":"response.output_text.delta","delta":"good2"}',
+                    "",
+                ]
+            )
+        )
+    ]
+    assert events == [
+        {"type": "response.output_text.delta", "delta": "good1"},
+        {"type": "response.output_text.delta", "delta": "good2"},
+    ]
+
+
 def test_extract_assistant_text_from_stream_item() -> None:
     assert (
         extract_assistant_text(
@@ -125,6 +153,147 @@ async def test_client_create_and_submit_request_shapes() -> None:
 
 
 @respx.mock
+async def test_create_session_managed_asks_the_server_to_provision_a_host() -> None:
+    # A managed session sends ONLY the host_type switch: the server picks the
+    # sandbox's host and workspace, and 422s a caller that supplies either.
+    create = respx.post("http://omnigent.test/v1/sessions").mock(
+        return_value=httpx.Response(201, json={"id": "conv_m"})
+    )
+    client = OmnigentClient("http://omnigent.test")
+
+    try:
+        session_id = await client.create_session("ag_1", "Slack C/1", host_type="managed")
+    finally:
+        await client.aclose()
+
+    assert session_id == "conv_m"
+    assert create.calls.last.request.read() == (
+        b'{"agent_id":"ag_1","title":"Slack C/1","host_type":"managed"}'
+    )
+
+
+@respx.mock
+async def test_delete_session_issues_delete_and_tolerates_absent() -> None:
+    # Cleanup of a session stranded by a failed launch: DELETE the session, and
+    # treat 404 (already gone) as success — that IS the desired end state.
+    delete = respx.delete("http://omnigent.test/v1/sessions/conv_1").mock(
+        return_value=httpx.Response(200, json={"id": "conv_1", "deleted": True})
+    )
+    gone = respx.delete("http://omnigent.test/v1/sessions/conv_2").mock(
+        return_value=httpx.Response(404, json={"error": {"code": "not_found"}})
+    )
+    client = OmnigentClient("http://omnigent.test")
+
+    try:
+        await client.delete_session("conv_1")
+        await client.delete_session("conv_2")  # already gone: must not raise
+    finally:
+        await client.aclose()
+
+    assert delete.called
+    assert gone.called
+
+
+@respx.mock
+async def test_delete_session_raises_on_server_error() -> None:
+    respx.delete("http://omnigent.test/v1/sessions/conv_1").mock(
+        return_value=httpx.Response(500, json={"error": {"code": "internal"}})
+    )
+    client = OmnigentClient("http://omnigent.test")
+
+    try:
+        with pytest.raises(OmnigentError):
+            await client.delete_session("conv_1")
+    finally:
+        await client.aclose()
+
+
+@respx.mock
+async def test_managed_host_support_reads_the_server_capability_probe() -> None:
+    info = respx.get("http://omnigent.test/v1/info").mock(
+        return_value=httpx.Response(
+            200, json={"managed_sandboxes_enabled": True, "sandbox_provider": "modal"}
+        )
+    )
+    client = OmnigentClient("http://omnigent.test")
+
+    try:
+        supported = await client.managed_host_support()
+    finally:
+        await client.aclose()
+
+    assert supported == (True, "modal")
+    assert info.calls.call_count == 1
+
+
+@respx.mock
+async def test_managed_host_support_reports_unknown_when_probe_fails() -> None:
+    # An unreadable /v1/info must NOT advertise managed sandboxes: setup would
+    # then offer an option the server rejects with a 422 at first message. It
+    # reports ``None``, not ``False`` — we never learned the server's answer, and
+    # callers must not repeat the failure to ask as a finding about the server.
+    respx.get("http://omnigent.test/v1/info").mock(return_value=httpx.Response(500))
+    client = OmnigentClient("http://omnigent.test")
+
+    try:
+        supported = await client.managed_host_support()
+    finally:
+        await client.aclose()
+
+    assert supported == (None, None)
+
+
+@respx.mock
+async def test_validate_withholds_managed_but_records_an_unread_probe() -> None:
+    respx.get("http://omnigent.test/health").mock(
+        return_value=httpx.Response(200, json={"status": "ok"})
+    )
+    respx.get("http://omnigent.test/v1/agents").mock(
+        return_value=httpx.Response(200, json={"data": [{"id": "ag_1"}]})
+    )
+    respx.get("http://omnigent.test/v1/hosts").mock(
+        return_value=httpx.Response(200, json={"hosts": [{"host_id": "h1", "status": "online"}]})
+    )
+    respx.get("http://omnigent.test/v1/info").mock(return_value=httpx.Response(500))
+    client = OmnigentClient("http://omnigent.test")
+
+    try:
+        validated = await client.validate()
+    finally:
+        await client.aclose()
+
+    # Withheld, exactly as before…
+    assert validated.managed_hosts is False
+    # …but flagged as never established, so no caller can report it as a "no".
+    assert validated.managed_support_known is False
+
+
+@respx.mock
+async def test_validate_records_a_readable_probe_as_known() -> None:
+    respx.get("http://omnigent.test/health").mock(
+        return_value=httpx.Response(200, json={"status": "ok"})
+    )
+    respx.get("http://omnigent.test/v1/agents").mock(
+        return_value=httpx.Response(200, json={"data": [{"id": "ag_1"}]})
+    )
+    respx.get("http://omnigent.test/v1/hosts").mock(
+        return_value=httpx.Response(200, json={"hosts": [{"host_id": "h1", "status": "online"}]})
+    )
+    respx.get("http://omnigent.test/v1/info").mock(
+        return_value=httpx.Response(200, json={"managed_sandboxes_enabled": False})
+    )
+    client = OmnigentClient("http://omnigent.test")
+
+    try:
+        validated = await client.validate()
+    finally:
+        await client.aclose()
+
+    assert validated.managed_hosts is False
+    assert validated.managed_support_known is True
+
+
+@respx.mock
 async def test_check_health_probes_health_endpoint() -> None:
     health = respx.get("http://omnigent.test/health").mock(
         return_value=httpx.Response(200, json={"status": "ok"})
@@ -159,6 +328,11 @@ async def test_validate_returns_agents_and_online_hosts() -> None:
             },
         )
     )
+    respx.get("http://omnigent.test/v1/info").mock(
+        return_value=httpx.Response(
+            200, json={"managed_sandboxes_enabled": False, "sandbox_provider": None}
+        )
+    )
     client = OmnigentClient("http://omnigent.test")
 
     try:
@@ -168,6 +342,8 @@ async def test_validate_returns_agents_and_online_hosts() -> None:
 
     assert [a["id"] for a in validated.agents] == ["ag_1"]
     assert [h["host_id"] for h in validated.online_hosts] == ["h_on"]
+    assert validated.managed_hosts is False
+    assert validated.managed_host_provider is None
 
 
 @respx.mock
@@ -176,6 +352,31 @@ async def test_validate_raises_auth_required_on_401() -> None:
         return_value=httpx.Response(200, json={"status": "ok"})
     )
     respx.get("http://omnigent.test/v1/agents").mock(return_value=httpx.Response(401))
+    client = OmnigentClient("http://omnigent.test")
+
+    try:
+        raised = False
+        try:
+            await client.validate()
+        except AuthRequiredError:
+            raised = True
+    finally:
+        await client.aclose()
+
+    assert raised
+
+
+@respx.mock
+async def test_validate_raises_auth_required_on_proxy_redirect() -> None:
+    # A Databricks-App-hosted server sits behind an auth proxy that 302s an
+    # unauthenticated request to its OIDC login page rather than returning 401.
+    # The bot must treat that as auth-required (→ start enrollment), not as a
+    # generic unreachable error.
+    respx.get("http://omnigent.test/health").mock(
+        return_value=httpx.Response(
+            302, headers={"location": "https://ws.example.com/oidc/oauth2/v2.0/authorize"}
+        )
+    )
     client = OmnigentClient("http://omnigent.test")
 
     try:
@@ -507,6 +708,132 @@ async def test_run_turn_ends_on_idless_idle_for_in_process_harness() -> None:
 
 
 @respx.mock
+async def test_run_turn_ignores_idless_idle_flap_on_claude_native_cold_start() -> None:
+    # Incident: a claude-native turn on a freshly-launched runner posted
+    # "Omnigent completed without returning response text" ~5s after submit, even
+    # though the agent later produced a full answer. During cold start (runner
+    # booted, message submitted, but the LLM hasn't returned its first token) the
+    # PTY-activity watcher emits an id-less `running` then an id-less `idle` flap.
+    # That pair looks like the in-process harness's real id-less end, so the turn
+    # ended with 0 events. It must instead be IGNORED (the turn has produced
+    # nothing) and the turn must end only on the later id-bearing Stop idle, once
+    # the answer has streamed.
+    async def _cold_start_stream() -> AsyncIterator[bytes]:
+        # PTY-activity cold-start flap: id-less running, then id-less idle, both
+        # BEFORE any answer token. No response_id, no delta, no response.* event.
+        yield b'data: {"type":"session.status","status":"running"}\n\n'
+        yield b'data: {"type":"session.status","status":"idle"}\n\n'  # cold-start flap
+        await asyncio.sleep(0.1)
+        # The LLM finally responds; claude-native forwards the answer + the
+        # id-bearing Stop idle (its authoritative turn-end edge).
+        yield b'data: {"type":"session.status","status":"running","response_id":"resp_1"}\n\n'
+        yield b'data: {"type":"response.output_text.delta","delta":"The real answer."}\n\n'
+        yield b'data: {"type":"session.status","status":"idle","response_id":"resp_1"}\n\n'
+        await asyncio.sleep(30)  # server keeps the stream open after idle
+
+    respx.get("http://omnigent.test/v1/sessions/conv_1/stream").mock(
+        return_value=httpx.Response(200, stream=_cold_start_stream())
+    )
+    respx.post("http://omnigent.test/v1/sessions/conv_1/events").mock(
+        return_value=httpx.Response(200, json={})
+    )
+    client = OmnigentClient("http://omnigent.test")
+
+    async def _drain() -> list[str | None]:
+        return [
+            event.get("delta")
+            async for event in client.run_turn("conv_1", "review", idle_grace_seconds=5.0)
+            if event.get("type") == "response.output_text.delta"
+        ]
+
+    try:
+        deltas = await asyncio.wait_for(_drain(), timeout=5.0)
+    finally:
+        await client.aclose()
+
+    # The cold-start flap was ignored; the real answer streamed and the id-bearing
+    # idle ended the turn — not 0 chars.
+    assert deltas == ["The real answer."]
+
+
+@respx.mock
+async def test_run_turn_ends_promptly_on_bare_idless_failed_with_no_output() -> None:
+    # The cold-start guard requires PRODUCTION before an id-less TERMINAL ends the
+    # turn — but that gate applies to `idle` only. A bare id-less `failed` is never
+    # a PTY-activity flap (the watcher emits only `idle`; `failed` comes solely
+    # from the authoritative StopFailure hook / a setup-phase failure), so a turn
+    # that fails before producing anything must END on that `failed` immediately,
+    # NOT hang to the idle-grace backstop. The long trailing silence would trip
+    # the (here 5s) idle-grace timeout, so ending well inside it proves the
+    # `failed` edge — not the timeout — ended the turn.
+    async def _fail_before_output() -> AsyncIterator[bytes]:
+        yield b'data: {"type":"session.status","status":"running"}\n\n'
+        yield b'data: {"type":"session.status","status":"failed"}\n\n'  # id-less, no output
+        await asyncio.sleep(30)  # server keeps the stream open; must not be reached
+
+    respx.get("http://omnigent.test/v1/sessions/conv_1/stream").mock(
+        return_value=httpx.Response(200, stream=_fail_before_output())
+    )
+    respx.post("http://omnigent.test/v1/sessions/conv_1/events").mock(
+        return_value=httpx.Response(200, json={})
+    )
+    client = OmnigentClient("http://omnigent.test")
+
+    async def _drain() -> list[dict[str, object]]:
+        return [event async for event in client.run_turn("conv_1", "go", idle_grace_seconds=5.0)]
+
+    try:
+        # Ends on the `failed` edge, well within both the 5s idle-grace and this
+        # 3s cap — a hang-to-timeout would blow the 3s wait.
+        await asyncio.wait_for(_drain(), timeout=3.0)
+    finally:
+        await client.aclose()
+
+
+@respx.mock
+async def test_run_turn_ignores_stale_idle_when_resuming_idle_session() -> None:
+    # Incident: resuming a session that's been idle for hours. The stream
+    # (idle=false) replays the session's CURRENT status first — a stale id-less
+    # `idle` — which arrives BEFORE the just-submitted message's `running` edge.
+    # The turn must NOT end on that pre-turn idle (which would stream 0 chars and
+    # post "completed without returning response text"); it must wait for the real
+    # turn to run and stream its answer.
+    async def _resumed_stream() -> AsyncIterator[bytes]:
+        # Leftover status from the previous (long-finished) turn, replayed first.
+        yield b'data: {"type":"session.status","status":"idle"}\n\n'
+        # Now the server processes the newly-submitted message.
+        yield b'data: {"type":"session.status","status":"running"}\n\n'
+        yield b'data: {"type":"response.output_text.delta","delta":"Fresh answer."}\n\n'
+        yield b'data: {"type":"response.completed","response":{"status":"completed"}}\n\n'
+        yield b'data: {"type":"session.status","status":"idle"}\n\n'  # the REAL end
+        await asyncio.sleep(30)  # server keeps the stream open after idle
+
+    respx.get("http://omnigent.test/v1/sessions/conv_1/stream").mock(
+        return_value=httpx.Response(200, stream=_resumed_stream())
+    )
+    respx.post("http://omnigent.test/v1/sessions/conv_1/events").mock(
+        return_value=httpx.Response(200, json={})
+    )
+    client = OmnigentClient("http://omnigent.test")
+
+    async def _drain() -> list[str | None]:
+        return [
+            event.get("delta")
+            async for event in client.run_turn("conv_1", "resume", idle_grace_seconds=5.0)
+            if event.get("type") == "response.output_text.delta"
+        ]
+
+    try:
+        deltas = await asyncio.wait_for(_drain(), timeout=5.0)
+    finally:
+        await client.aclose()
+
+    # The stale idle was ignored; the real answer streamed and the real idle ended
+    # the turn — not 0 chars.
+    assert deltas == ["Fresh answer."]
+
+
+@respx.mock
 async def test_run_turn_ends_when_stream_goes_silent_without_idle_event() -> None:
     # Incident 3cca0d8d: the stream produces output then goes SILENT with NO
     # terminal/idle event ever arriving (half-open connection, or the `idle` edge
@@ -635,6 +962,83 @@ async def test_client_raises_runner_unavailable() -> None:
         await client.aclose()
 
     assert raised is True
+
+
+@respx.mock
+async def test_run_turn_relaunches_a_runner_only_for_an_external_session() -> None:
+    # A session whose runner died reports 503 runner_unavailable on submit. For
+    # an EXTERNAL host the client launches a fresh runner and retries the turn.
+    respx.post("http://omnigent.test/v1/sessions/conv_1/events").mock(
+        side_effect=[
+            httpx.Response(503, json={"error": {"code": "runner_unavailable"}}),
+            httpx.Response(202, json={}),
+        ]
+    )
+    respx.get("http://omnigent.test/v1/sessions/conv_1/stream").mock(
+        return_value=httpx.Response(
+            200,
+            text=(
+                'data: {"type":"response.output_text.delta","delta":"back"}\n\n'
+                'data: {"type":"session.status","status":"idle","response_id":"r1"}\n\n'
+            ),
+        )
+    )
+    launch = respx.post("http://omnigent.test/v1/hosts/host_1/runners").mock(
+        return_value=httpx.Response(200, json={"runner_id": "runner_2"})
+    )
+    respx.get("http://omnigent.test/v1/runners/runner_2/status").mock(
+        return_value=httpx.Response(200, json={"online": True})
+    )
+    client = OmnigentClient("http://omnigent.test")
+
+    try:
+        deltas = [
+            event.get("delta")
+            async for event in client.run_turn(
+                "conv_1", "go", workspace="/home/u", host_id="host_1"
+            )
+            if event.get("type") == "response.output_text.delta"
+        ]
+    finally:
+        await client.aclose()
+
+    assert deltas == ["back"]
+    assert launch.called
+
+
+@respx.mock
+async def test_run_turn_never_launches_a_runner_for_a_managed_session() -> None:
+    # The server owns a managed session's sandbox and rebinds its runner itself.
+    # There is no host of ours to launch on, so the client must surface the
+    # failure rather than POST a runner onto a host it doesn't own.
+    respx.post("http://omnigent.test/v1/sessions/conv_m/events").mock(
+        return_value=httpx.Response(503, json={"error": {"code": "runner_unavailable"}})
+    )
+    respx.get("http://omnigent.test/v1/sessions/conv_m/stream").mock(
+        return_value=httpx.Response(200, text="")
+    )
+    hosts = respx.get("http://omnigent.test/v1/hosts").mock(
+        return_value=httpx.Response(200, json={"hosts": [{"host_id": "h1", "status": "online"}]})
+    )
+    launch = respx.post(url__regex=r"http://omnigent\.test/v1/hosts/[^/]+/runners").mock(
+        return_value=httpx.Response(200, json={"runner_id": "runner_2"})
+    )
+    client = OmnigentClient("http://omnigent.test")
+
+    try:
+        raised = False
+        try:
+            async for _event in client.run_turn("conv_m", "go", host_type="managed"):
+                pass
+        except RunnerUnavailableError:
+            raised = True
+    finally:
+        await client.aclose()
+
+    assert raised is True
+    # No runner launch, and no host was even shopped for one.
+    assert not launch.called
+    assert not hosts.called
 
 
 @respx.mock
@@ -928,3 +1332,352 @@ def test_elicitation_binary_and_form_are_supported() -> None:
     )
     # Even with a schema present, an AskUserQuestion is a supported form.
     assert form is not None and form.is_form and form.is_supported is True
+
+
+async def test_stream_session_events_classifies_mid_stream_drop() -> None:
+    # A transport error AFTER the stream connected (200 OK) is a mid-tail drop
+    # (proxy severing a long-lived chunked response), NOT an unreachable server.
+    async def _drop_after_output() -> AsyncIterator[bytes]:
+        yield b'data: {"type":"response.output_text.delta","delta":"partial"}\n\n'
+        raise httpx.RemoteProtocolError("peer closed connection (incomplete chunked read)")
+
+    with respx.mock:
+        respx.get("http://omnigent.test/v1/sessions/conv_1/stream").mock(
+            return_value=httpx.Response(200, stream=_drop_after_output())
+        )
+        client = OmnigentClient("http://omnigent.test")
+        raised: Exception | None = None
+        try:
+            # The drop must propagate OUT of the ``async with`` so the context
+            # manager's ``__aexit__`` re-raises it into the generator, where it is
+            # classified — mirroring how ``_run_turn_once`` consumes the stream.
+            async with client.stream_session_events("conv_1") as events:
+                async for _ in events:
+                    pass
+        except Exception as exc:
+            raised = exc
+        finally:
+            await client.aclose()
+
+    assert isinstance(raised, StreamInterruptedError)
+    assert not isinstance(raised, ServerUnreachableError)
+
+
+async def test_stream_session_events_preconnect_failure_is_unreachable() -> None:
+    # A transport failure BEFORE the stream connects stays ServerUnreachableError.
+    client = OmnigentClient("http://127.0.0.1:1")  # nothing listening
+    raised: Exception | None = None
+    try:
+        async with client.stream_session_events("conv_1") as events:
+            async for _ in events:
+                pass
+    except Exception as exc:
+        raised = exc
+    finally:
+        await client.aclose()
+
+    assert isinstance(raised, ServerUnreachableError)
+    assert not isinstance(raised, StreamInterruptedError)
+
+
+@respx.mock
+async def test_run_turn_reconnects_on_mid_stream_drop_without_resubmit() -> None:
+    # The proxy severs the stream mid-turn; the turn keeps running server-side.
+    # run_turn must re-open the stream WITHOUT re-submitting the message, and the
+    # server's cumulative in-flight replay must NOT double-render the shown text.
+    async def _first_leg() -> AsyncIterator[bytes]:
+        yield b'data: {"type":"session.status","status":"running","response_id":"resp_1"}\n\n'
+        yield b'data: {"type":"response.output_text.delta","delta":"Running tests"}\n\n'
+        yield b'data: {"type":"response.output_text.delta","delta":" now."}\n\n'
+        raise httpx.RemoteProtocolError("incomplete chunked read")
+
+    # On reconnect the server replays the whole streamed-so-far text as one
+    # cumulative delta, then resumes the live tail and ends the turn.
+    second_body = (
+        'data: {"type":"session.heartbeat"}\n\n'
+        'data: {"type":"response.output_text.delta","delta":"Running tests now."}\n\n'
+        'data: {"type":"response.output_text.delta","delta":" All 216 pass."}\n\n'
+        'data: {"type":"session.status","status":"idle","response_id":"resp_1"}\n\n'
+    )
+    respx.get("http://omnigent.test/v1/sessions/conv_1/stream").mock(
+        side_effect=[
+            httpx.Response(200, stream=_first_leg()),
+            httpx.Response(200, text=second_body),
+        ]
+    )
+    # Session still running after the drop → reconnect (not a clean stop).
+    respx.get("http://omnigent.test/v1/sessions/conv_1").mock(
+        return_value=httpx.Response(200, json={"status": "running"})
+    )
+    submit = respx.post("http://omnigent.test/v1/sessions/conv_1/events").mock(
+        return_value=httpx.Response(200, json={})
+    )
+    client = OmnigentClient("http://omnigent.test")
+
+    try:
+        deltas = [
+            event.get("delta")
+            async for event in client.run_turn("conv_1", "run the suite")
+            if event.get("type") == "response.output_text.delta"
+        ]
+    finally:
+        await client.aclose()
+
+    # The replayed cumulative text is de-duped to just its unseen suffix (empty
+    # here), so the answer reads once and continues cleanly across the reconnect.
+    assert "".join(d for d in deltas if d) == "Running tests now. All 216 pass."
+    # The message was submitted exactly once — the reconnect did not start a
+    # second turn.
+    assert submit.call_count == 1
+
+
+@respx.mock
+async def test_run_turn_stops_when_turn_ended_during_drop() -> None:
+    # If the turn finished during the stream drop, the server reports it idle; the
+    # client stops cleanly (the caller recovers the committed final text) rather
+    # than reconnecting into an already-finished turn.
+    async def _drop_mid_answer() -> AsyncIterator[bytes]:
+        yield b'data: {"type":"session.status","status":"running","response_id":"resp_1"}\n\n'
+        yield b'data: {"type":"response.output_text.delta","delta":"Almost done"}\n\n'
+        raise httpx.RemoteProtocolError("incomplete chunked read")
+
+    respx.get("http://omnigent.test/v1/sessions/conv_1/stream").mock(
+        return_value=httpx.Response(200, stream=_drop_mid_answer())
+    )
+    respx.get("http://omnigent.test/v1/sessions/conv_1").mock(
+        return_value=httpx.Response(200, json={"status": "idle"})
+    )
+    respx.post("http://omnigent.test/v1/sessions/conv_1/events").mock(
+        return_value=httpx.Response(200, json={})
+    )
+    client = OmnigentClient("http://omnigent.test")
+
+    try:
+        deltas = [
+            event.get("delta")
+            async for event in client.run_turn("conv_1", "finish up")
+            if event.get("type") == "response.output_text.delta"
+        ]
+    finally:
+        await client.aclose()
+
+    # Streamed what it saw before the drop, then stopped (no reconnect, no hang).
+    assert deltas == ["Almost done"]
+
+
+@respx.mock
+async def test_run_turn_raises_stream_interrupted_when_reconnect_exhausted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Every reconnect attempt drops again while the server keeps reporting the
+    # turn running → give up as StreamInterruptedError (a non-alarming "lost the
+    # live connection"), never ServerUnreachableError.
+    monkeypatch.setattr(omnigent_module, "_STREAM_RECONNECT_BACKOFF_S", 0.0)
+
+    def _always_dropping(request: httpx.Request) -> httpx.Response:
+        async def _drop() -> AsyncIterator[bytes]:
+            yield b'data: {"type":"response.output_text.delta","delta":"x"}\n\n'
+            raise httpx.RemoteProtocolError("incomplete chunked read")
+
+        return httpx.Response(200, stream=_drop())
+
+    respx.get("http://omnigent.test/v1/sessions/conv_1/stream").mock(side_effect=_always_dropping)
+    respx.get("http://omnigent.test/v1/sessions/conv_1").mock(
+        return_value=httpx.Response(200, json={"status": "running"})
+    )
+    respx.post("http://omnigent.test/v1/sessions/conv_1/events").mock(
+        return_value=httpx.Response(200, json={})
+    )
+    client = OmnigentClient("http://omnigent.test")
+
+    raised: Exception | None = None
+    try:
+        try:
+            async for _ in client.run_turn("conv_1", "go"):
+                pass
+        except Exception as exc:
+            raised = exc
+    finally:
+        await client.aclose()
+
+    assert isinstance(raised, StreamInterruptedError)
+    assert not isinstance(raised, ServerUnreachableError)
+
+
+@respx.mock
+async def test_run_turn_survives_many_drops_that_each_make_progress(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A long, healthy turn rides through MORE than _STREAM_RECONNECT_MAX_ATTEMPTS
+    # proxy caps. Each leg streams a NEW delta before dropping — genuine progress
+    # — so the consecutive-reconnect budget resets and the turn is NOT abandoned.
+    monkeypatch.setattr(omnigent_module, "_STREAM_RECONNECT_BACKOFF_S", 0.0)
+    n_legs = omnigent_module._STREAM_RECONNECT_MAX_ATTEMPTS + 3
+
+    def _leg(index: int, *, last: bool) -> httpx.Response:
+        async def _body() -> AsyncIterator[bytes]:
+            # A distinct new delta each leg (not a replay), so _reconcile_delta
+            # forwards it and the leg counts as progress.
+            yield (
+                f'data: {{"type":"response.output_text.delta","delta":"part{index} "}}\n\n'
+            ).encode()
+            if last:
+                yield b'data: {"type":"session.status","status":"idle"}\n\n'
+                return
+            raise httpx.RemoteProtocolError("proxy max-duration cap")
+
+        return httpx.Response(200, stream=_body())
+
+    legs = [_leg(i, last=(i == n_legs - 1)) for i in range(n_legs)]
+    respx.get("http://omnigent.test/v1/sessions/conv_1/stream").mock(side_effect=legs)
+    respx.get("http://omnigent.test/v1/sessions/conv_1").mock(
+        return_value=httpx.Response(200, json={"status": "running"})
+    )
+    respx.post("http://omnigent.test/v1/sessions/conv_1/events").mock(
+        return_value=httpx.Response(200, json={})
+    )
+    client = OmnigentClient("http://omnigent.test")
+
+    try:
+        deltas = [
+            event.get("delta")
+            async for event in client.run_turn("conv_1", "go")
+            if event.get("type") == "response.output_text.delta"
+        ]
+    finally:
+        await client.aclose()
+
+    # Every leg's new delta was forwarded and the turn completed — not abandoned
+    # despite far more drops than the consecutive-reconnect cap.
+    assert "".join(d for d in deltas if d) == "".join(f"part{i} " for i in range(n_legs))
+
+
+@respx.mock
+async def test_run_turn_reconnects_when_a_reopen_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The proxy severs the stream mid-turn and the re-open is then REFUSED — one
+    # transient connect blip inside the reconnect window. The turn is still
+    # running server-side, so that blip spends a reconnect attempt like any other
+    # and the next open resumes the answer; it must NOT end the turn.
+    monkeypatch.setattr(omnigent_module, "_STREAM_RECONNECT_BACKOFF_S", 0.0)
+
+    async def _first_leg() -> AsyncIterator[bytes]:
+        yield b'data: {"type":"session.status","status":"running","response_id":"resp_1"}\n\n'
+        yield b'data: {"type":"response.output_text.delta","delta":"Running tests"}\n\n'
+        raise httpx.RemoteProtocolError("proxy max-duration cap")
+
+    # The leg after the blip replays the streamed-so-far text, then finishes.
+    third_body = (
+        'data: {"type":"response.output_text.delta","delta":"Running tests"}\n\n'
+        'data: {"type":"response.output_text.delta","delta":" All 216 pass."}\n\n'
+        'data: {"type":"session.status","status":"idle","response_id":"resp_1"}\n\n'
+    )
+    stream = respx.get("http://omnigent.test/v1/sessions/conv_1/stream").mock(
+        side_effect=[
+            httpx.Response(200, stream=_first_leg()),
+            httpx.ConnectError("connection refused"),
+            httpx.Response(200, text=third_body),
+        ]
+    )
+    respx.get("http://omnigent.test/v1/sessions/conv_1").mock(
+        return_value=httpx.Response(200, json={"status": "running"})
+    )
+    submit = respx.post("http://omnigent.test/v1/sessions/conv_1/events").mock(
+        return_value=httpx.Response(200, json={})
+    )
+    client = OmnigentClient("http://omnigent.test")
+
+    try:
+        deltas = [
+            event.get("delta")
+            async for event in client.run_turn("conv_1", "run the suite")
+            if event.get("type") == "response.output_text.delta"
+        ]
+    finally:
+        await client.aclose()
+
+    # The answer rode through the refused re-open and read to its end, once.
+    assert "".join(d for d in deltas if d) == "Running tests All 216 pass."
+    assert stream.call_count == 3
+    assert submit.call_count == 1
+
+
+@respx.mock
+async def test_run_turn_gives_up_when_every_reopen_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A refused re-open SPENDS the reconnect budget rather than extending it: a
+    # server that stays down is given the same bounded number of attempts, then
+    # reported unreachable — no unbounded retry against a dead server.
+    monkeypatch.setattr(omnigent_module, "_STREAM_RECONNECT_BACKOFF_S", 0.0)
+
+    async def _first_leg() -> AsyncIterator[bytes]:
+        yield b'data: {"type":"response.output_text.delta","delta":"Working"}\n\n'
+        raise httpx.RemoteProtocolError("proxy max-duration cap")
+
+    opens = 0
+
+    def _refuse_after_first_leg(request: httpx.Request) -> httpx.Response:
+        nonlocal opens
+        opens += 1
+        if opens > 1:
+            raise httpx.ConnectError("connection refused")
+        return httpx.Response(200, stream=_first_leg())
+
+    stream = respx.get("http://omnigent.test/v1/sessions/conv_1/stream").mock(
+        side_effect=_refuse_after_first_leg
+    )
+    respx.get("http://omnigent.test/v1/sessions/conv_1").mock(
+        return_value=httpx.Response(200, json={"status": "running"})
+    )
+    respx.post("http://omnigent.test/v1/sessions/conv_1/events").mock(
+        return_value=httpx.Response(200, json={})
+    )
+    client = OmnigentClient("http://omnigent.test")
+
+    raised: Exception | None = None
+    try:
+        try:
+            async for _ in client.run_turn("conv_1", "go"):
+                pass
+        except Exception as exc:
+            raised = exc
+    finally:
+        await client.aclose()
+
+    # Bounded at the same cap the mid-tail drop uses: the opening leg plus one
+    # re-open per remaining attempt, and not one more.
+    assert stream.call_count == omnigent_module._STREAM_RECONNECT_MAX_ATTEMPTS
+    assert isinstance(raised, ServerUnreachableError)
+    assert not isinstance(raised, StreamInterruptedError)
+
+
+@respx.mock
+async def test_run_turn_does_not_retry_a_refused_first_connection() -> None:
+    # Nothing is running server-side until the first connection lands, so a
+    # refused FIRST open reports the server unreachable straight away instead of
+    # spending the reconnect budget on a turn that never started.
+    stream = respx.get("http://omnigent.test/v1/sessions/conv_1/stream").mock(
+        side_effect=httpx.ConnectError("connection refused")
+    )
+    submit = respx.post("http://omnigent.test/v1/sessions/conv_1/events").mock(
+        return_value=httpx.Response(200, json={})
+    )
+    client = OmnigentClient("http://omnigent.test")
+
+    raised: Exception | None = None
+    try:
+        try:
+            async for _ in client.run_turn("conv_1", "go"):
+                pass
+        except Exception as exc:
+            raised = exc
+    finally:
+        await client.aclose()
+
+    assert isinstance(raised, ServerUnreachableError)
+    assert not isinstance(raised, StreamInterruptedError)
+    assert stream.call_count == 1
+    # The message never reached a server that never answered.
+    assert submit.call_count == 0

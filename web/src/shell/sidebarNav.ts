@@ -1,7 +1,91 @@
-import type { Conversation } from "@/hooks/useConversations";
+import type { Conversation, SessionSortBy } from "@/hooks/useConversations";
 import { nativeCodingAgentForWrapper, WRAPPER_LABEL_KEY } from "@/lib/nativeCodingAgents";
+import { getOptimisticTitle } from "@/lib/optimisticTitles";
+import { PROJECT_LABEL_KEY, PINNED_LABEL_KEY } from "@/lib/sessionListCache";
 
 export const PINNED_CONVERSATION_IDS_STORAGE_KEY = "omnigent:pinned-conversation-ids";
+
+// ── Legacy localStorage pin helpers ───────────────────────────────────────
+//
+// Pins are server-authoritative now, but two paths still touch the legacy
+// localStorage key: the one-time server migration, and the pin toggle's
+// fallback when the server can't yet store pins (`filterHonored === false` — a
+// pre-upgrade server that ignores `?pinned=true`). Kept in this leaf module so
+// both the Sidebar and the `useConversations` toggle hook can use them without
+// an import cycle.
+
+/** Read the legacy pin ids, migrated to bare-hex form. Corrupt/absent ⇒ []. */
+export function readPinnedConversationIds(): string[] {
+  if (typeof window === "undefined") return [];
+  try {
+    const raw = window.localStorage.getItem(PINNED_CONVERSATION_IDS_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    // Migrate legacy prefixed ids (``conv_<hex>``) to the bare-hex form the API
+    // returns post id-to-binary migration; callers re-persist so the one-time
+    // rewrite is durable across reloads.
+    return migratePinnedConversationIds(
+      parsed.filter((value): value is string => typeof value === "string"),
+    );
+  } catch {
+    // Browser storage is user-editable and can contain stale/corrupt values.
+    // Treat bad pin state as "no pins" instead of breaking navigation.
+    return [];
+  }
+}
+
+/** Remove the legacy pin key entirely (migration complete). */
+export function clearLegacyPinnedConversationIds(): void {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.removeItem(PINNED_CONVERSATION_IDS_STORAGE_KEY);
+  } catch {
+    // Best-effort cleanup — a stale key is harmless (dedup + migration guard
+    // skip already-known ids), so a failure here needn't surface.
+  }
+}
+
+// Overwrite the legacy key with exactly `ids` (empty ⇒ remove). Throws if the
+// browser rejects the write (e.g. storage quota exceeded); no window ⇒ no-op.
+function writeLegacyPinnedConversationIdsOrThrow(ids: readonly string[]): void {
+  if (typeof window === "undefined") return;
+  if (ids.length === 0) {
+    window.localStorage.removeItem(PINNED_CONVERSATION_IDS_STORAGE_KEY);
+  } else {
+    window.localStorage.setItem(PINNED_CONVERSATION_IDS_STORAGE_KEY, JSON.stringify(ids));
+  }
+}
+
+// Overwrite the legacy key with exactly `ids` (empty ⇒ remove). Best-effort:
+// swallows write errors. Used by the migration to retain only the pins whose
+// server write failed — a failure here just means the migration retries on the
+// next load, so it must not surface.
+export function writeLegacyPinnedConversationIds(ids: readonly string[]): void {
+  try {
+    writeLegacyPinnedConversationIdsOrThrow(ids);
+  } catch {
+    // Best-effort — a failed write is retried on the next load.
+  }
+}
+
+/**
+ * Add or remove a single id in the legacy localStorage pin list, most-recently-
+ * pinned-first (matching the pre-server ordering the migration relies on).
+ * Used by the pin toggle's old-server fallback so a pin created before the
+ * server upgrade survives in localStorage and later migrates like any other
+ * pre-upgrade pin.
+ *
+ * Throws if the write fails (unlike the migration's best-effort write): this is
+ * the fallback's ONLY persistence, so a swallowed failure would let the toggle
+ * report success while the pin silently vanishes on reload. Throwing rejects
+ * the mutation instead, so its optimistic patch rolls back and the UI honestly
+ * shows the pin didn't take — matching the server PATCH path's failure handling.
+ */
+export function setLegacyPinnedConversationId(id: string, pinned: boolean): void {
+  const rest = readPinnedConversationIds().filter((x) => x !== id);
+  writeLegacyPinnedConversationIdsOrThrow(pinned ? [id, ...rest] : rest);
+}
 
 // Titles of sidebar sections the user has collapsed, e.g. ["Archived"].
 // Keyed by display title — stable identifiers for these fixed groups.
@@ -39,6 +123,7 @@ export type ConversationIconKind =
   | "qwen"
   | "kimi"
   | "hermes"
+  | "devin"
   | "nessie"
   | null;
 
@@ -72,8 +157,41 @@ export function getConversationAgentType(conversation: Conversation): string {
   return "Other";
 }
 
+/**
+ * Whether the viewer owns a session. A row with no ``owner`` (single-user mode,
+ * or a store with no permission grants wired) reads as owned. ``viewerId`` is
+ * ``null`` until identity resolves and is then treated as "not the owner" for
+ * shared rows, so they never flash into the viewer's own lists.
+ */
+export function isOwnedByViewer(conversation: Conversation, viewerId: string | null): boolean {
+  const owner = conversation.owner ?? null;
+  if (owner === null) return true;
+  return owner === viewerId;
+}
+
+/**
+ * Dual-read project membership shared by the sidebar folders and the Canvas
+ * tabs: the session carries the first-class ``project_id`` OR the legacy
+ * ``omni_project`` label of this name, and — filing being owner-only — the
+ * viewer owns it.
+ */
+export function sessionBelongsToProject(
+  conversation: Conversation,
+  project: { id: string | null; name: string },
+  viewerId: string | null,
+): boolean {
+  return (
+    isOwnedByViewer(conversation, viewerId) &&
+    ((project.id !== null && conversation.project_id === project.id) ||
+      conversation.labels?.[PROJECT_LABEL_KEY] === project.name)
+  );
+}
+
 export function conversationDisplayLabel(conversation: Conversation): string {
   if (conversation.title) return conversation.title;
+  // Just-created session: its first prompt stands in until a real title lands.
+  const optimistic = getOptimisticTitle(conversation.id);
+  if (optimistic !== undefined) return optimistic;
   const label = nativeWrapperLabel(conversation);
   if (label !== null) return label;
   return UNTITLED_CONVERSATION_LABEL;
@@ -93,17 +211,81 @@ export function filterConversations(
   });
 }
 
-// Sort by `updated_at` desc so the order matches the row's relative-time
-// pill. The active chat uses its frozen snapshot from
-// `activeOverride` instead of its live `updated_at`, so sending a message
-// in the chat you're already viewing doesn't move it.
-export function sortByUpdatedAtDesc(
+// Newest first; equal timestamps fall back to id, so arrival order never shows.
+// Freeze update timestamps for the active chat and hovered list; creation
+// timestamps stay immutable, including when the selected order changes.
+export function sortConversations(
   conversations: Conversation[],
   activeOverride: ActiveChatOverride | null,
+  frozenKeys?: Map<string, number> | null,
+  sortBy: SessionSortBy = "updated_at",
 ): Conversation[] {
-  const effective = (c: Conversation): number =>
-    activeOverride?.id === c.id ? activeOverride.updatedAt : c.updated_at;
-  return [...conversations].sort((a, b) => effective(b) - effective(a));
+  const effective = (c: Conversation): number => {
+    const live = activeOverride?.id === c.id ? activeOverride.updatedAt : c.updated_at;
+    const updatedAt = frozenKeys?.get(c.id) ?? live;
+    frozenKeys?.set(c.id, updatedAt);
+    return sortBy === "created_at" ? c.created_at : updatedAt;
+  };
+  return [...conversations].sort((a, b) => effective(b) - effective(a) || b.id.localeCompare(a.id));
+}
+
+/** Status groups, in the order the grouped sidebar renders them. */
+export const STATUS_BUCKETS = ["Needs attention", "Unread", "Working", "Draft", "Done"] as const;
+export type StatusBucket = (typeof STATUS_BUCKETS)[number];
+
+/** What a session needs from the viewer. `unseen` / `hasDraft` come from client stores. */
+export function statusBucket(c: Conversation, unseen: boolean, hasDraft: boolean): StatusBucket {
+  if ((c.pending_elicitations_count ?? 0) > 0 || c.status === "failed") return "Needs attention";
+  if (c.status === "running") return "Working";
+  if (unseen) return "Unread";
+  if (hasDraft) return "Draft";
+  return "Done";
+}
+
+export const DATE_BUCKETS = [
+  "today",
+  "yesterday",
+  "in the last 7 days",
+  "in the last 30 days",
+  "earlier",
+] as const;
+export type DateBucket = (typeof DATE_BUCKETS)[number];
+
+/** Bucket a timestamp (unix seconds) by local calendar day relative to `now`. */
+export function dateBucket(timestamp: number, now: Date): DateBucket {
+  // Local midnights via the Date constructor, so DST days aren't an hour off.
+  const midnight = (daysAgo: number) =>
+    new Date(now.getFullYear(), now.getMonth(), now.getDate() - daysAgo).getTime();
+  const at = timestamp * 1000;
+  if (at >= midnight(0)) return "today";
+  if (at >= midnight(1)) return "yesterday";
+  if (at >= midnight(7)) return "in the last 7 days";
+  if (at >= midnight(30)) return "in the last 30 days";
+  return "earlier";
+}
+
+/**
+ * Split `rows` into groups in `order`, keeping input order within each
+ * group. A row with no key (or one outside `order`) lands in the last group
+ * rather than vanishing.
+ */
+export function groupConversations<K extends string>(
+  rows: readonly Conversation[],
+  keyOf: (c: Conversation) => K | undefined,
+  order: readonly K[],
+  keepEmpty?: K,
+): { title: K; conversations: Conversation[] }[] {
+  const byKey = new Map<K, Conversation[]>(order.map((key) => [key, []]));
+  const fallback = byKey.get(order[order.length - 1]);
+  for (const row of rows) {
+    const key = keyOf(row);
+    const bucket = (key !== undefined && byKey.get(key)) || fallback;
+    bucket?.push(row);
+  }
+  return order.flatMap((title) => {
+    const conversations = byKey.get(title) ?? [];
+    return conversations.length > 0 || title === keepEmpty ? [{ title, conversations }] : [];
+  });
 }
 
 // Decide the next `activeOverride` value given the current route and
@@ -126,16 +308,6 @@ export function computeNextActiveOverride(
   return { id: activeId, updatedAt: active.updated_at };
 }
 
-export function togglePinnedConversationId(
-  pinnedIds: readonly string[],
-  conversationId: string,
-): string[] {
-  if (pinnedIds.includes(conversationId)) {
-    return pinnedIds.filter((id) => id !== conversationId);
-  }
-  return [conversationId, ...pinnedIds];
-}
-
 // A bare 32-char lowercase-hex conversation id — the shape the API returns now
 // that ids are stored as 16-byte binary uuids (legacy prefixes dropped).
 const BARE_CONVERSATION_ID_RE = /^[0-9a-f]{32}$/i;
@@ -150,12 +322,11 @@ export function bareConversationId(id: string): string {
 }
 
 // Migrate stored pin ids to the bare-hex form, dropping duplicates that collapse
-// together (a legacy ``conv_<hex>`` and its bare twin). Pins are persisted in
-// localStorage keyed by the conversation id, so ids pinned before the migration
-// still carry the old prefix. Without this, a returning user's pins no longer
-// match the ids the API returns: the pinned session loses its Pinned slot, and
-// the pinned-backfill re-fetches it under the bare id — surfacing a duplicate
-// row alongside the copy already in the loaded list.
+// together (a legacy ``conv_<hex>`` and its bare twin). Legacy pins were
+// persisted in localStorage keyed by the conversation id, so ids pinned before
+// the id-to-binary migration still carry the old prefix. Applied when reading
+// those legacy pins for the one-time push up to server-side labels, so a
+// returning user's pins map to the bare ids the API now returns.
 export function migratePinnedConversationIds(ids: readonly string[]): string[] {
   const seen = new Set<string>();
   const migrated: string[] = [];
@@ -169,8 +340,8 @@ export function migratePinnedConversationIds(ids: readonly string[]): string[] {
 }
 
 // Drop conversations whose id already appeared, keeping the first occurrence.
-// The pinned-backfill fetches a session by id and can return a copy that is
-// also present in the paginated list; merging both would render the row twice.
+// The server pinned list and the paginated list overlap (a pinned session is
+// usually in both); merging them would otherwise render the row twice.
 export function dedupeConversationsById(conversations: readonly Conversation[]): Conversation[] {
   const seen = new Set<string>();
   const deduped: Conversation[] = [];
@@ -184,36 +355,69 @@ export function dedupeConversationsById(conversations: readonly Conversation[]):
 
 // Order pinned conversations by when they were pinned, not by `updated_at` —
 // a pinned session holds its slot even when a new message bumps its
-// `updated_at`. `pinnedIds` is kept most-recently-pinned-first (see
-// `togglePinnedConversationId`), so we reverse it: the oldest pin ranks
-// first (top) and a freshly pinned session lands at the bottom of the group.
-// Anything not in `pinnedIds` (shouldn't happen for this list) sinks to the
-// bottom in a stable order.
-export function orderByPinnedSequence(
-  conversations: Conversation[],
-  pinnedIds: readonly string[],
-): Conversation[] {
-  const oldestPinFirst = [...pinnedIds].reverse();
-  const rankById = new Map(oldestPinFirst.map((id, index) => [id, index]));
-  const rank = (c: Conversation): number => rankById.get(c.id) ?? Number.MAX_SAFE_INTEGER;
-  return [...conversations].sort((a, b) => rank(a) - rank(b));
+// `updated_at`. The `omnigent.pinned` label value is the epoch-ms pin time,
+// or a value between two neighbours once the user drags to reorder (see
+// `pinOrderWrites`); sort ascending so a freshly pinned session lands at the
+// bottom. A missing/unparseable value sinks to the bottom, stably.
+export function orderByPinnedTimestamp(conversations: readonly Conversation[]): Conversation[] {
+  const pinnedAt = (c: Conversation): number => {
+    const raw = c.labels?.[PINNED_LABEL_KEY];
+    const ms = raw ? Number(raw) : NaN;
+    return Number.isFinite(ms) ? ms : Number.MAX_SAFE_INTEGER;
+  };
+  return [...conversations].sort((a, b) => pinnedAt(a) - pinnedAt(b));
 }
 
-export function normalizePinnedConversationIds(
-  pinnedIds: readonly string[],
-  conversations: readonly Conversation[],
-): string[] {
-  const validIds = new Set(conversations.map((conversation) => conversation.id));
-  const seen = new Set<string>();
-  const normalized: string[] = [];
+/** A pin label rewrite: the new `omnigent.pinned` sort value for one session. */
+export interface PinOrderWrite {
+  id: string;
+  pinnedAt: number;
+}
 
-  for (const id of pinnedIds) {
-    if (!validIds.has(id) || seen.has(id)) continue;
-    seen.add(id);
-    normalized.push(id);
+/**
+ * The pin label writes that move `fromId` into `toId`'s slot of the (already
+ * pin-ordered) Pinned list. A `fromId` that isn't pinned yet is inserted just
+ * above `toId`. The label value is the list's sort key, so a move normally
+ * rewrites only the moved session, to a value between its new neighbours. When
+ * there's no room between them (equal or missing values), every pin is
+ * renumbered from the lowest existing value (rows already at their new value
+ * are skipped). Returns `[]` for a no-op.
+ */
+export function pinOrderWrites(
+  pinned: readonly Conversation[],
+  fromId: string,
+  toId: string,
+): PinOrderWrite[] {
+  const from = pinned.findIndex((c) => c.id === fromId);
+  const to = pinned.findIndex((c) => c.id === toId);
+  if (to < 0 || from === to) return [];
+  const moved = [...pinned];
+  const [row] = from < 0 ? [{ id: fromId } as Conversation] : moved.splice(from, 1);
+  moved.splice(to, 0, row);
+  const value = (c: Conversation | undefined): number => Number(c?.labels?.[PINNED_LABEL_KEY]);
+  const prev = value(moved[to - 1]);
+  const next = value(moved[to + 1]);
+  let pinnedAt = prev + (next - prev) / 2;
+  if (to === 0) pinnedAt = next - 1;
+  else if (to === moved.length - 1) pinnedAt = prev + 1;
+  if (
+    Number.isFinite(pinnedAt) &&
+    (to === 0 || pinnedAt > prev) &&
+    (to === moved.length - 1 || pinnedAt < next)
+  ) {
+    return [{ id: fromId, pinnedAt }];
   }
-
-  return normalized;
+  // Renumber from the lowest existing value, unless it's too large to count up
+  // from in distinct steps; then use a range just below now, so a later pin
+  // (stamped `Date.now()`) still lands at the bottom.
+  const finite = pinned.map(value).filter(Number.isFinite);
+  const lowest = finite.length > 0 ? Math.min(...finite) : NaN;
+  const base =
+    Math.abs(lowest) + moved.length <= Number.MAX_SAFE_INTEGER ? lowest : Date.now() - moved.length;
+  // Skip rows that already hold their renumbered value.
+  return moved
+    .map((c, index) => ({ id: c.id, pinnedAt: base + index }))
+    .filter((w, index) => value(moved[index]) !== w.pinnedAt);
 }
 
 // ── Drag-and-drop ────────────────────────────────────────────────────────────
@@ -236,6 +440,7 @@ export type SidebarDropTarget =
   | { type: "project"; name: string }
   | { type: "ungroup" }
   | { type: "pin" }
+  | { type: "pin-order"; id: string }
   | null;
 
 /** The action a drop resolves to. `move` files the session into a project;
@@ -252,8 +457,9 @@ export type SidebarDropTarget =
 export type SidebarDropAction =
   | { kind: "move"; project: string; unpin: boolean }
   | { kind: "ungroup"; project: string; unpin: boolean }
-  | { kind: "pin" }
+  | { kind: "pin"; targetId?: string }
   | { kind: "unpin" }
+  | { kind: "reorder-pin"; targetId: string }
   | { kind: "none" };
 
 /**
@@ -269,6 +475,8 @@ export type SidebarDropAction =
  * - Dropped on the ungroup zone while unfiled → `unpin` if pinned, else `none`.
  * - Dropped on the pin zone while not already pinned → `pin`.
  * - Dropped on the pin zone while already pinned → `none`.
+ * - Dropped on another pinned row while pinned → `reorder-pin`; while unpinned →
+ *   `pin` with that row as `targetId`, so it's pinned into that slot.
  * - Dropped on nothing → `none`.
  */
 export function resolveSidebarDrop(
@@ -288,8 +496,23 @@ export function resolveSidebarDrop(
     // floats pinned sessions out of their project into the Pinned section).
     return source.isPinned ? { kind: "none" } : { kind: "pin" };
   }
+  if (target.type === "pin-order") {
+    if (!source.isPinned) return { kind: "pin", targetId: target.id };
+    return target.id === source.id
+      ? { kind: "none" }
+      : { kind: "reorder-pin", targetId: target.id };
+  }
   // Ungroup (dropped on "Chats" / the fallback strip): land it in the flat list.
   if (source.project) return { kind: "ungroup", project: source.project, unpin: source.isPinned };
   // No project label: only meaningful if pinned (unpin → it drops into Chats).
   return source.isPinned ? { kind: "unpin" } : { kind: "none" };
+}
+
+/**
+ * Whether the Sessions list accepts a dragged session: a filed one (ungroup) or
+ * a pinned one (unpin). Grouped views already list filed sessions in place, so
+ * there it only unpins a pin that has no project to lose.
+ */
+export function sessionsListAcceptsDrop(source: SidebarDragSource, grouped: boolean): boolean {
+  return grouped ? source.isPinned && !source.project : !!source.project || source.isPinned;
 }

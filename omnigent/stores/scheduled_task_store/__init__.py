@@ -7,14 +7,19 @@ table and its ``scheduled_task_runs`` history table.
 
 from __future__ import annotations
 
+import builtins
 from abc import ABC, abstractmethod
-from typing import Any
+from typing import Any, Literal
 
 from omnigent.entities import ScheduledTask, ScheduledTaskRun
 
 # Sentinel meaning "caller did not supply this argument; leave the column unchanged."
 # Distinct from None, which means "set the column to NULL."
 _UNSET: Any = object()
+
+# How :meth:`ScheduledTaskStore.adopt_session` resolved: the task now continues
+# the session, another session got there first, or the task changed under the run.
+AdoptOutcome = Literal["adopted", "taken", "stale"]
 
 
 class ScheduledTaskStore(ABC):
@@ -49,9 +54,16 @@ class ScheduledTaskStore(ABC):
         *,
         model_override: str | None = None,
         reasoning_effort: str | None = None,
+        permission_mode: str | None = None,
+        max_cost_usd: float | None = None,
+        session_mode: str = "new",
+        session_id: str | None = None,
         workspace: str | None = None,
         host_id: str | None = None,
+        project_id: str | None = None,
+        execution_target: str = "connected_host",
         state: str = "active",
+        delegation_ref: str | None = None,
     ) -> ScheduledTask:
         """
         Insert a new scheduled task.
@@ -67,10 +79,24 @@ class ScheduledTaskStore(ABC):
         :param timezone: IANA timezone the trigger is evaluated in.
         :param model_override: Optional LLM model override.
         :param reasoning_effort: Optional reasoning-effort hint.
+        :param permission_mode: Optional native-harness permission mode
+            (Claude Code), e.g. ``"acceptEdits"``.
+        :param max_cost_usd: Optional per-firing cost budget in USD.
+        :param session_mode: ``"new"`` (default) starts a new session per
+            firing; ``"continue"`` sends each firing's prompt into one session.
+        :param session_id: The existing session a ``"continue"`` task sends
+            its prompt to; ``None`` lets its first firing create one.
         :param workspace: Runner start path (source repo / working dir).
         :param host_id: The connected host to pin the run to.
+        :param project_id: First-class project each fired session is filed
+            into, or ``None`` to leave fired sessions unfiled.
+        :param execution_target: ``"connected_host"`` (default) or
+            ``"managed_sandbox"`` (a fresh server-provisioned sandbox per fire).
         :param state: Lifecycle state — ``active``/``paused``/``deleted``.
-            Defaults to ``"active"``.
+            Defaults to ``"active"``. Persistent dispatch sets ``completed``
+            once a schedule has no remaining occurrences.
+        :param delegation_ref: Names the authorization grant a deployment uses to
+            act as the owner when the task fires; never a credential.
         :returns: The newly created :class:`ScheduledTask`.
         :raises ValueError: If ``state`` is not a recognized value.
         """
@@ -87,16 +113,17 @@ class ScheduledTaskStore(ABC):
         ...
 
     @abstractmethod
-    def list(self) -> list[ScheduledTask]:
+    def list(self, *, owner_user_id: str | None = None) -> list[ScheduledTask]:
         """
-        List all scheduled tasks ordered by ``created_at ASC, id ASC``.
+        List non-deleted scheduled tasks ordered by ``created_at ASC, id ASC``.
 
+        :param owner_user_id: When given, return only tasks owned by this user.
         :returns: List of :class:`ScheduledTask` instances.
         """
         ...
 
     @abstractmethod
-    def list_active(self) -> list[ScheduledTask]:
+    def list_active(self) -> builtins.list[ScheduledTask]:
         """
         List active scheduled tasks ordered by ``created_at ASC, id ASC``.
 
@@ -107,7 +134,7 @@ class ScheduledTaskStore(ABC):
         ...
 
     @abstractmethod
-    def list_active_all_workspaces(self) -> list[ScheduledTask]:
+    def list_active_all_workspaces(self) -> builtins.list[ScheduledTask]:
         """
         List active scheduled tasks across every workspace.
 
@@ -126,11 +153,18 @@ class ScheduledTaskStore(ABC):
         name: str | None = None,
         prompt: str | None = None,
         rrule: str | None = None,
+        agent_id: str | None = None,
         timezone: str | None = None,
-        model_override: str | None = None,
-        reasoning_effort: str | None = None,
-        workspace: str | None = None,
+        model_override: str | None = _UNSET,
+        reasoning_effort: str | None = _UNSET,
+        permission_mode: str | None = _UNSET,
+        max_cost_usd: float | None = _UNSET,
+        session_mode: str | None = None,
+        session_id: str | None = _UNSET,
+        workspace: str | None = _UNSET,
         host_id: str | None = _UNSET,
+        project_id: str | None = _UNSET,
+        execution_target: str | None = None,
         state: str | None = None,
         last_run_at: int | None = None,
         last_run_conversation_id: str | None = _UNSET,
@@ -138,14 +172,22 @@ class ScheduledTaskStore(ABC):
         """
         Update mutable fields of a task.
 
-        Most parameters use ``None`` to mean "leave unchanged". For ``host_id``
-        and ``last_run_conversation_id``, the sentinel default means "not
-        provided / leave unchanged"; passing ``None`` explicitly sets the column
-        to NULL (e.g. to clear a host binding or to null out the last-run
-        conversation after it is deleted).
+        Most parameters use ``None`` to mean "leave unchanged". For the per-task
+        overrides (``model_override``, ``reasoning_effort``,
+        ``permission_mode``), ``host_id``, ``project_id``, ``max_cost_usd``, ``session_id``, and
+        ``last_run_conversation_id``, the sentinel default means "not provided /
+        leave unchanged"; passing ``None`` explicitly sets the column to NULL —
+        so resetting an override to the agent default actually clears it (e.g.
+        turning a set ``bypassPermissions`` back off), and clearing a host
+        binding or nulling out a deleted last-run conversation.
 
         Passing ``rrule`` updates the recurring trigger; ``None``
         leaves it unchanged.
+
+        Passing ``agent_id`` rebinds the task to a different agent, which
+        switches the harness its future firings run. The fire path reads
+        ``agent_id`` fresh on every firing and each firing owns its own
+        conversation, so past runs keep the agent they actually ran.
 
         Returns ``None`` if the task does not exist.
 
@@ -155,12 +197,42 @@ class ScheduledTaskStore(ABC):
         ...
 
     @abstractmethod
+    def adopt_session(
+        self,
+        scheduled_task_id: str,
+        session_id: str,
+        *,
+        snapshot: ScheduledTask,
+        host_id: str | None = None,
+    ) -> AdoptOutcome:
+        """
+        Record the session a ``"continue"`` task's first firing created.
+
+        Leaves the task unchanged when another session was recorded first
+        (``"taken"``), or when the task is no longer a ``"continue"`` task or
+        was edited since the firing read it (``"stale"``), so a concurrent run,
+        pick or edit wins.
+
+        :param scheduled_task_id: Opaque task identifier.
+        :param session_id: The session the firing created.
+        :param snapshot: The stored task as the firing read it.
+        :param host_id: The connected host the session runs on, pinned on a task
+            that has none: the session cannot move, so every later run routes
+            to that host.
+        :returns: How the adoption resolved.
+        """
+        ...
+
+    @abstractmethod
     def delete(self, scheduled_task_id: str) -> bool:
         """
         Delete a scheduled task. Idempotent.
 
+        Unfinished claimed runs may retain the task in the deleted state until
+        cleanup or completion finishes. Such tasks cannot be edited or fired.
+
         :param scheduled_task_id: Opaque task identifier.
-        :returns: ``True`` if removed; ``False`` if not found.
+        :returns: ``True`` if newly deleted; ``False`` if missing or already deleted.
         """
         ...
 
@@ -199,12 +271,148 @@ class ScheduledTaskStore(ABC):
         ...
 
     @abstractmethod
-    def list_runs(self, scheduled_task_id: str) -> list[ScheduledTaskRun]:
+    def list_runs(
+        self,
+        scheduled_task_id: str,
+        *,
+        limit: int = 100,
+        after_id: str | None = None,
+    ) -> tuple[builtins.list[ScheduledTaskRun], str | None]:
         """
-        List runs for a task ordered by ``scheduled_at DESC, id DESC``
+        List one page of a task's runs ordered by ``scheduled_at DESC, id DESC``
         (most recent first).
 
+        Cursor-paginated so run history is never silently truncated: returns
+        ``(runs, next_cursor)`` where ``next_cursor`` is the id to pass as
+        ``after_id`` for the next page, or ``None`` when the last page is
+        reached.
+
         :param scheduled_task_id: The task whose runs to return.
-        :returns: List of :class:`ScheduledTaskRun` instances.
+        :param limit: Maximum number of runs per page. Defaults to 100.
+        :param after_id: Return runs ordered after this run id (exclusive).
+        :returns: ``(runs, next_cursor)``.
+        """
+        ...
+
+    @abstractmethod
+    def clear_project_id(self, scheduled_task_id: str, project_id: str) -> bool:
+        """
+        Clear the task's ``project_id`` only while it still equals *project_id*.
+
+        A single conditional write, so a concurrent update that moved the task to
+        another project is never overwritten.
+
+        :param scheduled_task_id: The task to update.
+        :param project_id: The project id expected on the row, e.g. a deleted one.
+        :returns: ``True`` if the column was cleared.
+        """
+        ...
+
+    @abstractmethod
+    def update_run(
+        self,
+        run_id: str,
+        *,
+        status: str,
+        finished_at: int,
+        error: str | None = None,
+        error_code: str | None = None,
+    ) -> ScheduledTaskRun | None:
+        """
+        Transition a still-``running`` run to a terminal status.
+
+        Idempotent and conditional: the update only applies to a run whose
+        current status is ``running`` (guarded by ``WHERE status = running``),
+        so a run already advanced to a terminal state (a fire-time
+        ``skipped``/``failed``, or a prior reconciliation) is never clobbered
+        and two concurrent sweeps cannot double-transition it.
+
+        :param run_id: The run to transition.
+        :param status: The terminal status to set — ``succeeded`` or
+            ``failed``.
+        :param finished_at: Unix epoch seconds the run reached the terminal
+            state.
+        :param error: Optional failure detail (only for ``failed``).
+        :param error_code: Optional short failure classification (only for
+            ``failed``), e.g. ``"incomplete"``.
+        :returns: The updated :class:`ScheduledTaskRun` if a ``running`` run
+            was transitioned; ``None`` if no matching ``running`` run existed
+            (not found, or already terminal).
+        """
+        ...
+
+    @abstractmethod
+    def get_running_run_by_conversation(self, conversation_id: str) -> ScheduledTaskRun | None:
+        """
+        Return the ``running`` run for a conversation, or ``None``.
+
+        The event-driven completion hook (fired when a conversation's turn
+        reaches a terminal state) uses this reverse lookup to find the
+        scheduled-task run to transition. Workspace-scoped like every other
+        store read (filters on ``current_workspace_id()``), so the caller must
+        run it inside the run's ``workspace_scope``. Backed by the
+        ``ix_scheduled_task_runs_conversation_status`` index on
+        ``(workspace_id, conversation_id, status, id)``.
+
+        A conversation has at most one ``running`` run (only the run that
+        created a session waits for its turn; a continued run is finished once
+        its prompt is delivered), so this returns a single row rather than a
+        list.
+
+        :param conversation_id: The fired conversation to look up.
+        :returns: The matching ``running`` :class:`ScheduledTaskRun`, or
+            ``None`` if the conversation has no run, or its run is already
+            terminal.
+        """
+        ...
+
+    @abstractmethod
+    def list_running_runs_for_tasks(
+        self,
+        scheduled_task_ids: builtins.list[str],
+    ) -> builtins.list[ScheduledTaskRun]:
+        """
+        List ``running`` runs for the given tasks in the current workspace.
+
+        Powers the lazy-on-read stale backstop on the scheduled-task LIST
+        endpoint: the route resolves the owner's tasks, then this returns their
+        still-``running`` runs so the route can force-fail the ones past the max
+        age. Workspace-scoped (filters on ``current_workspace_id()``) like every
+        other read; an empty id list returns an empty list.
+
+        :param scheduled_task_ids: Task ids (already owner-scoped by the caller).
+        :returns: ``running`` :class:`ScheduledTaskRun` instances for those
+            tasks, ordered ``scheduled_at DESC, id DESC``.
+        """
+        ...
+
+    @abstractmethod
+    def list_latest_run_status_for_tasks(
+        self,
+        scheduled_task_ids: builtins.list[str],
+    ) -> dict[str, str]:
+        """
+        Return each task's MOST RECENT run status in one windowed query.
+
+        Powers the Tasks-list completion badge: the route resolves the owner's
+        tasks, then this returns ``{task_id: status}`` for the single latest run
+        per task, so a page of N tasks costs ONE query instead of N per-row
+        ``/runs`` fetches. A task with no runs is simply absent from the map (the
+        caller renders "never run").
+
+        "Latest" uses the same ``(scheduled_at DESC, id DESC)`` ordering as
+        :meth:`list_runs`, so the reported status matches the run that would head
+        that task's history — and, crucially, a run-now firing (which creates a
+        new run with a ``scheduled_at`` at/after the last scheduled fire) becomes
+        the reported status as soon as it is recorded. Callers should force-fail
+        stale ``running`` runs BEFORE calling this so a dead orphan reports
+        ``failed`` rather than a stuck ``running``.
+
+        Workspace-scoped (filters on ``current_workspace_id()``) like every other
+        read; an empty id list returns an empty map without a query.
+
+        :param scheduled_task_ids: Task ids (already owner-scoped by the caller).
+        :returns: ``{scheduled_task_id: latest_run_status}`` for tasks that have
+            at least one run.
         """
         ...

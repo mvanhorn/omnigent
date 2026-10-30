@@ -114,3 +114,139 @@ describe("LoginPage sanitizeReturnTo open-redirect defense", () => {
     expect(hrefWrites[0]).not.toContain("evil.com");
   });
 });
+
+describe("LoginPage return_to under a base path", () => {
+  beforeEach(() => {
+    window.__OMNIGENT_BASE_PATH__ = "/proxy/6767";
+  });
+  afterEach(() => {
+    delete window.__OMNIGENT_BASE_PATH__;
+  });
+
+  it("defaults to the base root (not origin root) when no return_to is given", async () => {
+    renderLoginAt("");
+    await waitFor(() => expect(hrefWrites.length).toBeGreaterThan(0));
+    expect(hrefWrites[0]).toBe("/proxy/6767/");
+  });
+
+  it("falls back to the base root for an off-origin return_to", async () => {
+    renderLoginAt("https://evil.com");
+    await waitFor(() => expect(hrefWrites.length).toBeGreaterThan(0));
+    expect(hrefWrites[0]).toBe("/proxy/6767/");
+    expect(hrefWrites[0]).not.toContain("evil.com");
+  });
+
+  it("preserves a legitimate base-prefixed return_to unchanged", async () => {
+    // The captured return_to already carries the base prefix; it must be used
+    // as-is so the post-reload BrowserRouter (basename) matches the route.
+    renderLoginAt("%2Fproxy%2F6767%2Fsessions%2Fabc");
+    await waitFor(() => expect(hrefWrites.length).toBeGreaterThan(0));
+    expect(hrefWrites[0]).toBe("/proxy/6767/sessions/abc");
+  });
+
+  it("prefixes a legitimate same-origin return_to that isn't already base-prefixed", async () => {
+    // A server-issued redirect (e.g. the device-authorization consent bounce)
+    // may not know about the deployment base path — it must still land under
+    // it, not at the bare domain root where the reverse proxy has no route.
+    renderLoginAt("%2Foauth%2Fdevice%3Fuser_code%3DABCD-2345");
+    await waitFor(() => expect(hrefWrites.length).toBeGreaterThan(0));
+    expect(hrefWrites[0]).toBe("/proxy/6767/oauth/device?user_code=ABCD-2345");
+  });
+});
+
+describe("LoginPage v2 (?login-v2=1) flow", () => {
+  function renderLoginV2(extra = "") {
+    return render(
+      <MemoryRouter initialEntries={[`/login?login-v2=1${extra}`]}>
+        <LoginPage />
+      </MemoryRouter>,
+    );
+  }
+
+  it("renders the sign-in form inside the v2 card", async () => {
+    vi.mocked(accountsApi.getMe).mockResolvedValue(null);
+    renderLoginV2();
+    expect(await screen.findByLabelText(/username/i)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /sign in/i })).toBeInTheDocument();
+  });
+
+  it("signs in and navigates on success", async () => {
+    vi.mocked(accountsApi.getMe).mockResolvedValue(null);
+    vi.mocked(accountsApi.login).mockResolvedValue({
+      ok: true,
+      user: { id: "alice", is_admin: false },
+      token: "t",
+      expires_in: 3600,
+    });
+    renderLoginV2();
+    fireEvent.change(await screen.findByLabelText(/username/i), { target: { value: "alice" } });
+    fireEvent.change(screen.getByLabelText(/password/i), { target: { value: "hunter2!" } });
+    fireEvent.click(screen.getByRole("button", { name: /sign in/i }));
+
+    await waitFor(() =>
+      expect(accountsApi.login).toHaveBeenCalledWith({ username: "alice", password: "hunter2!" }),
+    );
+    await waitFor(() => expect(hrefWrites[0]).toBe("/"));
+  });
+
+  it("shows the server error and does not navigate on failure", async () => {
+    vi.mocked(accountsApi.getMe).mockResolvedValue(null);
+    vi.mocked(accountsApi.login).mockResolvedValue({
+      ok: false,
+      error: "Invalid credentials",
+      status: 401,
+    });
+    renderLoginV2();
+    fireEvent.change(await screen.findByLabelText(/username/i), { target: { value: "alice" } });
+    fireEvent.change(screen.getByLabelText(/password/i), { target: { value: "wrongpass" } });
+    fireEvent.click(screen.getByRole("button", { name: /sign in/i }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("Invalid credentials");
+    expect(hrefWrites).toHaveLength(0);
+  });
+});
+
+describe("LoginPage forced re-auth (?reauth=1)", () => {
+  it("does NOT auto-bounce an already-signed-in user — shows the form", async () => {
+    // getMe resolves to an account (beforeEach default), which normally
+    // auto-returns to return_to. Under reauth=1 (device-grant consent), that
+    // shortcut must be suppressed so the user re-enters their password.
+    render(
+      <MemoryRouter
+        initialEntries={["/login?reauth=1&return_to=%2Foauth%2Fdevice%3Fuser_code%3DABCD"]}
+      >
+        <LoginPage />
+      </MemoryRouter>,
+    );
+    // The password form is shown…
+    await waitFor(() => expect(screen.getByLabelText(/password/i)).toBeInTheDocument());
+    // …and no auto-navigation happened despite an existing session.
+    expect(hrefWrites).toHaveLength(0);
+    expect(accountsApi.getMe).not.toHaveBeenCalled();
+  });
+
+  it("navigates to return_to only after a fresh submit under reauth=1", async () => {
+    vi.mocked(accountsApi.login).mockResolvedValue({
+      ok: true,
+      user: { id: "alice", is_admin: false },
+      token: "t",
+      expires_in: 3600,
+    });
+    render(
+      <MemoryRouter
+        initialEntries={["/login?reauth=1&return_to=%2Foauth%2Fdevice%3Fuser_code%3DABCD"]}
+      >
+        <LoginPage />
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(screen.getByLabelText(/password/i)).toBeInTheDocument());
+    expect(hrefWrites).toHaveLength(0); // still no auto-bounce
+
+    fireEvent.change(screen.getByLabelText(/username/i), { target: { value: "alice" } });
+    fireEvent.change(screen.getByLabelText(/password/i), { target: { value: "pw" } });
+    fireEvent.click(screen.getByRole("button", { name: /sign in/i }));
+
+    await waitFor(() => expect(hrefWrites.length).toBeGreaterThan(0));
+    expect(hrefWrites[0]).toBe("/oauth/device?user_code=ABCD");
+  });
+});

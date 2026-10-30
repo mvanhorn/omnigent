@@ -69,9 +69,28 @@ def test_parse_with_provider_prefix(
     assert parse_model_string(model_string) == expected
 
 
-def test_parse_without_prefix_defaults_to_openai() -> None:
-    result = parse_model_string("gpt-5.4")
-    assert result == RoutedModel(provider="openai", model="gpt-5.4")
+@pytest.mark.parametrize(
+    "bare_model",
+    [
+        "gpt-5.4",
+        # Non-gpt bare ids also default to "openai" — parse_model_string is
+        # the generic-client routing primitive (omnigent/llms/client.py); its
+        # bare→openai default preserves the OpenAI-compatible adapter path
+        # for specs that pin a plain model id against a custom base_url
+        # (LiteLLM / OpenRouter / local-gateway style).  Provider inference
+        # for harness decisions (web_search passthrough gating) is scoped to
+        # web_search_native_passthrough_provider, not to this function.
+        "claude-opus-4-8",
+        "gemini-2.5-flash",
+        "grok-2",
+        "deepseek-chat",
+        "databricks-gpt-5-4",
+    ],
+)
+def test_parse_without_prefix_defaults_to_openai(bare_model: str) -> None:
+    """Bare model ids (no ``/``) always resolve to the openai provider."""
+    result = parse_model_string(bare_model)
+    assert result == RoutedModel(provider="openai", model=bare_model)
 
 
 def test_unknown_provider_raises() -> None:
@@ -90,10 +109,16 @@ def test_unknown_provider_raises() -> None:
         # passthrough 400s for Claude).
         ("databricks-claude-sonnet-4", "claude-sdk"),
         ("databricks-claude-sonnet-4-6", "claude-sdk"),
+        ("system.ai.claude-sonnet-4-6", "claude-sdk"),
         # Anthropic-prefixed models also need claude-sdk.
         ("anthropic/claude-sonnet-4-20250514", "claude-sdk"),
         # Databricks-hosted GPT and plain OpenAI models → openai-agents.
         ("databricks-gpt-5-4", "openai-agents"),
+        ("system.ai.gpt-5-6-sol", "openai-agents"),
+        ("databricks-glm-5-2", "openai-agents"),
+        ("system.ai.glm-5-2", "openai-agents"),
+        ("databricks-kimi-k2-6", "openai-agents"),
+        ("system.ai.kimi-k2-6", "openai-agents"),
         ("openai/gpt-5.4", "openai-agents"),
         ("gpt-5.4", "openai-agents"),
         # xAI / Grok models -- provider prefix required.

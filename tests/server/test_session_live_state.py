@@ -54,7 +54,7 @@ class _RecordingStore:
         self.status_writes: list[tuple[str, str]] = []
         self.pending_writes: list[tuple[str, int]] = []
         self.touches: list[list[str]] = []
-        self.clears: list[str] = []
+        self.clears: list[tuple[str, int | None]] = []
 
     def set_session_live_status(self, conversation_id: str, status: str) -> None:
         self.status_writes.append((conversation_id, status))
@@ -66,8 +66,8 @@ class _RecordingStore:
         del now
         self.touches.append(runner_ids)
 
-    def clear_runner_liveness(self, runner_id: str) -> None:
-        self.clears.append(runner_id)
+    def clear_runner_liveness(self, runner_id: str, not_after: int | None = None) -> None:
+        self.clears.append((runner_id, not_after))
 
 
 @pytest.fixture()
@@ -97,6 +97,13 @@ def test_persist_live_status_dedupes_transitions(recording_store: _RecordingStor
         ("conv_1", "idle"),
         ("conv_2", "idle"),
     ]
+
+
+def test_forget_live_status_drops_dedupe_state() -> None:
+    """A replica handing off a session must not keep its stale dedupe state."""
+    session_live_state._last_status["conv_1"] = "running"
+    session_live_state.forget_live_status("conv_1")
+    assert "conv_1" not in session_live_state._last_status
 
 
 def test_pending_count_hook_persists_publish_and_resolve(
@@ -137,7 +144,33 @@ def test_runner_liveness_touch_and_clear_pass_through(
     session_live_state.clear_runner_liveness("runner_a")
     _wait_until(lambda: recording_store.touches and recording_store.clears)
     assert recording_store.touches == [["runner_a", "runner_b"]]
-    assert recording_store.clears == ["runner_a"]
+    stamp = session_live_state.last_liveness_stamp("runner_a")
+    assert recording_store.clears == [("runner_a", stamp)]
+
+
+def test_touch_records_stamp_and_clear_forwards_it_as_not_after(
+    recording_store: _RecordingStore,
+) -> None:
+    """``touch`` remembers its own stamp; ``clear`` forwards it as ``not_after``.
+
+    The disconnect handler relies on this stamp surviving the clear itself
+    (never erased here — only :func:`session_live_state.configure` resets
+    it), so a later cross-replica check still has something to compare
+    against.
+    """
+    assert session_live_state.last_liveness_stamp("runner_c") is None
+
+    before = int(time.time())
+    session_live_state.touch_runner_liveness(["runner_c"])
+    stamp = session_live_state.last_liveness_stamp("runner_c")
+    assert stamp is not None and stamp >= before
+
+    session_live_state.clear_runner_liveness("runner_c")
+    _wait_until(lambda: bool(recording_store.clears))
+    assert recording_store.clears == [("runner_c", stamp)]
+
+    # The clear call itself never erases the process's own record of it.
+    assert session_live_state.last_liveness_stamp("runner_c") == stamp
 
 
 def test_unconfigured_module_is_a_no_op() -> None:
@@ -247,6 +280,123 @@ def test_unencodable_status_is_dropped_before_enqueue(
 
     # Only the encodable status was ever enqueued; "launching" never was.
     assert recording_store.status_writes == [("conv_1", "running")]
+
+
+class _FakeScheduledTaskStore:
+    """Scheduled-task-store stand-in recording the hook's lookup + update."""
+
+    def __init__(self, running_by_conv: dict[str, str] | None = None) -> None:
+        # conversation_id -> run_id for conversations that have a running run.
+        self._running_by_conv = running_by_conv or {}
+        self.lookup_calls: list[str] = []
+        self.update_calls: list[tuple[str, str, str | None, str | None]] = []
+        self.lookup_workspaces: list[int] = []
+
+    def get_running_run_by_conversation(self, conversation_id: str):  # type: ignore[no-untyped-def]
+        from omnigent.db.db_models import current_workspace_id
+
+        self.lookup_calls.append(conversation_id)
+        self.lookup_workspaces.append(current_workspace_id())
+        run_id = self._running_by_conv.get(conversation_id)
+        if run_id is None:
+            return None
+        # Minimal object carrying only the ``id`` the hook reads.
+        return type("_Run", (), {"id": run_id})()
+
+    def update_run(
+        self,
+        run_id: str,
+        *,
+        status: str,
+        finished_at: int,
+        error: str | None = None,
+        error_code: str | None = None,
+    ):  # type: ignore[no-untyped-def]
+        self.update_calls.append((run_id, status, error, error_code))
+        return type("_Run", (), {"id": run_id, "status": status})()
+
+
+def test_scheduled_run_completion_idle_transitions_to_succeeded() -> None:
+    """A terminal ``idle`` edge flips the conversation's running run to succeeded."""
+    sched = _FakeScheduledTaskStore({"conv_1": "run_1"})
+    session_live_state.configure(_RecordingStore(), sched)  # type: ignore[arg-type]
+    try:
+        session_live_state.persist_scheduled_run_completion("conv_1", "succeeded")
+        _wait_until(lambda: bool(sched.update_calls))
+    finally:
+        session_live_state.configure(None)
+    assert sched.lookup_calls == ["conv_1"]
+    assert len(sched.update_calls) == 1
+    run_id, status, error, error_code = sched.update_calls[0]
+    assert (run_id, status) == ("run_1", "succeeded")
+    assert error is None and error_code is None
+
+
+def test_scheduled_run_completion_failed_carries_error_code() -> None:
+    """A terminal ``failed`` edge flips the run to failed with the error detail."""
+    sched = _FakeScheduledTaskStore({"conv_1": "run_1"})
+    session_live_state.configure(_RecordingStore(), sched)  # type: ignore[arg-type]
+    try:
+        session_live_state.persist_scheduled_run_completion(
+            "conv_1", "failed", error_code="runner_disconnected", error="dropped"
+        )
+        _wait_until(lambda: bool(sched.update_calls))
+    finally:
+        session_live_state.configure(None)
+    assert sched.update_calls == [("run_1", "failed", "dropped", "runner_disconnected")]
+
+
+def test_scheduled_run_completion_noop_for_non_scheduled_conversation() -> None:
+    """An interactive conversation has no running run → lookup only, no update.
+
+    This is the common case: the hook fires on every terminal edge, and the
+    cheap reverse lookup returning ``None`` keeps it a no-op for the vast
+    majority of (non-scheduled) conversations.
+    """
+    sched = _FakeScheduledTaskStore({})  # no running runs
+    session_live_state.configure(_RecordingStore(), sched)  # type: ignore[arg-type]
+    try:
+        session_live_state.persist_scheduled_run_completion("conv_x", "succeeded")
+        _wait_until(lambda: bool(sched.lookup_calls))
+    finally:
+        session_live_state.configure(None)
+    assert sched.lookup_calls == ["conv_x"]
+    assert sched.update_calls == []
+
+
+def test_scheduled_run_completion_noop_without_scheduled_store() -> None:
+    """With only a conversation store wired the hook is a pure no-op.
+
+    ``configure(store)`` (no scheduled-task store) must not enqueue any work —
+    the runner process and most tests never wire one.
+    """
+    session_live_state.configure(_RecordingStore())  # type: ignore[arg-type]
+    try:
+        # No scheduled store => returns before touching the executor.
+        session_live_state.persist_scheduled_run_completion("conv_1", "succeeded")
+    finally:
+        session_live_state.configure(None)
+
+
+def test_scheduled_run_completion_runs_in_callers_workspace_scope() -> None:
+    """The lookup + update inherit the caller's ``workspace_scope``.
+
+    Same contract as the live_status mirror: the store filters on
+    ``current_workspace_id()``, so the hook's reverse lookup must resolve to
+    the fired run's workspace. Bind a non-default workspace, leave the scope
+    before the worker runs, and assert the write thread still observed it.
+    """
+    from omnigent.db.db_models import workspace_scope
+
+    sched = _FakeScheduledTaskStore({"conv_1": "run_1"})
+    session_live_state.configure(_RecordingStore(), sched)  # type: ignore[arg-type]
+    try:
+        with workspace_scope(4242):
+            session_live_state.persist_scheduled_run_completion("conv_1", "succeeded")
+        _wait_until(lambda: bool(sched.lookup_workspaces))
+    finally:
+        session_live_state.configure(None)
+    assert sched.lookup_workspaces == [4242]
 
 
 @pytest.mark.asyncio

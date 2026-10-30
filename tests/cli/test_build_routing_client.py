@@ -11,6 +11,9 @@ from __future__ import annotations
 from typing import Any
 from unittest.mock import MagicMock, patch
 
+import click
+import pytest
+
 from omnigent.cli import _build_external_routing_client, _build_local_llm_routing_client
 from omnigent.server.smart_routing import ExternalRoutingClient, LLMRoutingClient
 
@@ -26,7 +29,11 @@ def test_external_builds_client() -> None:
     assert client._url == "https://host/ai-gateway/routing/v1/routes:select"
     assert client._router_name == "task_v0"
     assert client._auth is None  # no profile -> unauthenticated
-    assert client._model_prefixes == []  # no prefix -> catalog ids sent verbatim
+    # No prefix configured -> the module's shared catalog-prefix list, so the
+    # client and the server-side seam can't disagree about a catalog id.
+    from omnigent.server.smart_routing import MODEL_ID_PREFIXES
+
+    assert client._model_prefixes == list(MODEL_ID_PREFIXES)
 
 
 def test_external_threads_model_prefix_scalar() -> None:
@@ -55,22 +62,68 @@ def test_external_threads_model_prefix_list() -> None:
     assert client._model_prefixes == ["databricks-", "system.ai."]
 
 
-def test_external_resolves_profile_auth() -> None:
+def test_external_defers_profile_auth_to_per_call() -> None:
+    """A ``profile`` is threaded through for lazy per-call token minting.
+
+    The client mints a fresh bearer per request (OAuth refresh) rather
+    than resolving a token at build time — a token captured once here
+    would 401 after ~1h. So the builder neither resolves the profile
+    eagerly nor sets a static ``_auth``; it stores the profile instead.
+    """
     cfg = {
         "provider": "external",
         "base_url": "https://host/v1",
         "router_name": "task_v0",
         "profile": "staging",
     }
-    creds = MagicMock(token="dapi-XYZ", host="https://host")
     with patch(
         "omnigent.runtime.credentials.databricks.resolve_databricks_workspace",
-        return_value=creds,
     ) as resolve:
         client = _build_external_routing_client(cfg)
-    resolve.assert_called_once_with("staging")
+    resolve.assert_not_called()  # deferred to per-call, not resolved at build
     assert isinstance(client, ExternalRoutingClient)
-    assert client._auth is not None  # bearer auth built from the profile token
+    assert client._auth is None  # static auth unused; token minted per call
+    assert client._databricks_profile == "staging"
+
+
+def test_external_falls_back_to_the_deployments_databricks_provider_profile() -> None:
+    """
+    A ``routing:`` block that names no profile still authenticates as the config's.
+
+    Otherwise the client falls through to the ambient SDK chain, which resolves
+    by host or ``[DEFAULT]``: on a workspace with two profiles on one host, the
+    router then authenticates as a different identity than the panes it routes,
+    and re-authing one leaves the other's token expired.
+    """
+    cfg = {
+        "providers": {
+            "ws": {"kind": "databricks", "profile": "eng-ml-agent-platform", "default": True},
+        },
+        "routing": {
+            "provider": "external",
+            "base_url": "https://host/v1",
+            "router_name": "task_v0",
+        },
+    }
+    client = _build_external_routing_client(cfg["routing"], None, cfg)
+    assert isinstance(client, ExternalRoutingClient)
+    assert client._databricks_profile == "eng-ml-agent-platform"
+
+
+def test_externals_own_profile_still_wins_over_the_provider_block() -> None:
+    """An explicitly routed profile is the deployment saying which identity to use."""
+    cfg = {
+        "providers": {"ws": {"kind": "databricks", "profile": "agent"}},
+        "routing": {
+            "provider": "external",
+            "base_url": "https://host/v1",
+            "router_name": "task_v0",
+            "profile": "staging",
+        },
+    }
+    client = _build_external_routing_client(cfg["routing"], None, cfg)
+    assert isinstance(client, ExternalRoutingClient)
+    assert client._databricks_profile == "staging"
 
 
 def test_external_api_key_expands_env(monkeypatch: Any) -> None:
@@ -118,6 +171,17 @@ def test_external_missing_required_fields_disables() -> None:
         _build_external_routing_client({"provider": "external", "base_url": "https://h/v1"})
         is None
     )
+
+
+def test_external_rejects_non_string_config_value() -> None:
+    with pytest.raises(click.ClickException, match=r"routing\.base_url must be a string"):
+        _build_external_routing_client(
+            {
+                "provider": "external",
+                "base_url": 123,
+                "router_name": "task_v0",
+            }
+        )
 
 
 def test_llm_without_server_llm_disables() -> None:

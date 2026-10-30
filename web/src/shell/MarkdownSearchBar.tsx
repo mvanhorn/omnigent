@@ -9,6 +9,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { ChevronDownIcon, ChevronUpIcon, SearchIcon, XIcon } from "lucide-react";
 import type { Editor } from "@tiptap/react";
+import type { Transaction } from "@tiptap/pm/state";
 import type { ReactElement, RefObject } from "react";
 import {
   findMatches,
@@ -36,15 +37,18 @@ export function MarkdownSearchBar({
   const [query, setQuery] = useState("");
   const [currentIndex, setCurrentIndex] = useState(0);
 
-  // Recount matches whenever the query changes or the document is edited, so
-  // "n / m" and navigation stay accurate.
+  // Recount matches whenever the query changes or the document changes, so
+  // "n / m" and navigation stay accurate. Another writer's update arrives
+  // without an "update" event, so listen to every document-changing transaction.
   const [docVersion, setDocVersion] = useState(0);
   useEffect(() => {
     if (!editor) return;
-    const bump = () => setDocVersion((v) => v + 1);
-    editor.on("update", bump);
+    const bump = ({ transaction }: { transaction: Transaction }) => {
+      if (transaction.docChanged) setDocVersion((v) => v + 1);
+    };
+    editor.on("transaction", bump);
     return () => {
-      editor.off("update", bump);
+      editor.off("transaction", bump);
     };
   }, [editor]);
 
@@ -88,10 +92,9 @@ export function MarkdownSearchBar({
 
   // Focus the input when the bar opens.
   useEffect(() => {
-    if (open) {
-      const id = setTimeout(() => inputRef.current?.focus(), 0);
-      return () => clearTimeout(id);
-    }
+    if (!open) return undefined;
+    const id = setTimeout(() => inputRef.current?.focus(), 0);
+    return () => clearTimeout(id);
   }, [open, inputRef]);
 
   const goNext = useCallback(() => {
@@ -129,9 +132,9 @@ export function MarkdownSearchBar({
           }
         }}
         placeholder="Find…"
-        className="min-w-0 flex-1 bg-transparent text-xs outline-none"
+        className="min-w-0 flex-1 bg-transparent text-sm outline-none"
       />
-      <span className="shrink-0 text-xs text-muted-foreground">
+      <span className="shrink-0 text-sm text-muted-foreground">
         {query.trim() ? (matchCount > 0 ? `${safeIndex + 1} / ${matchCount}` : "No results") : ""}
       </span>
       <button

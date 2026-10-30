@@ -10,6 +10,11 @@ Two families: **HTTP/API journeys** (server + DB, no runner/LLM — fast and
 low-noise) and **full-turn journeys** (a real agent turn through the runner +
 a zero-latency mock LLM). See *Journeys* below.
 
+The companion [OSS UI benchmark](../ui/README.md) drives the production SPA in
+Chromium against the same isolated server lifecycle. It measures populated
+session opening, composer key-to-frame latency, and per-keystroke style/layout
+work, with a same-runner base-versus-PR gate and nightly JSON artifacts.
+
 By default the server boots a fresh, empty SQLite DB, which gives best-case
 numbers that don't move with load. For meaningful results, point it at a
 **pre-seeded corpus** (`seed.py`) and, ideally, at **Postgres** — production
@@ -44,7 +49,8 @@ Key flags (`--help` for all): `--journeys A,B`, `--database-uri URI` (seeded
 corpus / Postgres; default: throwaway empty SQLite), `--iterations N` (per
 latency run), `--requests N` / `--concurrency N` (throughput), `--runs N`,
 `--warmup N`, `--output FILE`, `--min-rps` / `--max-p50-ms` / `--max-p99-ms`
-(CI thresholds).
+(CI thresholds), `--network-delay-ms MS` (simulated client↔server latency,
+see *Network* below).
 
 ## Journeys
 
@@ -59,11 +65,28 @@ latency run), `--requests N` / `--concurrency N` (throughput), `--runs N`,
 | `search_sessions` | `GET /v1/sessions?search_query=` — unindexed `LIKE` | total item count |
 | `fork_session` | `POST /v1/sessions/{id}/fork` — fork (deep-copy items); forks deleted in teardown, untimed | items/session |
 | `add_comment` | `POST /v1/sessions/{id}/comments` — create a review comment | write path |
+| `list_projects` | `GET /v1/sessions/projects` — sidebar project list (dual-read union) | project count |
+| `list_project_sessions` | `GET /v1/sessions?project=` — a project folder's sessions (dual-read filter) | sessions/project |
 
 Read journeys target a **pre-seeded** session when the DB has a corpus; against
 an empty DB they self-seed a small fallback session over HTTP (the
 `external_conversation_item` event — appends items without starting a task), so
 they still work with no runner or LLM.
+
+### Hook spawn (no server)
+
+| Journey | Operation timed |
+| --- | --- |
+| `native_hook_spawn` | Spawn the per-chunk `MessageDisplay` hook exactly as Claude Code does — isolated interpreter, module entrypoint, JSON payload on stdin |
+
+Claude Code **blocks its TUI** on command hooks, so one hook subprocess's
+lifetime is user-visible streaming latency, and the same interpreter+import
+cost fronts every statusline refresh and per-tool-call policy hook. The
+journey needs no server or runner; registering it here rides hook spawn cost
+on the same nightly/release regression comparison as everything else
+(`omnigent/__init__` re-exports lazily so this stays ~interpreter-sized). The
+import-graph side of the guarantee is pinned deterministically by
+`tests/harnesses/claude_native/test_claude_native_message_display_hook.py`.
 
 ### Full-turn (runner + mock LLM)
 
@@ -71,13 +94,21 @@ These drive a real agent turn end-to-end — `POST …/events` → server → **
 → in-process executor → mock LLM → stream back → `idle`. Selecting any of them
 boots `BenchEnvironment(with_runner=True)` automatically.
 
-Each turn costs ~1 s+ (vs. the millisecond HTTP journeys), so these journeys
-cap their latency iterations (`Journey.max_iterations`, currently 5) — a large
-`--iterations` tuned for the HTTP journeys is clamped down for them so the run
-stays within the CI time budget, with `--runs` providing the repeats. The cap
-only lowers the count, never raises it. A cold start never deletes its session,
-so sessions accumulate across a run; keeping the count small also keeps that
-drift negligible (~2 ms/turn).
+These journeys cap their latency iterations (`Journey.max_iterations`) and,
+where repeats warm nothing, their warmups (`Journey.max_warmup`), so a large
+`--iterations` / `--warmup` tuned for the HTTP journeys is clamped down and the
+run stays within the CI time budget. Caps only lower a count, never raise it.
+
+- `warm_turn`, `time_to_first_token`, `interrupt`: up to 50 samples per run.
+  Each turn's LLM request grows with session history, so they move to a fresh
+  warmed session every 25 samples to bound history depth.
+- `session_cold_start`, `session_cold_restart`: 1 warmup and up to 14 samples.
+  Every op launches a fresh runner, so one warmup absorbs the first-launch
+  costs; a run launches at most 15 runners.
+- `cli_startup`: no warmup, up to 6 samples. Times `omnigent polly --server` from
+  invocation until the REPL toolbar reports `ready`. The CLI gets its own data
+  and config dirs, and between samples only its own daemons are stopped, so the
+  journey is safe to run next to a local Omnigent server.
 
 | Journey | Operation timed |
 | --- | --- |
@@ -85,7 +116,7 @@ drift negligible (~2 ms/turn).
 | `session_cold_restart` | With an existing session's runner stopped before the sample, post a user message and time the automatic runner relaunch to first token |
 | `warm_turn` | Drive a turn on an already-warm session — steady-state dispatch overhead |
 | `time_to_first_token` | Post a turn; time to the first streamed `output_text` delta |
-| `interrupt` | Interrupt a running (gated) turn; time to cancellation |
+| `interrupt` | With a turn parked on the mock's gate before the sample, time `POST interrupt` → the turn going `idle` (the cancel path only) |
 | `read_runner_file` | `GET .../environments/default/filesystem/{path}` — server → runner filesystem read proxy |
 
 The two cold journeys use a real `omni host` daemon. `session_cold_start`
@@ -113,6 +144,89 @@ dispatch/streaming/cancel overhead, not model latency.
 Add a journey by registering a `Journey` in `journeys.py` (set `needs_runner`
 for full-turn journeys).
 
+## Network requests + simulated delay
+
+Two related knobs for reasoning about **network cost** — the round-trips a
+journey makes and what they'd cost over a real network, both of which loopback
+otherwise hides.
+
+### Requests-per-op (`http_requests` / `avg_http_requests_per_op`)
+
+Every run reports how many HTTP requests **the server handled** during its
+timed region, divided by successful ops → requests-per-op. This is the
+deterministic, noise-free signal: a change that adds or removes a round-trip
+moves the count directly, independent of timing jitter.
+
+The value is the *server-side* count, not just what the benchmark process
+issues — so for the full-turn (`needs_runner`) journeys it also captures the
+cross-process traffic a client-side hook can't see (runner → server callbacks,
+host → server). That's where the count is genuinely unknown and interesting; for
+the HTTP/API journeys it's known by construction (`list_sessions` = 1,
+`create_session` = 2 for the POST + inline DELETE, etc.).
+
+How it works, and why it never ships in production:
+
+- The server already tracks a cumulative request counter
+  (`ServerPerformanceMetrics.total_started`), but it lives in the server
+  subprocess's memory and is only pushed to OTel. The harness needs to *read*
+  it, so a tiny router (`debug_router.py`) exposes it at
+  `GET /debug/server-metrics`.
+- That router lives under `dev/`, which `pyproject.toml` excludes from the wheel
+  (`include = ["omnigent*"]`) — a production install can't even import it.
+- It's mounted only via the `debug_router_modules` config key, which mirrors the
+  existing `policy_modules` load-by-dotted-path seam (`create_app` →
+  `_load_debug_routers`). The harness's generated `server.yaml` sets it;
+  production config never does. A module that fails to import is logged and
+  skipped, so a stray key is a no-op where `dev/` is absent.
+- The harness (`environment.py`) reads the endpoint around each run's timed
+  region and diffs it (subtracting its own closing poll). Counting is
+  best-effort: if the endpoint is unreachable the run still reports latency,
+  just with `http_requests: null`.
+
+**Per-route appendix (`network_routes`).** Beyond the single per-op number, the
+endpoint also returns a per-route tally (keyed by the low-cardinality FastAPI
+template, e.g. `POST /v1/sessions`), so each journey's `summary` carries a
+`network_routes` breakdown — every endpoint the journey hit, its total request
+count, and per-op count, sorted chattiest-first. Since the count is near
+identical across runs, it's summed across the summary runs and grouped by route.
+This is what makes the count *actionable*: for `session_cold_start` it names
+which endpoints the ~12 requests/op are spread across (including the
+cross-process runner→server / host→server calls), not just the total. The
+harness's own counter-poll route is filtered out. The raw per-run map is in each
+run's `route_requests`.
+
+**Tunnel round-trips are not counted.** Steady-state server↔runner traffic is
+frames multiplexed over one long-lived WebSocket tunnel, not fresh HTTP requests
+— so neither this counter nor an HTTP hook sees them as "requests." Counting
+tunnel frames would need instrumenting the tunnel transport; it's out of scope
+for v1.
+
+### Simulated network delay (`--network-delay-ms`)
+
+Loopback has ~zero latency, so the benchmark can't tell a chatty journey (many
+round-trips) from a lean one on wall-clock alone. `--network-delay-ms MS`
+(default `0`) injects an artificial sleep before **every request the benchmark
+client sends**, via an httpx request event hook — modelling a real client↔server
+network hop. Combined with the per-op request count, `delay × requests-per-op`
+is the wall-clock cost those round-trips add, so the two features reinforce each
+other when testing a network optimization.
+
+**Scope note (v1):** the delay models the **client↔server** hop only — the hop
+the benchmark process owns. The cross-process server↔runner tunnel and
+server→mock-LLM hops are *not* delayed (they'd need injecting sleep into the
+runner's client / the tunnel transport, in separate processes). Documented
+follow-up. The nightly and PR workflows run at `0` for stable, comparable trend
+data; dispatch the workflow with a higher `network_delay_ms` when investigating
+a network optimization.
+
+**Mind the CI time budget.** The delay applies to *every* client→server
+request, so it multiplies across the full-turn journeys' round-trips — a cold
+start makes ~12 requests/op. A large delay across the whole default journey set
+can exceed the workflow's 30-min per-leg timeout (empirically, with the older
+poll-based turn driver `network_delay_ms=100` over all journeys timed out; `10`
+finishes in ~6 min). For a bigger delay, pair it with a `--journeys` subset of
+the HTTP journeys, where the count is 1–2/op.
+
 ## Seeding a realistic corpus
 
 `seed.py` writes a sizeable, deterministic corpus directly through the store
@@ -121,17 +235,26 @@ API (no HTTP, no runner) into the same DB the server then boots against:
 ```bash
 # Seed 5000 sessions × 50 items into a SQLite file, then benchmark against it.
 uv run --no-sync dev/benchmarks/omnigent/seed.py \
-    --database-uri sqlite:////abs/path/bench.db --sessions 5000 --items-per-session 50
+    --database-uri sqlite:////abs/path/bench.db --sessions 5000 --items-per-session 50 \
+    --projects 20 --filed-fraction 0.5
 uv run --no-sync dev/benchmarks/omnigent/run.py \
     --database-uri sqlite:////abs/path/bench.db --output bench.json
 ```
 
-Seeding is **idempotent**: a matching corpus (same sessions/items/schema) is
-detected and reused, so re-running is a fast no-op — pass `--reseed` to force,
-or a differing config to be warned. SQLite absolute paths need four slashes
-(`sqlite:////abs/...`). The reuse marker records the DB's Alembic head read at
-seed time, so a corpus from an older schema is automatically reseeded — no
-manual revision bookkeeping. `test_seed_creates_listable_corpus` (which seeds
+The corpus also seeds **first-class projects** and files a fraction of sessions
+into them, so `list_projects` / `list_project_sessions` measure a realistic
+sidebar instead of an empty project set. `--projects N` sets the folder count
+(0 = none) and `--filed-fraction F` the fraction of sessions filed (round-robin
+across the folders); the defaults (20 projects, 0.5) put ~1/40th of the corpus
+in each folder. Projects are owned by the reserved `"local"` user the loopback
+server resolves to, so the owner-scoped project reads see them.
+
+Seeding is **idempotent**: a matching corpus (same sessions/items/projects/
+schema) is detected and reused, so re-running is a fast no-op — pass `--reseed`
+to force, or a differing config to be warned. SQLite absolute paths need four
+slashes (`sqlite:////abs/...`). The reuse marker records the DB's Alembic head
+read at seed time, so a corpus from an older schema is automatically reseeded —
+no manual revision bookkeeping. `test_seed_creates_listable_corpus` (which seeds
 through the store, running migrations to the current head) is the safety net
 that a schema change hasn't broken seeding.
 
@@ -173,7 +296,7 @@ document without running the harness.
 
 ```jsonc
 {
-  "schema_version": 4,
+  "schema_version": 6,
   "generated_at": "<ISO-8601 UTC>",
   "git_sha": "<HEAD sha>",
   "git_branch": "<branch>",
@@ -181,7 +304,7 @@ document without running the harness.
   "harness": "http-only",
   "config": {"iterations": 100, "requests": 500, "concurrency": 1,
              "runs": 3, "warmup": 10, "with_runner": false,
-             "backend": "sqlite"},
+             "backend": "sqlite", "network_delay_ms": 0.0},
   "journeys": {
     "<journey name>": {
       "kind": "latency" | "throughput",
@@ -190,11 +313,18 @@ document without running the harness.
       "runs": [                       // one per --runs
         {"n_success": N, "n_failures": N, "failures": {"HTTP 500": 1},
          "wall_time_s": …, "mean_ms": …, "p50_ms": …, "p95_ms": …,
-         "p99_ms": …, "max_ms": …, "rps": …}
+         "p99_ms": …, "max_ms": …, "rps": …,
+         "http_requests": N,          // server HTTP requests during the timed region; null if uncounted
+         "http_requests_per_op": …,   // http_requests / n_success; null if uncounted
+         "route_requests": {"POST /v1/sessions": N, ...}}  // per-route breakdown; {} if uncounted
       ],
       "summary": {"runs_total": 3, "runs_ok": 3,   // how many runs the averages cover
                   "avg_mean_ms": …, "avg_p50_ms": …, "avg_p95_ms": …,
-                  "avg_p99_ms": …, "avg_rps": …}    // averaged over the runs_ok runs
+                  "avg_p99_ms": …, "avg_rps": …,   // averaged over the runs_ok runs
+                  "avg_http_requests_per_op": …,   // present only when a run was counted
+                  "network_routes": [              // per-route appendix, sorted by per_op desc
+                    {"route": "POST /v1/sessions", "requests": N, "per_op": …}
+                  ]}                               // present only when a run recorded routes
     }
     // A journey that errored out of measurement entirely instead carries:
     //   {"kind", "backend", "needs_runner", "runs": [], "summary": {},
@@ -202,6 +332,10 @@ document without running the harness.
   }
 }
 ```
+
+The `http_requests*` / `route_requests` / `network_routes` fields are the
+server-side request count and its per-endpoint breakdown (see *Network* above);
+`network_delay_ms` records the simulated client↔server latency the run used.
 
 The per-journey `summary` + `runs` shape mirrors MLflow's gateway benchmark, so
 the same ETL flatten works — keyed by `journey` and `backend`. Bump
@@ -227,9 +361,10 @@ couldn't be verified.
 | `run.py` | CLI orchestrator + entrypoint |
 | `seed.py` | deterministic corpus seeder (store API) |
 | `journeys.py` | `Journey` dataclass, latency/throughput runners, registry |
-| `environment.py` | server (± runner + mock LLM) lifecycle; `--database-uri` |
+| `environment.py` | server (± runner + mock LLM) lifecycle; `--database-uri`; request-count read + network-delay hook |
 | `measure.py` | `RunResult`, percentile, aggregation, thresholds, tables |
 | `schema.py` | `SCHEMA_VERSION`, `build_report`, git/host metadata |
+| `debug_router.py` | CI-only `GET /debug/server-metrics` plugin router (never shipped in the wheel) |
 | `sample_output.json` | committed example of the JSON contract |
 
 The smoke test is `tests/benchmarks/test_benchmark_smoke.py` (boots the server
@@ -246,6 +381,22 @@ head + `seed.py` + corpus config, so a migration busts the cache and forces a
 reseed; Postgres and MySQL are fresh per run), runs the benchmark, and uploads
 `benchmark-results-<backend>-<run_id>.json`. The workspace notebook pulls those
 artifacts.
+
+`.github/workflows/benchmark-release.yml` gates release cuts (called from
+`release.yml`). It benchmarks the previous stable release and the candidate
+concurrently on **one** runner, because hosted VMs vary in speed by up to ~1.5x
+between runs and a cross-runner comparison reports that as a regression. Each
+side gets its own checkout, venv, `HOME`, and copy of a corpus seeded at the
+baseline's schema. Dispatch it with `baseline_ref` == `candidate_ref` for an A/A
+noise check.
+
+`compare.py` (used by the release and PR gates) flags a regression on run-median
+P50 or P95 (`--threshold`, and optionally a separate `--threshold-p95`). Journeys
+with fewer than 20 samples per run gate on P50 only, since their P95 is the slowest
+sample. A journey whose candidate ops all failed is `failed` and fails the gate.
+The release gate uses 30% on P50 and 50% on P95, about twice the worst
+per-journey noise seen in same-runner A/A runs; the PR benchmark's comparison
+against the nightly (a different VM) stays at 100%.
 
 Schema changes need no manual step: the seed always targets the current
 migrated schema (migrations run when the store is constructed), the reuse
@@ -275,4 +426,47 @@ seeding.
 - **Simulated provider latency.** The mock LLM returns at ~zero latency, which
   is what isolates omnigent overhead. A fixed per-response delay knob would let
   turns model end-user wall-clock instead; it's a small change behind the
-  `configure_mock` / `set_mock_fallback` seam if that's ever wanted.
+  `configure_mock` / `set_mock_fallback` seam if that's ever wanted. (Distinct
+  from `--network-delay-ms`, which models the *client↔server* hop — see
+  *Network* above.)
+- **Wider network-delay coverage.** `--network-delay-ms` v1 delays only the
+  client↔server hop (the one the benchmark process owns). Extending it to the
+  server↔runner tunnel and server→mock-LLM hops would need injecting the delay
+  into the runner's httpx client and the tunnel transport in their own
+  processes.
+- **Tunnel round-trip counting.** `http_requests` counts HTTP the server
+  handles, not frames on the persistent server↔runner WebSocket tunnel.
+  Counting those (for a true per-turn round-trip figure) would mean
+  instrumenting the tunnel transport's `RequestFrame` dispatch.
+
+
+### Project-order latency
+
+The default suite includes **four scenarios at 1,000 projects**: order GET,
+manual order PUT, and both project-list endpoints in manual mode. This keeps
+one latency signal per endpoint without multiplying the report by sort mode
+and project count. Alphabetical/reset behavior and size limits remain covered
+by store/API tests. For a focused run:
+
+```bash
+uv run --no-sync dev/benchmarks/omnigent/run.py \
+  --journeys project_order_save_1000,project_order_get_custom_1000,project_order_projects_custom_1000,project_order_session_projects_custom_1000 \
+  --iterations 100 --runs 3 --output /tmp/project-order-benchmark.json
+```
+
+These journeys share the `benchmark-project-order-1000` account, using
+the benchmark server's trusted identity header. Setup creates exactly the
+specified number of empty projects via the API, outside timing; repeated runs
+reuse them. Existing corpus sessions and the local user's preference are
+untouched. Use a benchmark database, as with the rest of this suite.
+
+Saves alternate between two manual orders. Persistence checks run outside each
+operation's latency timer; they do contribute to request counters and wall-clock
+throughput. Read samples validate exact counts and ordering. The large-project
+case guards against work that scales poorly with project count; the existing
+`list_projects` journey continues covering the local user's seeded sessions.
+
+The existing nightly backend matrix collects these names automatically. PR
+comparisons start gating them once a nightly baseline includes the new names;
+until then the comparator labels them as new. Existing regression thresholds
+are unchanged.

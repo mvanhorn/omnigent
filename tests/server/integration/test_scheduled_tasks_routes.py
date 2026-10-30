@@ -7,8 +7,12 @@ validation (400s) and live-scheduler sync on every mutation.
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+import uuid
+from collections.abc import AsyncIterator, Callable, Iterator
+from contextlib import asynccontextmanager
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 
 import httpx
 import pytest
@@ -16,21 +20,43 @@ import pytest_asyncio
 from fastapi import FastAPI
 
 from omnigent.db.utils import builtin_agent_id
+from omnigent.native.native_coding_agents import CLAUDE_NATIVE_AGENT_NAME
 from omnigent.runtime.agent_cache import AgentCache
-from omnigent.server import app as server_app
 from omnigent.server.app import create_app
+from omnigent.server.feature_flags import resolve_feature_flags
+from omnigent.server.managed_hosts import ManagedSandboxConfig, ManagedSandboxDeployment
 from omnigent.server.routes import scheduled_tasks as scheduled_tasks_routes
+from omnigent.server.scheduled.dispatch_scheduler import (
+    PersistentTaskScheduler,
+    ScheduledTaskDispatchHooks,
+)
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
 from omnigent.stores.scheduled_task_store.sqlalchemy_store import (
     SqlAlchemyScheduledTaskStore,
 )
 from tests.server.conftest import ControllableMockClient
+from tests.server.helpers import FakeSandboxLauncher
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.usefixtures("frozen_recurrence_clock")]
+
+
+def _sandbox_deployment(*, manages_profiles: bool = False) -> ManagedSandboxDeployment:
+    launcher = FakeSandboxLauncher()
+    launcher.manages_profiles = manages_profiles
+    return ManagedSandboxDeployment.single(
+        ManagedSandboxConfig(
+            provider="company",
+            server_url="https://test.example",
+            token_ttl_s=100,
+            launcher_factory=lambda: launcher,
+            manages_profiles=manages_profiles,
+        )
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -53,8 +79,15 @@ def _stub_host_workspace_validation(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
-@pytest.fixture()
-def auth_app(runtime_init: None, db_uri: str, tmp_path: Path) -> FastAPI:
+def _build_app(
+    db_uri: str,
+    tmp_path: Path,
+    *,
+    persistent: bool = False,
+    local_single_user: bool = False,
+    projects: bool = True,
+    automations: bool | Callable[[], bool] | None = None,
+) -> FastAPI:
     from omnigent.server.auth import UnifiedAuthProvider
     from omnigent.stores.host_store import HostStore
 
@@ -71,8 +104,29 @@ def auth_app(runtime_init: None, db_uri: str, tmp_path: Path) -> FastAPI:
         # ownership) resolves against actual host rows. Without it,
         # ``app.state.host_store`` is None and the route skips the check.
         host_store=HostStore(db_uri),
-        auth_provider=UnifiedAuthProvider(source="header"),
+        project_store=SqlAlchemyProjectStore(db_uri) if projects else None,
+        automations=automations,
+        auth_provider=UnifiedAuthProvider(source="header", local_single_user=local_single_user),
+        feature_flags=resolve_feature_flags(
+            {"OMNIGENT_FEATURES": "automations_v2" if persistent else "-automations_v2"}
+        ),
+        server_config={"scheduled_task_scheduler": {"startup_retry_seconds": 0.01}},
+        scheduled_task_dispatch=(
+            ScheduledTaskDispatchHooks(AsyncMock(), AsyncMock(return_value=None))
+            if persistent
+            else None
+        ),
     )
+
+
+@pytest.fixture()
+def auth_app(
+    runtime_init: None, db_uri: str, tmp_path: Path, request: pytest.FixtureRequest
+) -> FastAPI:
+    app = _build_app(db_uri, tmp_path, persistent=getattr(request, "param", False))
+    _make_user(db_uri)
+    _register_host(app, "4b653f6031f35d168cc0b37caa1306d1", "alice@example.com")
+    return app
 
 
 def _register_host(app: FastAPI, host_id: str, owner: str) -> None:
@@ -85,11 +139,9 @@ def _register_host(app: FastAPI, host_id: str, owner: str) -> None:
     app.state.host_store.upsert_on_connect(host_id, f"{owner}-laptop", owner)
 
 
-@pytest_asyncio.fixture()
-async def auth_client(
-    auth_app: FastAPI,
-    mock_llm: ControllableMockClient,
-    tmp_path: Path,
+@asynccontextmanager
+async def _serve(
+    app: FastAPI, mock_llm: ControllableMockClient, tmp_path: Path
 ) -> AsyncIterator[httpx.AsyncClient]:
     from omnigent.runtime import set_harness_process_manager
     from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
@@ -100,14 +152,24 @@ async def auth_client(
 
     # Enter the lifespan so app.state.scheduled_task_scheduler exists and the
     # routes can sync to it.
-    async with auth_app.router.lifespan_context(auth_app):
-        transport = httpx.ASGITransport(app=auth_app)
+    async with app.router.lifespan_context(app):
+        transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
             yield c
 
     mock_llm.release_all()
     set_harness_process_manager(None)
     await pm.shutdown()
+
+
+@pytest_asyncio.fixture()
+async def auth_client(
+    auth_app: FastAPI,
+    mock_llm: ControllableMockClient,
+    tmp_path: Path,
+) -> AsyncIterator[httpx.AsyncClient]:
+    async with _serve(auth_app, mock_llm, tmp_path) as client:
+        yield client
 
 
 def _headers(email: str = "alice@example.com") -> dict[str, str]:
@@ -126,13 +188,58 @@ def _create_body(**overrides: object) -> dict[str, object]:
         "name": "nightly triage",
         "prompt": "triage the queue",
         "rrule": _VALID_RRULE,
-        "agent_id": builtin_agent_id(server_app._CLAUDE_NATIVE_AGENT_NAME),
+        "agent_id": builtin_agent_id(CLAUDE_NATIVE_AGENT_NAME),
         "timezone": "America/Los_Angeles",
         "workspace": "/repo",
         "host_id": "4b653f6031f35d168cc0b37caa1306d1",
     }
     body.update(overrides)
     return body
+
+
+@pytest.mark.parametrize("operation", ["create", "update"])
+async def test_schedule_validation_keeps_requests_responsive(
+    auth_client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch, operation: str
+) -> None:
+    import asyncio
+    import threading
+
+    url = "/v1/scheduled-tasks"
+    method = "POST"
+    body = _create_body(rrule="FREQ=DAILY")
+    if operation == "update":
+        created = await auth_client.post(url, json=body, headers=_headers())
+        assert created.status_code == 200, created.text
+        url += "/" + created.json()["id"]
+        method = "PATCH"
+        body = {"rrule": "FREQ=WEEKLY"}
+
+    entered = threading.Event()
+    release = threading.Event()
+
+    def recurrence_clock() -> float:
+        # Hold the clock boundary to check concurrent HTTP service, then expire
+        # the real iterator's deadline without an expensive recurrence.
+        if not entered.is_set():
+            entered.set()
+            assert release.wait(5), "recurrence validation blocked the event loop"
+            return 0
+        return 1
+
+    monkeypatch.setattr("omnigent.server.scheduled._bounded_rrule.monotonic", recurrence_clock)
+    pending = asyncio.create_task(auth_client.request(method, url, json=body, headers=_headers()))
+    try:
+        assert await asyncio.to_thread(entered.wait, 2)
+        response = await asyncio.wait_for(
+            auth_client.get("/v1/scheduled-tasks", headers=_headers()), timeout=2
+        )
+        assert response.status_code == 200, response.text
+        assert not pending.done()
+    finally:
+        release.set()
+        result = await pending
+    assert result.status_code == 400, result.text
+    assert "time limit" in result.text
 
 
 async def test_create_lists_and_gets(auth_client: httpx.AsyncClient, db_uri: str) -> None:
@@ -146,7 +253,9 @@ async def test_create_lists_and_gets(auth_client: httpx.AsyncClient, db_uri: str
     assert created["workspace"] == "/repo"
     assert created["host_id"] == "4b653f6031f35d168cc0b37caa1306d1"
     assert "base_branch" not in created
-    assert "execution_target" not in created
+    # execution_target is now surfaced (defaults to connected_host); base_branch
+    # stays an internal legacy column.
+    assert created["execution_target"] == "connected_host"
     task_id = created["id"]
 
     listed = await auth_client.get("/v1/scheduled-tasks", headers=_headers())
@@ -157,6 +266,56 @@ async def test_create_lists_and_gets(auth_client: httpx.AsyncClient, db_uri: str
     got = await auth_client.get(f"/v1/scheduled-tasks/{task_id}", headers=_headers())
     assert got.status_code == 200
     assert got.json()["id"] == task_id
+
+
+async def test_automations_gate_is_checked_per_request(
+    runtime_init: None,
+    db_uri: str,
+    tmp_path: Path,
+    mock_llm: ControllableMockClient,
+) -> None:
+    gate = {"state": "on"}
+
+    def automations() -> bool:
+        if gate["state"] == "broken":
+            raise RuntimeError("gate unavailable")
+        return gate["state"] == "on"
+
+    app = _build_app(db_uri, tmp_path, automations=automations)
+    _make_user(db_uri)
+    _register_host(app, "4b653f6031f35d168cc0b37caa1306d1", "alice@example.com")
+
+    async with _serve(app, mock_llm, tmp_path) as client:
+
+        async def enabled_in_info() -> bool:
+            return (await client.get("/v1/info", headers=_headers())).json()["automations_enabled"]
+
+        created = await client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+        assert created.status_code == 200, created.text
+        task_url = f"/v1/scheduled-tasks/{created.json()['id']}"
+        assert await enabled_in_info() is True
+
+        # A failing gate is off too, so a broken deployment flag hides automations.
+        for state in ("off", "broken"):
+            gate["state"] = state
+            for method, url in (
+                ("GET", "/v1/scheduled-tasks"),
+                ("POST", "/v1/scheduled-tasks"),
+                ("GET", task_url),
+                ("PATCH", task_url),
+                ("POST", f"{task_url}/run"),
+                ("GET", f"{task_url}/runs"),
+                ("DELETE", task_url),
+            ):
+                body = _create_body() if method == "POST" else {} if method == "PATCH" else None
+                response = await client.request(method, url, json=body, headers=_headers())
+                assert response.status_code == 404, (state, method, url, response.text)
+            assert await enabled_in_info() is False
+
+        gate["state"] = "on"
+        got = await client.get(task_url, headers=_headers())
+        assert got.status_code == 200, got.text
+        assert await enabled_in_info() is True
 
 
 async def test_create_no_workspace_task_persists_null_host_and_workspace(
@@ -191,6 +350,116 @@ async def test_create_rejects_workspace_without_host(
     del body["host_id"]
     resp = await auth_client.post("/v1/scheduled-tasks", json=body, headers=_headers())
     assert resp.status_code == 400, resp.text
+
+
+async def test_create_managed_sandbox_rejects_pinned_host(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """A managed_sandbox task runs in a fresh sandbox; a pinned host/workspace is a 422."""
+    _make_user(db_uri)
+    # _create_body pins host_id + workspace by default — invalid with a sandbox.
+    body = _create_body(execution_target="managed_sandbox")
+    resp = await auth_client.post("/v1/scheduled-tasks", json=body, headers=_headers())
+    assert resp.status_code == 422, resp.text
+
+
+async def test_create_managed_sandbox_requires_configured_sandboxes(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """managed_sandbox is rejected (400) when the server has no sandbox config."""
+    _make_user(db_uri)
+    body = _create_body(execution_target="managed_sandbox")
+    del body["host_id"]
+    del body["workspace"]
+    resp = await auth_client.post("/v1/scheduled-tasks", json=body, headers=_headers())
+    assert resp.status_code == 400, resp.text
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("managed", [False, True])
+@pytest.mark.parametrize("operation", ["create", "patch"])
+async def test_profile_schedules_are_rejected_before_persistence(
+    auth_app, auth_client, db_uri, enabled, managed, operation
+):
+    from omnigent.server.sandbox_profiles import SandboxProfileCatalog
+
+    _make_user(db_uri)
+    deployment = _sandbox_deployment(manages_profiles=managed)
+    factory = Mock(side_effect=AssertionError("Schedule validation must not construct providers"))
+    deployment.default.launcher_factory = factory
+    auth_app.state.sandbox_config = deployment
+    auth_app.state.sandbox_profiles = (
+        None
+        if not enabled
+        else SandboxProfileCatalog(SqlAlchemyConversationStore(db_uri), deployment)
+    )
+    if operation == "patch":
+        created = await auth_client.post(
+            "/v1/scheduled-tasks", json=_create_body(), headers=_headers()
+        )
+        assert created.status_code == 200, created.text
+        task_id = created.json()["id"]
+        response = await auth_client.patch(
+            f"/v1/scheduled-tasks/{task_id}",
+            json={"execution_target": "managed_sandbox"},
+            headers=_headers(),
+        )
+    else:
+        body = _create_body(execution_target="managed_sandbox")
+        del body["host_id"], body["workspace"]
+        response = await auth_client.post("/v1/scheduled-tasks", json=body, headers=_headers())
+    assert response.status_code == (400 if managed else 200), response.text
+    factory.assert_not_called()
+    if managed:
+        assert "cannot select a profile yet" in response.text
+        tasks = (await auth_client.get("/v1/scheduled-tasks", headers=_headers())).json()[
+            "scheduled_tasks"
+        ]
+        if operation == "create":
+            assert tasks == []
+        else:
+            assert tasks[0]["execution_target"] == "connected_host"
+
+
+async def test_patch_execution_target_roundtrip_clears_host_and_workspace(
+    auth_app: FastAPI, auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """A pinned task can switch to managed_sandbox and back without a 400.
+
+    Regression for the round-trip bug: switching to managed_sandbox must clear
+    BOTH host_id and workspace (via the store's explicit-null), otherwise a
+    retained workspace makes the switch back to connected_host fail validation
+    with "host_id required when workspace is set".
+    """
+    _make_user(db_uri)
+
+    auth_app.state.sandbox_config = _sandbox_deployment()
+    try:
+        created = (
+            await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+        ).json()
+        tid = created["id"]
+        assert created["host_id"] is not None and created["workspace"] is not None
+
+        to_managed = await auth_client.patch(
+            f"/v1/scheduled-tasks/{tid}",
+            json={"execution_target": "managed_sandbox"},
+            headers=_headers(),
+        )
+        assert to_managed.status_code == 200, to_managed.text
+        b = to_managed.json()
+        assert b["execution_target"] == "managed_sandbox"
+        assert b["host_id"] is None and b["workspace"] is None
+
+        back = await auth_client.patch(
+            f"/v1/scheduled-tasks/{tid}",
+            json={"execution_target": "connected_host"},
+            headers=_headers(),
+        )
+        assert back.status_code == 200, back.text
+        assert back.json()["execution_target"] == "connected_host"
+    finally:
+        auth_app.state.sandbox_config = None
 
 
 async def test_create_rejects_invalid_rrule(auth_client: httpx.AsyncClient, db_uri: str) -> None:
@@ -239,6 +508,39 @@ async def test_create_rejects_invalid_reasoning_effort(
     assert resp.status_code == 400, resp.text
 
 
+async def test_create_persists_permission_mode(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """A valid permission mode round-trips on create and read."""
+    _make_user(db_uri)
+    resp = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(permission_mode="acceptEdits"),
+        headers=_headers(),
+    )
+    assert resp.status_code == 200, resp.text
+    created = resp.json()
+    assert created["permission_mode"] == "acceptEdits"
+    task_id = created["id"]
+
+    got = await auth_client.get(f"/v1/scheduled-tasks/{task_id}", headers=_headers())
+    assert got.status_code == 200
+    assert got.json()["permission_mode"] == "acceptEdits"
+
+
+@pytest.mark.parametrize("permission_mode", ["yolo", "--danger", "Auto"])
+async def test_create_rejects_invalid_permission_mode(
+    auth_client: httpx.AsyncClient, db_uri: str, permission_mode: str
+) -> None:
+    _make_user(db_uri)
+    resp = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(permission_mode=permission_mode),
+        headers=_headers(),
+    )
+    assert resp.status_code == 400, resp.text
+
+
 async def test_create_rejects_relative_workspace(
     auth_client: httpx.AsyncClient, db_uri: str
 ) -> None:
@@ -280,9 +582,9 @@ async def test_create_pinned_host_without_workspace_rejects_nonexistent_host(
 ) -> None:
     """A pinned host with NO workspace that references a NONEXISTENT host is
     rejected at create (404) instead of persisting an unvalidated host that only
-    fails at fire time. No host was registered, so the owner check 404s."""
+    fails at fire time."""
     _make_user(db_uri)
-    body = _create_body()
+    body = _create_body(host_id="dead1111beef2222dead3333beef4444")
     del body["workspace"]  # host_id set, no workspace → the fixed authz gap
     resp = await auth_client.post("/v1/scheduled-tasks", json=body, headers=_headers())
     assert resp.status_code == 404, resp.text
@@ -297,8 +599,8 @@ async def test_create_pinned_host_without_workspace_rejects_nonowned_host(
     _make_user(db_uri, email="alice@example.com")
     _make_user(db_uri, email="bob@example.com")
     # The host belongs to bob; alice pins it with no workspace.
-    _register_host(auth_app, "4b653f6031f35d168cc0b37caa1306d1", "bob@example.com")
-    body = _create_body()
+    _register_host(auth_app, "eeee5555ffff6666aaaa7777bbbb8888", "bob@example.com")
+    body = _create_body(host_id="eeee5555ffff6666aaaa7777bbbb8888")
     del body["workspace"]
     resp = await auth_client.post(
         "/v1/scheduled-tasks", json=body, headers=_headers("alice@example.com")
@@ -340,6 +642,214 @@ async def test_patch_add_host_without_workspace_authorizes_owner(
         headers=_headers("alice@example.com"),
     )
     assert denied.status_code == 403, denied.text
+
+
+@pytest.mark.parametrize("method", ["create", "patch"])
+@pytest.mark.parametrize("workspace", [None, "/repo"])
+@pytest.mark.parametrize("detached", [False, True])
+async def test_rejects_existing_sandbox_before_workspace_rpc(
+    auth_app: FastAPI,
+    auth_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    method: str,
+    workspace: str | None,
+    detached: bool,
+) -> None:
+    """Managed host pins are invalid even after their sandbox has been detached."""
+    host = auth_app.state.host_store.register_managed_host(
+        host_id="aaaa1111bbbb2222cccc3333dddd4444",
+        name="existing-sandbox",
+        user_id="alice@example.com",
+        token="test-launch-token",
+        provider="agent_sandbox",
+        sandbox_id="sandbox-existing",
+        token_expires_at=2_000_000_000,
+    )
+    if detached:
+        assert auth_app.state.host_store.detach_stale_managed_sandbox(
+            host.host_id,
+            sandbox_id=host.sandbox_id,
+            expected_updated_at=host.updated_at,
+        )
+    workspace_probe = AsyncMock(side_effect=AssertionError("must reject before host RPC"))
+    monkeypatch.setattr(
+        scheduled_tasks_routes, "validate_existing_host_workspace", workspace_probe
+    )
+
+    if method == "create":
+        response = await auth_client.post(
+            "/v1/scheduled-tasks",
+            json=_create_body(host_id=host.host_id, workspace=workspace),
+            headers=_headers(),
+        )
+    else:
+        created = await auth_client.post(
+            "/v1/scheduled-tasks",
+            json=_create_body(host_id=None, workspace=None),
+            headers=_headers(),
+        )
+        assert created.status_code == 200, created.text
+        response = await auth_client.patch(
+            f"/v1/scheduled-tasks/{created.json()['id']}",
+            json={
+                "host_id": host.host_id,
+                **({"workspace": workspace} if workspace is not None else {}),
+            },
+            headers=_headers(),
+        )
+        unchanged = await auth_client.get(
+            f"/v1/scheduled-tasks/{created.json()['id']}", headers=_headers()
+        )
+        assert unchanged.json()["host_id"] is None
+        assert unchanged.json()["workspace"] is None
+
+    assert response.status_code == 400, response.text
+    assert "select a new sandbox for each run" in response.text
+    workspace_probe.assert_not_awaited()
+
+
+@pytest.mark.parametrize("workspace", [None, "/repo"])
+async def test_existing_sandbox_pin_checks_ownership_first(
+    auth_app: FastAPI,
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    workspace: str | None,
+) -> None:
+    _make_user(db_uri, email="bob@example.com")
+    host = auth_app.state.host_store.register_managed_host(
+        host_id="aaaa1111bbbb2222cccc3333dddd4444",
+        name="bobs-sandbox",
+        user_id="bob@example.com",
+        token="test-launch-token",
+        provider="agent_sandbox",
+        sandbox_id="sandbox-bob",
+        token_expires_at=2_000_000_000,
+    )
+    response = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(host_id=host.host_id, workspace=workspace),
+        headers=_headers(),
+    )
+    assert response.status_code == 403, response.text
+
+
+async def _make_project(
+    client: httpx.AsyncClient, name: str, owner: str = "alice@example.com"
+) -> str:
+    resp = await client.post("/v1/projects", json={"name": name}, headers=_headers(owner))
+    assert resp.status_code == 200, resp.text
+    return resp.json()["id"]
+
+
+async def test_create_files_runs_into_an_owned_project(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    _make_user(db_uri)
+    _make_user(db_uri, "bob@example.com")
+    info = (await auth_client.get("/v1/info", headers=_headers())).json()
+    assert info["scheduled_task_projects"] is True
+    mine = await _make_project(auth_client, "mine")
+    bobs = await _make_project(auth_client, "bob's", owner="bob@example.com")
+
+    for project_id in (bobs, "not-a-project-id", ""):
+        resp = await auth_client.post(
+            "/v1/scheduled-tasks", json=_create_body(project_id=project_id), headers=_headers()
+        )
+        assert resp.status_code == 404, resp.text
+    # Names are resolved by the client through the projects API, not here.
+    by_name = await auth_client.post(
+        "/v1/scheduled-tasks", json=_create_body(project_name="mine"), headers=_headers()
+    )
+    assert by_name.status_code == 422, by_name.text
+
+    created = await auth_client.post(
+        "/v1/scheduled-tasks", json=_create_body(project_id=mine), headers=_headers()
+    )
+    assert created.status_code == 200, created.text
+    assert created.json()["project_id"] == mine
+    # Stored by id, so renaming the project keeps the task filed in it.
+    renamed = await auth_client.patch(
+        f"/v1/projects/{mine}", json={"name": "renamed"}, headers=_headers()
+    )
+    assert renamed.status_code == 200, renamed.text
+    got = await auth_client.get(f"/v1/scheduled-tasks/{created.json()['id']}", headers=_headers())
+    assert got.json()["project_id"] == mine
+
+
+async def test_update_moves_and_clears_the_task_project(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    _make_user(db_uri)
+    _make_user(db_uri, "bob@example.com")
+    first = await _make_project(auth_client, "first")
+    second = await _make_project(auth_client, "second")
+    bobs = await _make_project(auth_client, "bob's", owner="bob@example.com")
+    created = (
+        await auth_client.post(
+            "/v1/scheduled-tasks", json=_create_body(project_id=first), headers=_headers()
+        )
+    ).json()
+    task_url = f"/v1/scheduled-tasks/{created['id']}"
+
+    moved = await auth_client.patch(task_url, json={"project_id": second}, headers=_headers())
+    assert moved.status_code == 200, moved.text
+    assert moved.json()["project_id"] == second
+    renamed = await auth_client.patch(task_url, json={"name": "renamed"}, headers=_headers())
+    assert renamed.json()["project_id"] == second
+
+    for rejected_id in (bobs, ""):
+        rejected = await auth_client.patch(
+            task_url, json={"project_id": rejected_id}, headers=_headers()
+        )
+        assert rejected.status_code == 404, rejected.text
+    assert (await auth_client.get(task_url, headers=_headers())).json()["project_id"] == second
+
+    cleared = await auth_client.patch(task_url, json={"project_id": None}, headers=_headers())
+    assert cleared.status_code == 200, cleared.text
+    assert cleared.json()["project_id"] is None
+
+
+async def test_task_projects_are_refused_without_a_project_store(
+    runtime_init: None,
+    db_uri: str,
+    tmp_path: Path,
+    mock_llm: ControllableMockClient,
+) -> None:
+    app = _build_app(db_uri, tmp_path, projects=False)
+    _make_user(db_uri)
+    _register_host(app, "4b653f6031f35d168cc0b37caa1306d1", "alice@example.com")
+    async with _serve(app, mock_llm, tmp_path) as client:
+        info = (await client.get("/v1/info", headers=_headers())).json()
+        assert info["scheduled_task_projects"] is False
+        filed = await client.post(
+            "/v1/scheduled-tasks", json=_create_body(project_id="p" * 32), headers=_headers()
+        )
+        assert filed.status_code == 404, filed.text
+        created = await client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+        assert created.status_code == 200, created.text
+        task_url = f"/v1/scheduled-tasks/{created.json()['id']}"
+        moved = await client.patch(task_url, json={"project_id": "p" * 32}, headers=_headers())
+        assert moved.status_code == 404, moved.text
+
+
+async def test_single_user_task_projects_are_the_projects_api_projects(
+    runtime_init: None,
+    db_uri: str,
+    tmp_path: Path,
+    mock_llm: ControllableMockClient,
+) -> None:
+    """The local runtime's projects belong to "local", though its tasks store no owner."""
+    app = _build_app(db_uri, tmp_path, local_single_user=True)
+    body = _create_body()
+    del body["workspace"]
+    del body["host_id"]
+    async with _serve(app, mock_llm, tmp_path) as client:
+        existing = (await client.post("/v1/projects", json={"name": "existing"})).json()
+        by_id = await client.post(
+            "/v1/scheduled-tasks", json={**body, "project_id": existing["id"]}
+        )
+        assert by_id.status_code == 200, by_id.text
+        assert by_id.json()["project_id"] == existing["id"]
 
 
 async def test_create_rejects_unsupported_public_fields(
@@ -390,6 +900,285 @@ async def test_update_changes_fields_and_validates_rrule(
     assert deleted_state.status_code == 422, deleted_state.text
 
 
+async def test_update_switches_the_bound_agent(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """PATCH ``agent_id`` rebinds a task to a different harness.
+
+    An existing automation must be switchable in place — the alternative is
+    recreating it, which loses the task id and its run history.
+    """
+    from omnigent.native.native_coding_agents import CODEX_NATIVE_AGENT_NAME
+
+    _make_user(db_uri)
+    created = (
+        await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    ).json()
+    task_id = created["id"]
+    assert created["agent_id"] == builtin_agent_id(CLAUDE_NATIVE_AGENT_NAME)
+
+    target = builtin_agent_id(CODEX_NATIVE_AGENT_NAME)
+    patched = await auth_client.patch(
+        f"/v1/scheduled-tasks/{task_id}",
+        json={"agent_id": target},
+        headers=_headers(),
+    )
+    assert patched.status_code == 200, patched.text
+    assert patched.json()["agent_id"] == target
+    # Same task row, not a recreate.
+    assert patched.json()["id"] == task_id
+
+    got = await auth_client.get(f"/v1/scheduled-tasks/{task_id}", headers=_headers())
+    assert got.json()["agent_id"] == target
+
+
+async def test_update_agent_switch_clears_the_old_harnesss_settings(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """A switch drops per-agent settings the new harness can't use.
+
+    ``permission_mode`` is a Claude-only flag and a model id is provider-bound,
+    so carrying them onto a codex task would break the fire with an unknown
+    ``--permission-mode`` / a model its CLI has never heard of.
+    """
+    from omnigent.native.native_coding_agents import CODEX_NATIVE_AGENT_NAME
+
+    _make_user(db_uri)
+    created = (
+        await auth_client.post(
+            "/v1/scheduled-tasks",
+            json=_create_body(
+                permission_mode="bypassPermissions",
+                model_override="databricks-claude-sonnet-4-6",
+                reasoning_effort="high",
+            ),
+            headers=_headers(),
+        )
+    ).json()
+    task_id = created["id"]
+    assert created["permission_mode"] == "bypassPermissions"
+
+    patched = await auth_client.patch(
+        f"/v1/scheduled-tasks/{task_id}",
+        json={"agent_id": builtin_agent_id(CODEX_NATIVE_AGENT_NAME)},
+        headers=_headers(),
+    )
+    assert patched.status_code == 200, patched.text
+    got = (await auth_client.get(f"/v1/scheduled-tasks/{task_id}", headers=_headers())).json()
+    assert got["permission_mode"] is None
+    assert got["model_override"] is None
+    assert got["reasoning_effort"] is None
+
+
+async def test_update_agent_switch_revalidates_workspace_against_the_new_agent(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A switch re-checks the pinned workspace against the TARGET agent.
+
+    The ``os_env`` boundary is per-agent, so a workspace validated for the old
+    harness proves nothing about the new one. The autouse fixture stubs the
+    validator, so capture the agent it receives to pin down WHICH agent the
+    boundary check runs against — asserting a 200 alone would pass even if the
+    route kept checking the old agent.
+    """
+    from omnigent.native.native_coding_agents import CODEX_NATIVE_AGENT_NAME
+
+    _make_user(db_uri)
+    created = (
+        await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    ).json()
+
+    seen: list[str] = []
+
+    async def _recording_validate(**kwargs: object) -> str:
+        agent = kwargs["agent"]
+        seen.append(getattr(agent, "id", ""))
+        workspace = kwargs["workspace"]
+        assert isinstance(workspace, str)
+        return workspace
+
+    monkeypatch.setattr(
+        scheduled_tasks_routes, "validate_existing_host_workspace", _recording_validate
+    )
+
+    target = builtin_agent_id(CODEX_NATIVE_AGENT_NAME)
+    patched = await auth_client.patch(
+        f"/v1/scheduled-tasks/{created['id']}",
+        json={"agent_id": target},
+        headers=_headers(),
+    )
+    assert patched.status_code == 200, patched.text
+    # Ran once, against the agent being switched TO — not the one being left.
+    assert seen == [target], seen
+
+
+async def test_update_agent_switch_keeps_settings_resent_in_the_same_patch(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """Settings sent alongside a switch are kept and gated on the NEW agent."""
+    from omnigent.native.native_coding_agents import CODEX_NATIVE_AGENT_NAME
+
+    _make_user(db_uri)
+    created = (
+        await auth_client.post(
+            "/v1/scheduled-tasks",
+            json=_create_body(agent_id=builtin_agent_id(CODEX_NATIVE_AGENT_NAME)),
+            headers=_headers(),
+        )
+    ).json()
+
+    patched = await auth_client.patch(
+        f"/v1/scheduled-tasks/{created['id']}",
+        json={
+            "agent_id": builtin_agent_id(CLAUDE_NATIVE_AGENT_NAME),
+            "permission_mode": "acceptEdits",
+        },
+        headers=_headers(),
+    )
+    assert patched.status_code == 200, patched.text
+    assert patched.json()["permission_mode"] == "acceptEdits"
+
+
+async def test_update_agent_switch_gates_permission_mode_on_the_new_agent(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """A Claude-only mode sent with a switch to codex is rejected, not persisted."""
+    from omnigent.native.native_coding_agents import CODEX_NATIVE_AGENT_NAME
+
+    _make_user(db_uri)
+    created = (
+        await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    ).json()
+
+    resp = await auth_client.patch(
+        f"/v1/scheduled-tasks/{created['id']}",
+        json={
+            "agent_id": builtin_agent_id(CODEX_NATIVE_AGENT_NAME),
+            "permission_mode": "acceptEdits",
+        },
+        headers=_headers(),
+    )
+    assert resp.status_code == 400, resp.text
+    assert "permission_mode" in resp.text
+    # Rejected before any write: the task keeps its original agent.
+    got = await auth_client.get(f"/v1/scheduled-tasks/{created['id']}", headers=_headers())
+    assert got.json()["agent_id"] == builtin_agent_id(CLAUDE_NATIVE_AGENT_NAME)
+
+
+async def test_update_rejects_unknown_agent(auth_client: httpx.AsyncClient, db_uri: str) -> None:
+    """Switching to a nonexistent agent 404s instead of persisting a dead binding."""
+    _make_user(db_uri)
+    created = (
+        await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    ).json()
+
+    resp = await auth_client.patch(
+        f"/v1/scheduled-tasks/{created['id']}",
+        json={"agent_id": "ag_does_not_exist"},
+        headers=_headers(),
+    )
+    assert resp.status_code == 404, resp.text
+
+
+async def test_update_rejects_null_agent(auth_client: httpx.AsyncClient, db_uri: str) -> None:
+    """A task must always have an agent — an explicit null is a 422, not a no-op."""
+    _make_user(db_uri)
+    created = (
+        await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    ).json()
+
+    resp = await auth_client.patch(
+        f"/v1/scheduled-tasks/{created['id']}",
+        json={"agent_id": None},
+        headers=_headers(),
+    )
+    assert resp.status_code == 422, resp.text
+
+
+async def test_create_rejects_permission_mode_for_non_claude_agent(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """A valid mode on a non-Claude agent is rejected (server capability gate).
+
+    The web dialog only shows the permission control for Claude Code; the server
+    enforces the same gate so a codex/cursor/etc. task can't persist a mode the
+    fire path would inject as an unknown ``--permission-mode`` flag. The value
+    itself is a valid Claude mode — the rejection is purely about the agent's
+    harness.
+    """
+    from omnigent.native.native_coding_agents import CODEX_NATIVE_AGENT_NAME
+
+    _make_user(db_uri)
+    resp = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(
+            agent_id=builtin_agent_id(CODEX_NATIVE_AGENT_NAME),
+            permission_mode="acceptEdits",
+        ),
+        headers=_headers(),
+    )
+    assert resp.status_code == 400, resp.text
+    assert "permission_mode" in resp.text
+
+
+async def test_update_clears_permission_mode_with_explicit_null(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """PATCH ``permission_mode: null`` clears a previously-set mode end-to-end.
+
+    The edit dialog resets the control to Default by sending an explicit null,
+    so a task launched with ``bypassPermissions`` must actually revert to the
+    agent default (not silently keep the dangerous mode). Asserts the PERSISTED
+    value via a read-back, not just the response.
+    """
+    _make_user(db_uri)
+    created = (
+        await auth_client.post(
+            "/v1/scheduled-tasks",
+            json=_create_body(permission_mode="bypassPermissions"),
+            headers=_headers(),
+        )
+    ).json()
+    task_id = created["id"]
+    assert created["permission_mode"] == "bypassPermissions"
+
+    patched = await auth_client.patch(
+        f"/v1/scheduled-tasks/{task_id}",
+        json={"permission_mode": None},
+        headers=_headers(),
+    )
+    assert patched.status_code == 200, patched.text
+    assert patched.json()["permission_mode"] is None
+
+    got = await auth_client.get(f"/v1/scheduled-tasks/{task_id}", headers=_headers())
+    assert got.json()["permission_mode"] is None
+
+
+async def test_update_omitting_permission_mode_leaves_it_unchanged(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """A PATCH that omits ``permission_mode`` must not clear a set mode."""
+    _make_user(db_uri)
+    created = (
+        await auth_client.post(
+            "/v1/scheduled-tasks",
+            json=_create_body(permission_mode="acceptEdits"),
+            headers=_headers(),
+        )
+    ).json()
+    task_id = created["id"]
+
+    patched = await auth_client.patch(
+        f"/v1/scheduled-tasks/{task_id}",
+        json={"name": "renamed"},
+        headers=_headers(),
+    )
+    assert patched.status_code == 200, patched.text
+    assert patched.json()["permission_mode"] == "acceptEdits"
+
+
 async def test_update_rejects_invalid_model_override(
     auth_client: httpx.AsyncClient, db_uri: str
 ) -> None:
@@ -422,18 +1211,138 @@ async def test_update_rejects_invalid_reasoning_effort(
     assert bad.status_code == 400, bad.text
 
 
-async def test_delete_removes_task(auth_client: httpx.AsyncClient, db_uri: str) -> None:
+@pytest.mark.parametrize("claimed", [False, True])
+async def test_delete_removes_task(
+    auth_client: httpx.AsyncClient, db_uri: str, claimed: bool
+) -> None:
     _make_user(db_uri)
     created = (
         await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
     ).json()
     task_id = created["id"]
+    store = SqlAlchemyScheduledTaskStore(db_uri)
+    if claimed:
+        task = store.get(task_id)
+        from omnigent.server.scheduled.schedule import next_scheduled_time
+
+        assert store.initialize_next_run_at(task, next_scheduled_time(task, task.created_at))
+        task = store.get(task_id)
+        assert task is not None and task.next_run_at is not None
+        assert (
+            store.claim_scheduled_run(
+                task,
+                now=task.next_run_at,
+                next_run_at=task.next_run_at + 3600,
+                host_id=task.host_id,
+                lease_seconds=120,
+            )
+            is not None
+        )
 
     deleted = await auth_client.delete(f"/v1/scheduled-tasks/{task_id}", headers=_headers())
     assert deleted.status_code == 200, deleted.text
 
     got = await auth_client.get(f"/v1/scheduled-tasks/{task_id}", headers=_headers())
     assert got.status_code == 404
+    listed = await auth_client.get("/v1/scheduled-tasks", headers=_headers())
+    assert listed.json()["scheduled_tasks"] == []
+    if claimed:
+        assert store.get(task_id).state == "deleted"
+        assert len(store.list_runs(task_id)[0]) == 1
+        for method, suffix, body in [
+            ("get", "/runs", None),
+            ("post", "/run", None),
+            ("patch", "", {"state": "active"}),
+            ("delete", "", None),
+        ]:
+            response = await auth_client.request(
+                method,
+                f"/v1/scheduled-tasks/{task_id}{suffix}",
+                headers=_headers(),
+                json=body,
+            )
+            assert response.status_code == 404
+
+
+async def test_delete_cleanup_failure_still_returns_success_off_event_loop(
+    auth_client,
+    auth_app,
+    db_uri,
+    monkeypatch,
+):
+    import threading
+
+    created = (
+        await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    ).json()
+    request_thread = threading.get_ident()
+    cleanup_threads = []
+
+    def fail_cleanup(self, task_id, *, after=None):
+        cleanup_threads.append(threading.get_ident())
+        raise RuntimeError("cleanup interrupted")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(SqlAlchemyScheduledTaskStore, "_purge_deleted_task_page", fail_cleanup)
+        response = await auth_client.delete(
+            f"/v1/scheduled-tasks/{created['id']}", headers=_headers()
+        )
+    assert response.status_code == 200, response.text
+    assert cleanup_threads and request_thread not in cleanup_threads
+    assert auth_app.state.scheduled_task_scheduler.job_count == 0
+    assert (
+        await auth_client.get(f"/v1/scheduled-tasks/{created['id']}", headers=_headers())
+    ).status_code == 404
+    store = SqlAlchemyScheduledTaskStore(db_uri)
+    assert store.get(created["id"]).state == "deleted"
+    store.purge_deleted_tasks()
+    assert store.get(created["id"]) is None
+
+
+@pytest.mark.parametrize("operation", ["create", "update"])
+async def test_schedule_search_failure_returns_400_and_rolls_back(
+    auth_client,
+    auth_app,
+    db_uri,
+    monkeypatch,
+    operation,
+):
+    from omnigent.server.scheduled.rrule import RRuleSearchError
+    from omnigent.stores.scheduled_task_store import sqlalchemy_store
+
+    store = auth_app.state.scheduled_task_scheduler._store
+    store.configure_dispatch(True)
+    existing = None
+    if operation == "update":
+        created = (
+            await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+        ).json()
+        existing = store.get(created["id"])
+
+    def fail_actual_schedule(*args):
+        raise RRuleSearchError("search budget exceeded")
+
+    monkeypatch.setattr(sqlalchemy_store, "next_scheduled_time", fail_actual_schedule)
+    if operation == "create":
+        response = await auth_client.post(
+            "/v1/scheduled-tasks", json=_create_body(), headers=_headers()
+        )
+    else:
+        response = await auth_client.patch(
+            f"/v1/scheduled-tasks/{existing.id}",
+            json={"rrule": "FREQ=DAILY;BYHOUR=12"},
+            headers=_headers(),
+        )
+    assert response.status_code == 400, response.text
+    assert "Could not calculate the next run time for this schedule." in response.text
+    expected_outcome = (
+        "The task was not created." if operation == "create" else "Your changes were not saved."
+    )
+    assert expected_outcome in response.text
+    if existing is None:
+        assert store.list() == []
+    else:
+        assert store.get(existing.id) == existing
 
 
 async def test_other_users_task_is_not_visible(
@@ -502,3 +1411,1286 @@ async def test_scheduler_synced_on_create_and_delete(
 
     await auth_client.delete(f"/v1/scheduled-tasks/{created['id']}", headers=_headers())
     assert scheduler.job_count == before
+
+
+# ── GET /v1/scheduled-tasks/{id}/runs (run history) ──────────────────────────
+
+
+def _seed_run(db_uri: str, task_id: str, run_id: str, **overrides: object) -> None:
+    """Seed a run row directly (the sweep/fire path writes these in prod).
+
+    Tests run at the default workspace (no tenant middleware), matching the
+    route's read scope.
+    """
+    from omnigent.stores.scheduled_task_store.sqlalchemy_store import (
+        SqlAlchemyScheduledTaskStore,
+    )
+
+    store = SqlAlchemyScheduledTaskStore(db_uri)
+    kwargs: dict[str, object] = {
+        "run_id": run_id,
+        "scheduled_task_id": task_id,
+        "status": "succeeded",
+        "scheduled_at": 1000,
+        "conversation_id": "conv_seed",
+        "fired_at": 1001,
+        "finished_at": 1002,
+    }
+    kwargs.update(overrides)
+    store.create_run(**kwargs)  # type: ignore[arg-type]
+
+
+async def test_list_runs_returns_history_for_owned_task(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """An owned task's run history comes back most-recent-first with run fields."""
+    _make_user(db_uri)
+    created = (
+        await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    ).json()
+    task_id = created["id"]
+
+    import uuid
+
+    older_id = uuid.uuid4().hex
+    newer_id = uuid.uuid4().hex
+    conv_id = uuid.uuid4().hex
+    _seed_run(
+        db_uri, task_id, older_id, scheduled_at=1000, status="succeeded", conversation_id=conv_id
+    )
+    _seed_run(
+        db_uri,
+        task_id,
+        newer_id,
+        scheduled_at=2000,
+        status="failed",
+        error_code="incomplete",
+        finished_at=2002,
+        conversation_id=conv_id,
+    )
+
+    resp = await auth_client.get(f"/v1/scheduled-tasks/{task_id}/runs", headers=_headers())
+    assert resp.status_code == 200, resp.text
+    runs = resp.json()["runs"]
+    assert [r["id"] for r in runs] == [newer_id, older_id]  # scheduled_at DESC
+    newest = runs[0]
+    assert newest["status"] == "failed"
+    assert newest["error_code"] == "incomplete"
+    assert newest["finished_at"] == 2002
+    assert newest["conversation_id"] == conv_id
+    assert newest["scheduled_task_id"] == task_id
+    # The free-text error blob is not exposed on the run list.
+    assert "error" not in newest
+    # The run's session doesn't exist, so it carries no session read state.
+    assert newest["conversation_updated_at"] is None
+    assert newest["conversation_status"] is None
+    assert newest["viewer_last_seen"] is None
+    assert newest["viewer_unread"] is None
+
+
+@pytest.fixture()
+def clean_session_read_state() -> Iterator[None]:
+    """Clear the module-level session read-state cache around a test."""
+    from omnigent.server.routes._sessions import helpers
+
+    helpers._read_last_seen.clear()
+    helpers._read_explicit_unread.clear()
+    yield
+    helpers._read_last_seen.clear()
+    helpers._read_explicit_unread.clear()
+
+
+@pytest.mark.usefixtures("clean_session_read_state")
+async def test_list_runs_includes_conversation_read_state_fields(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """Run rows include batched conversation read-state fields; skipped runs get nulls.
+
+    The ``/runs`` endpoint enriches each run that has a ``conversation_id`` with
+    ``conversation_updated_at``, ``conversation_status``, and ``viewer_unread``
+    so the frontend can compute the unread dot without per-row session GETs.
+    Runs with no conversation (skipped/failed host-less) get null for all three.
+    """
+    import uuid
+
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+
+    _make_user(db_uri)
+    created = (
+        await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    ).json()
+    task_id = created["id"]
+
+    from omnigent.server.routes._sessions.helpers import _set_read_state
+
+    # Create a real conversation in the store so the batch-fetch can hydrate it.
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    conv = conv_store.create_conversation(conversation_id=uuid.uuid4().hex)
+    conv_store.set_session_live_status(conv.id, "idle")
+    _set_read_state("alice@example.com", conv.id, conv.updated_at - 1, True)
+    # A known session the viewer saw but never flagged, waiting on its harness.
+    waiting = conv_store.create_conversation(conversation_id=uuid.uuid4().hex)
+    conv_store.set_session_live_status(waiting.id, "waiting")
+    _set_read_state("alice@example.com", waiting.id, 1_700_000_100, False)
+
+    succeeded_id = uuid.uuid4().hex
+    running_id = uuid.uuid4().hex
+    skipped_id = uuid.uuid4().hex
+    _seed_run(
+        db_uri,
+        task_id,
+        succeeded_id,
+        scheduled_at=1000,
+        status="succeeded",
+        conversation_id=conv.id,
+    )
+    _seed_run(
+        db_uri,
+        task_id,
+        running_id,
+        scheduled_at=1500,
+        status="running",
+        conversation_id=waiting.id,
+    )
+    _seed_run(
+        db_uri,
+        task_id,
+        skipped_id,
+        scheduled_at=2000,
+        status="skipped",
+        error_code="no_online_host",
+        conversation_id=None,
+    )
+
+    resp = await auth_client.get(f"/v1/scheduled-tasks/{task_id}/runs", headers=_headers())
+    assert resp.status_code == 200, resp.text
+    runs = {r["id"]: r for r in resp.json()["runs"]}
+
+    # The succeeded run with a real conversation gets enriched fields.
+    succ = runs[succeeded_id]
+    assert succ["conversation_updated_at"] == conv_store.get_conversation(conv.id).updated_at
+    assert succ["conversation_status"] == "idle"
+    assert succ["viewer_last_seen"] == conv.updated_at - 1
+    assert succ["viewer_unread"] is True
+
+    # Status reads as the sessions list reports it ("waiting" is "running"), and
+    # an unflagged session is explicitly not unread rather than unknown.
+    running = runs[running_id]
+    assert running["conversation_status"] == "running"
+    assert running["viewer_last_seen"] == 1_700_000_100
+    assert running["viewer_unread"] is False
+
+    # The skipped run (no conversation_id) gets null for all three fields.
+    skip = runs[skipped_id]
+    assert skip["conversation_updated_at"] is None
+    assert skip["conversation_status"] is None
+    assert skip["viewer_last_seen"] is None
+    assert skip["viewer_unread"] is None
+
+
+@pytest.mark.usefixtures("clean_session_read_state")
+async def test_list_runs_reads_the_local_users_read_state(
+    runtime_init: None,
+    db_uri: str,
+    tmp_path: Path,
+    mock_llm: ControllableMockClient,
+) -> None:
+    """On the single-user local runtime, ``viewer_unread`` matches the session list's.
+
+    Session read state is keyed by the raw "local" identity; ``/runs`` must read
+    the same key rather than the ``None`` the task-ownership check uses.
+    """
+    import uuid
+
+    from omnigent.server.routes._sessions.helpers import _set_read_state
+
+    app = _build_app(db_uri, tmp_path, local_single_user=True)
+    async with _serve(app, mock_llm, tmp_path) as client:
+        created = await client.post(
+            "/v1/scheduled-tasks", json=_create_body(host_id=None, workspace=None)
+        )
+        assert created.status_code == 200, created.text
+        task_id = created.json()["id"]
+        conv_store = SqlAlchemyConversationStore(db_uri)
+        conv = conv_store.create_conversation(conversation_id=uuid.uuid4().hex)
+        _seed_run(db_uri, task_id, uuid.uuid4().hex, conversation_id=conv.id)
+        _set_read_state("local", conv.id, conv.updated_at - 1, True)
+
+        resp = await client.get(f"/v1/scheduled-tasks/{task_id}/runs")
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["runs"][0]["viewer_unread"] is True
+
+
+async def test_list_runs_empty_for_task_with_no_runs(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """A task that has never fired returns an empty run list (not a 404)."""
+    _make_user(db_uri)
+    created = (
+        await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    ).json()
+    resp = await auth_client.get(f"/v1/scheduled-tasks/{created['id']}/runs", headers=_headers())
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["runs"] == []
+    assert body["next_cursor"] is None
+
+
+async def test_list_runs_cursor_pagination(auth_client: httpx.AsyncClient, db_uri: str) -> None:
+    """Paging through runs via ``limit`` + ``after`` yields every run once, in
+    order, with a null cursor on the final page."""
+    import uuid
+
+    _make_user(db_uri)
+    created = (
+        await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    ).json()
+    task_id = created["id"]
+
+    total = 25
+    # scheduled_at ascending with i so newest-first order is deterministic.
+    seeded_newest_first: list[str] = []
+    for i in range(total):
+        rid = uuid.uuid4().hex
+        _seed_run(db_uri, task_id, rid, scheduled_at=1000 + i, conversation_id=uuid.uuid4().hex)
+        seeded_newest_first.insert(0, rid)
+
+    collected: list[str] = []
+    after: str | None = None
+    pages = 0
+    while True:
+        params = {"limit": 10}
+        if after is not None:
+            params["after"] = after
+        resp = await auth_client.get(
+            f"/v1/scheduled-tasks/{task_id}/runs", params=params, headers=_headers()
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        collected.extend(r["id"] for r in body["runs"])
+        pages += 1
+        after = body["next_cursor"]
+        if after is None:
+            break
+        assert pages < 10, "pagination did not terminate"
+
+    # No gaps, no dupes, correct newest-first order across pages.
+    assert collected == seeded_newest_first
+    assert len(collected) == total
+
+
+async def test_list_runs_404_for_nonexistent_task(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """Runs for an unknown task id 404 (owner-scoped, not enumerable)."""
+    _make_user(db_uri)
+    resp = await auth_client.get(
+        "/v1/scheduled-tasks/ffffffffffffffffffffffffffffffff/runs", headers=_headers()
+    )
+    assert resp.status_code == 404, resp.text
+
+
+async def test_list_runs_404_for_nonowned_task(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """A task owned by another user 404s its runs (no cross-user enumeration)."""
+    _make_user(db_uri, "alice@example.com")
+    _make_user(db_uri, "bob@example.com")
+    created = (
+        await auth_client.post(
+            "/v1/scheduled-tasks", json=_create_body(), headers=_headers("alice@example.com")
+        )
+    ).json()
+    # Bob asks for Alice's task runs → 404.
+    resp = await auth_client.get(
+        f"/v1/scheduled-tasks/{created['id']}/runs", headers=_headers("bob@example.com")
+    )
+    assert resp.status_code == 404, resp.text
+
+
+# ── lazy-on-read orphan backstop ─────────────────────────────────────────────
+
+
+async def test_list_runs_force_fails_stale_running_run(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """Reading history force-fails a run left ``running`` past the 6h max age.
+
+    The lazy-on-read backstop for a genuine orphan (terminal event never
+    fired). ``scheduled_at`` is set well beyond the max age, so the read
+    transitions it to ``failed(incomplete)`` with ``finished_at`` stamped.
+    """
+    import time
+    import uuid
+
+    from omnigent.server.scheduled.run_reconciler import STALE_RUN_MAX_AGE_SECONDS
+
+    _make_user(db_uri)
+    created = (
+        await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    ).json()
+    task_id = created["id"]
+    run_id = uuid.uuid4().hex
+    stale_scheduled_at = int(time.time()) - STALE_RUN_MAX_AGE_SECONDS - 60
+    _seed_run(
+        db_uri,
+        task_id,
+        run_id,
+        status="running",
+        scheduled_at=stale_scheduled_at,
+        fired_at=stale_scheduled_at + 1,
+        finished_at=None,
+        conversation_id=uuid.uuid4().hex,
+    )
+
+    resp = await auth_client.get(f"/v1/scheduled-tasks/{task_id}/runs", headers=_headers())
+    assert resp.status_code == 200, resp.text
+    run = resp.json()["runs"][0]
+    assert run["status"] == "failed"
+    assert run["error_code"] == "incomplete"
+    assert run["finished_at"] is not None
+
+
+async def test_list_runs_leaves_young_running_run_untouched(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """A recently-fired ``running`` run is NOT force-failed on read.
+
+    Only runs past the max age are reaped; a young in-flight run is left for
+    the event hook to complete normally.
+    """
+    import time
+    import uuid
+
+    _make_user(db_uri)
+    created = (
+        await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    ).json()
+    task_id = created["id"]
+    run_id = uuid.uuid4().hex
+    recent = int(time.time()) - 30  # 30s ago, well within the max age
+    _seed_run(
+        db_uri,
+        task_id,
+        run_id,
+        status="running",
+        scheduled_at=recent,
+        fired_at=recent + 1,
+        finished_at=None,
+        conversation_id=uuid.uuid4().hex,
+    )
+
+    resp = await auth_client.get(f"/v1/scheduled-tasks/{task_id}/runs", headers=_headers())
+    assert resp.status_code == 200, resp.text
+    run = resp.json()["runs"][0]
+    assert run["status"] == "running"
+    assert run["finished_at"] is None
+
+
+async def test_list_tasks_force_fails_stale_running_run(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """The LIST endpoint also force-fails a stale ``running`` run (no conv read).
+
+    Reading GET /v1/scheduled-tasks reaps the owner's stale orphans so a
+    Tasks-list badge never shows one as ``running``. Verified via the detail
+    endpoint afterward (the list response itself carries no run rows yet).
+    """
+    import time
+    import uuid
+
+    from omnigent.server.scheduled.run_reconciler import STALE_RUN_MAX_AGE_SECONDS
+
+    _make_user(db_uri)
+    created = (
+        await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    ).json()
+    task_id = created["id"]
+    run_id = uuid.uuid4().hex
+    stale_at = int(time.time()) - STALE_RUN_MAX_AGE_SECONDS - 60
+    _seed_run(
+        db_uri,
+        task_id,
+        run_id,
+        status="running",
+        scheduled_at=stale_at,
+        fired_at=stale_at + 1,
+        finished_at=None,
+        conversation_id=uuid.uuid4().hex,
+    )
+
+    # Hitting the LIST endpoint triggers the lazy stale backstop.
+    list_resp = await auth_client.get("/v1/scheduled-tasks", headers=_headers())
+    assert list_resp.status_code == 200, list_resp.text
+
+    # The run was force-failed as a side effect of the list read.
+    detail = await auth_client.get(f"/v1/scheduled-tasks/{task_id}/runs", headers=_headers())
+    run = detail.json()["runs"][0]
+    assert run["status"] == "failed"
+    assert run["error_code"] == "incomplete"
+    assert run["finished_at"] is not None
+
+
+async def test_list_tasks_leaves_young_running_run_untouched(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """The LIST endpoint does NOT reap a young in-flight run."""
+    import time
+    import uuid
+
+    _make_user(db_uri)
+    created = (
+        await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    ).json()
+    task_id = created["id"]
+    run_id = uuid.uuid4().hex
+    recent = int(time.time()) - 30
+    _seed_run(
+        db_uri,
+        task_id,
+        run_id,
+        status="running",
+        scheduled_at=recent,
+        fired_at=recent + 1,
+        finished_at=None,
+        conversation_id=uuid.uuid4().hex,
+    )
+
+    list_resp = await auth_client.get("/v1/scheduled-tasks", headers=_headers())
+    assert list_resp.status_code == 200, list_resp.text
+
+    detail = await auth_client.get(f"/v1/scheduled-tasks/{task_id}/runs", headers=_headers())
+    run = detail.json()["runs"][0]
+    assert run["status"] == "running"
+    assert run["finished_at"] is None
+
+
+# ── event-hook wiring: _publish_status -> persist_scheduled_run_completion ────
+#
+# These lock the PRIMARY completion mechanism at the _publish_status seam (not
+# by re-calling the hook directly): a real terminal edge published the way the
+# SSE relay publishes it must reach the hook and transition the run, resolving
+# under the run's workspace_scope via the shared session_live_state executor.
+# Layer exercised: the sync _publish_status(...) call (its no-subscriber
+# session_stream.publish is a no-op) → session_live_state.persist_scheduled_run_
+# completion → the ThreadPoolExecutor(max_workers=1) worker → store.update_run.
+# A full runner/relay round-trip is covered by the live E2E; this covers the
+# server-side wiring so a future _publish_status refactor can't silently break
+# scheduled-run completion.
+
+
+def _seed_running_run_for_conv(db_uri: str, conversation_id: str) -> tuple[str, str]:
+    """Create a task + a ``running`` run bound to ``conversation_id``.
+
+    :returns: ``(task_id, run_id)``.
+    """
+    import uuid
+
+    from omnigent.stores.scheduled_task_store.sqlalchemy_store import (
+        SqlAlchemyScheduledTaskStore,
+    )
+
+    store = SqlAlchemyScheduledTaskStore(db_uri)
+    task_id = uuid.uuid4().hex
+    store.create(
+        scheduled_task_id=task_id,
+        name="hook-wiring",
+        prompt="p",
+        rrule="FREQ=HOURLY;BYMINUTE=0",
+        user_id=None,
+        agent_id=uuid.uuid4().hex,
+        timezone="UTC",
+    )
+    run_id = uuid.uuid4().hex
+    store.create_run(
+        run_id=run_id,
+        scheduled_task_id=task_id,
+        status="running",
+        scheduled_at=1000,
+        conversation_id=conversation_id,
+        fired_at=1001,
+    )
+    return task_id, run_id
+
+
+def _wait_for_run_status(
+    db_uri: str, task_id: str, run_id: str, want: str, timeout_s: float = 10.0
+):  # type: ignore[no-untyped-def]
+    """Poll the store until ``run_id`` reaches ``want`` (or timeout).
+
+    The hook write lands on session_live_state's background single-worker
+    executor, so the assertion must wait for that thread rather than read
+    synchronously.
+    """
+    import time
+
+    from omnigent.stores.scheduled_task_store.sqlalchemy_store import (
+        SqlAlchemyScheduledTaskStore,
+    )
+
+    store = SqlAlchemyScheduledTaskStore(db_uri)
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        for r in store.list_runs(task_id)[0]:
+            if r.id == run_id and r.status == want:
+                return r
+        time.sleep(0.02)
+    # Return the current row (whatever status) so the caller's assert reports it.
+    for r in store.list_runs(task_id):
+        if r.id == run_id:
+            return r
+    return None
+
+
+async def test_publish_status_idle_edge_transitions_scheduled_run_to_succeeded(
+    db_uri: str,
+) -> None:
+    """A completed-turn edge through _publish_status flips the run to succeeded.
+
+    Drives the real _publish_status(conversation_id, "idle") the relay emits and
+    asserts the run transitions running -> succeeded with finished_at set, via
+    the hook + executor path (workspace_scope contract exercised, not bypassed).
+
+    Async to satisfy the module's ``pytestmark = pytest.mark.asyncio``; the body
+    is synchronous (the hook write lands on session_live_state's background
+    executor, polled below) — no awaits needed.
+    """
+    import uuid
+
+    from omnigent.server import session_live_state
+    from omnigent.server.routes.sessions import _publish_status, _session_status_cache
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+    from omnigent.stores.scheduled_task_store.sqlalchemy_store import (
+        SqlAlchemyScheduledTaskStore,
+    )
+
+    conv_id = uuid.uuid4().hex
+    task_id, run_id = _seed_running_run_for_conv(db_uri, conv_id)
+
+    session_live_state.configure(
+        SqlAlchemyConversationStore(db_uri), SqlAlchemyScheduledTaskStore(db_uri)
+    )
+    try:
+        _publish_status(conv_id, "running")
+        _publish_status(conv_id, "idle")
+        row = _wait_for_run_status(db_uri, task_id, run_id, "succeeded")
+    finally:
+        session_live_state.configure(None)
+        _session_status_cache.pop(conv_id, None)
+
+    assert row is not None
+    assert row.status == "succeeded"
+    assert row.finished_at is not None
+    assert row.error_code is None
+
+
+async def test_publish_status_idle_after_cache_loss_completes_run(
+    db_uri: str,
+) -> None:
+    """Run completion still works after a restart loses cached session status."""
+    import uuid
+
+    from omnigent.server import session_live_state
+    from omnigent.server.routes.sessions import _publish_status, _session_status_cache
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+    from omnigent.stores.scheduled_task_store.sqlalchemy_store import (
+        SqlAlchemyScheduledTaskStore,
+    )
+
+    conv_id = uuid.uuid4().hex
+    task_id, run_id = _seed_running_run_for_conv(db_uri, conv_id)
+    session_live_state.configure(
+        SqlAlchemyConversationStore(db_uri), SqlAlchemyScheduledTaskStore(db_uri)
+    )
+    try:
+        _session_status_cache.pop(conv_id, None)
+        _publish_status(conv_id, "idle")
+        run = _wait_for_run_status(db_uri, task_id, run_id, "succeeded")
+    finally:
+        session_live_state.configure(None)
+        _session_status_cache.pop(conv_id, None)
+
+    assert run is not None
+    assert run.status == "succeeded"
+
+
+async def test_publish_status_idle_after_waiting_completes_run(db_uri: str) -> None:
+    """An idle that follows ``waiting`` (e.g. Stop while parked) completes the run."""
+    import uuid
+
+    from omnigent.server import session_live_state
+    from omnigent.server.routes.sessions import _publish_status, _session_status_cache
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+    from omnigent.stores.scheduled_task_store.sqlalchemy_store import (
+        SqlAlchemyScheduledTaskStore,
+    )
+
+    conv_id = uuid.uuid4().hex
+    task_id, run_id = _seed_running_run_for_conv(db_uri, conv_id)
+    session_live_state.configure(
+        SqlAlchemyConversationStore(db_uri), SqlAlchemyScheduledTaskStore(db_uri)
+    )
+    try:
+        _publish_status(conv_id, "waiting")
+        _publish_status(conv_id, "idle")
+        row = _wait_for_run_status(db_uri, task_id, run_id, "succeeded")
+    finally:
+        session_live_state.configure(None)
+        _session_status_cache.pop(conv_id, None)
+
+    assert row is not None
+    assert row.status == "succeeded"
+
+
+async def test_patch_pinning_host_on_managed_task_is_rejected(
+    auth_app: FastAPI, auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """Pinning host_id on an already-managed task is rejected, not silently dropped."""
+    _make_user(db_uri)
+
+    auth_app.state.sandbox_config = _sandbox_deployment()
+    try:
+        body = _create_body(execution_target="managed_sandbox")
+        del body["host_id"]
+        del body["workspace"]
+        created = (
+            await auth_client.post("/v1/scheduled-tasks", json=body, headers=_headers())
+        ).json()
+        tid = created["id"]
+
+        # No execution_target in the PATCH, so the request model can't catch it;
+        # the handler must reject against the effective (managed) target.
+        resp = await auth_client.patch(
+            f"/v1/scheduled-tasks/{tid}",
+            json={"host_id": "4b653f6031f35d168cc0b37caa1306d1"},
+            headers=_headers(),
+        )
+        assert resp.status_code == 400, resp.text
+    finally:
+        auth_app.state.sandbox_config = None
+
+
+async def test_publish_status_failed_edge_transitions_scheduled_run_to_failed(
+    db_uri: str,
+) -> None:
+    """A failed-turn edge through _publish_status flips the run to failed+code.
+
+    Async for the module ``pytestmark`` (see the idle-edge test); body is sync.
+    """
+    import uuid
+
+    from omnigent.server import session_live_state
+    from omnigent.server.routes.sessions import _publish_status, _session_status_cache
+    from omnigent.server.schemas import ErrorDetail
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+    from omnigent.stores.scheduled_task_store.sqlalchemy_store import (
+        SqlAlchemyScheduledTaskStore,
+    )
+
+    conv_id = uuid.uuid4().hex
+    task_id, run_id = _seed_running_run_for_conv(db_uri, conv_id)
+
+    session_live_state.configure(
+        SqlAlchemyConversationStore(db_uri), SqlAlchemyScheduledTaskStore(db_uri)
+    )
+    try:
+        _publish_status(
+            conv_id, "failed", ErrorDetail(code="runner_disconnected", message="dropped")
+        )
+        row = _wait_for_run_status(db_uri, task_id, run_id, "failed")
+    finally:
+        session_live_state.configure(None)
+        _session_status_cache.pop(conv_id, None)
+
+    assert row is not None
+    assert row.status == "failed"
+    assert row.finished_at is not None
+    assert row.error_code == "runner_disconnected"
+
+
+# ── serializer fields: last_run_status + next_run_at ─────────────────────────
+
+
+async def test_list_and_get_carry_last_run_status_and_next_run_at(
+    auth_client: httpx.AsyncClient, auth_app: FastAPI, db_uri: str
+) -> None:
+    """LIST + GET surface the latest run's status and the scheduler's next fire.
+
+    ``last_run_status`` comes from the windowed store query (the most-recent run
+    by scheduled_at DESC); ``next_run_at`` comes from the live scheduler, so an
+    armed active task reports a non-null ISO timestamp.
+    """
+    import uuid
+
+    _make_user(db_uri)
+    created = (
+        await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    ).json()
+    task_id = created["id"]
+    # A freshly created task has never run.
+    assert created["last_run_status"] is None
+    # It is armed on the scheduler, so next_run_at is a non-null ISO string.
+    assert isinstance(created["next_run_at"], str)
+
+    # Seed two runs; the newer (failed) one is the reported status.
+    _seed_run(
+        db_uri,
+        task_id,
+        uuid.uuid4().hex,
+        scheduled_at=1000,
+        status="succeeded",
+        conversation_id=uuid.uuid4().hex,
+    )
+    _seed_run(
+        db_uri,
+        task_id,
+        uuid.uuid4().hex,
+        scheduled_at=2000,
+        status="failed",
+        finished_at=2002,
+        conversation_id=uuid.uuid4().hex,
+    )
+
+    list_body = (await auth_client.get("/v1/scheduled-tasks", headers=_headers())).json()
+    row = next(t for t in list_body["scheduled_tasks"] if t["id"] == task_id)
+    assert row["last_run_status"] == "failed"
+    assert isinstance(row["next_run_at"], str)
+
+    get_body = (await auth_client.get(f"/v1/scheduled-tasks/{task_id}", headers=_headers())).json()
+    assert get_body["last_run_status"] == "failed"
+    assert isinstance(get_body["next_run_at"], str)
+
+
+async def test_paused_task_has_null_next_run_at(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """A paused task is not armed, so next_run_at is null."""
+    _make_user(db_uri)
+    created = (
+        await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    ).json()
+    task_id = created["id"]
+    patched = (
+        await auth_client.patch(
+            f"/v1/scheduled-tasks/{task_id}", json={"state": "paused"}, headers=_headers()
+        )
+    ).json()
+    assert patched["state"] == "paused"
+    assert patched["next_run_at"] is None
+
+
+# ── POST /v1/scheduled-tasks/{id}/run (run now) ──────────────────────────────
+
+
+async def test_run_now_triggers_and_records_a_run(
+    auth_client: httpx.AsyncClient, auth_app: FastAPI, db_uri: str
+) -> None:
+    """POST /run returns 202 and drives the wired run-now trigger for the task.
+
+    The route delegates to ``app.state.scheduled_task_run_now`` (built over the
+    shared fire path). Here we stub that trigger with a recorder that writes a
+    ``running`` run row, then assert the row appears in the task's history and as
+    ``last_run_status`` — the integration contract the real trigger fulfills.
+    """
+    import time
+    import uuid
+
+    from omnigent.stores.scheduled_task_store.sqlalchemy_store import (
+        SqlAlchemyScheduledTaskStore,
+    )
+
+    _make_user(db_uri)
+    created = (
+        await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    ).json()
+    task_id = created["id"]
+
+    calls: list[tuple[int, str]] = []
+    now = int(time.time())
+
+    async def _fake_run_now(workspace_id: int, scheduled_task_id: str) -> bool:
+        calls.append((workspace_id, scheduled_task_id))
+        # Use a current-time fire so the LIST endpoint's stale backstop (6h age
+        # from fired_at) does NOT reap this fresh in-flight run to ``failed``.
+        SqlAlchemyScheduledTaskStore(db_uri).create_run(
+            run_id=uuid.uuid4().hex,
+            scheduled_task_id=scheduled_task_id,
+            status="running",
+            scheduled_at=now,
+            conversation_id=uuid.uuid4().hex,
+            fired_at=now,
+        )
+        return True
+
+    auth_app.state.scheduled_task_run_now = _fake_run_now
+
+    resp = await auth_client.post(f"/v1/scheduled-tasks/{task_id}/run", headers=_headers())
+    assert resp.status_code == 202, resp.text
+    assert resp.json() == {"triggered": True, "id": task_id}
+    # The trigger was invoked with the task's workspace + id.
+    assert calls == [(0, task_id)]
+
+    runs = (
+        await auth_client.get(f"/v1/scheduled-tasks/{task_id}/runs", headers=_headers())
+    ).json()["runs"]
+    assert len(runs) == 1
+    assert runs[0]["status"] == "running"
+    # And the completion badge source now reports it.
+    list_body = (await auth_client.get("/v1/scheduled-tasks", headers=_headers())).json()
+    row = next(t for t in list_body["scheduled_tasks"] if t["id"] == task_id)
+    assert row["last_run_status"] == "running"
+
+
+async def test_run_now_allows_paused_task(
+    auth_client: httpx.AsyncClient, auth_app: FastAPI, db_uri: str
+) -> None:
+    """Run-now is a manual override — a paused task is still triggerable (202)."""
+    _make_user(db_uri)
+    created = (
+        await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    ).json()
+    task_id = created["id"]
+    await auth_client.patch(
+        f"/v1/scheduled-tasks/{task_id}", json={"state": "paused"}, headers=_headers()
+    )
+
+    triggered: list[str] = []
+
+    async def _fake_run_now(workspace_id: int, scheduled_task_id: str) -> bool:
+        triggered.append(scheduled_task_id)
+        return True
+
+    auth_app.state.scheduled_task_run_now = _fake_run_now
+    resp = await auth_client.post(f"/v1/scheduled-tasks/{task_id}/run", headers=_headers())
+    assert resp.status_code == 202, resp.text
+    assert triggered == [task_id]
+
+
+async def test_run_now_conflict_when_already_in_flight(
+    auth_client: httpx.AsyncClient, auth_app: FastAPI, db_uri: str
+) -> None:
+    """A trigger that reports it was skipped (already in flight) surfaces as 409."""
+    _make_user(db_uri)
+    created = (
+        await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    ).json()
+    task_id = created["id"]
+
+    async def _fake_run_now(workspace_id: int, scheduled_task_id: str) -> bool:
+        return False  # already in flight
+
+    auth_app.state.scheduled_task_run_now = _fake_run_now
+    resp = await auth_client.post(f"/v1/scheduled-tasks/{task_id}/run", headers=_headers())
+    assert resp.status_code == 409, resp.text
+
+
+async def test_run_now_404_for_nonowned_task(
+    auth_client: httpx.AsyncClient, auth_app: FastAPI, db_uri: str
+) -> None:
+    """Running another user's task 404s (not enumerable across users)."""
+    _make_user(db_uri, "alice@example.com")
+    _make_user(db_uri, "bob@example.com")
+    created = (
+        await auth_client.post(
+            "/v1/scheduled-tasks", json=_create_body(), headers=_headers("alice@example.com")
+        )
+    ).json()
+
+    async def _fake_run_now(workspace_id: int, scheduled_task_id: str) -> bool:
+        raise AssertionError("run_now must not be reached for a non-owned task")
+
+    auth_app.state.scheduled_task_run_now = _fake_run_now
+    resp = await auth_client.post(
+        f"/v1/scheduled-tasks/{created['id']}/run", headers=_headers("bob@example.com")
+    )
+    assert resp.status_code == 404, resp.text
+
+
+async def test_run_now_503_when_scheduler_not_running(
+    auth_client: httpx.AsyncClient, auth_app: FastAPI, db_uri: str
+) -> None:
+    """With no run-now trigger wired, the endpoint reports the subsystem is down."""
+    _make_user(db_uri)
+    created = (
+        await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    ).json()
+    auth_app.state.scheduled_task_run_now = None
+    resp = await auth_client.post(f"/v1/scheduled-tasks/{created['id']}/run", headers=_headers())
+    assert resp.status_code == 503, resp.text
+
+
+@pytest.mark.parametrize("auth_app", [True], indirect=True)
+async def test_database_scheduler_run_now_404_for_nonowned_task(
+    auth_app: FastAPI, auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    _make_user(db_uri, "bob@example.com")
+    created = (
+        await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    ).json()
+    resp = await auth_client.post(
+        f"/v1/scheduled-tasks/{created['id']}/run", headers=_headers("bob@example.com")
+    )
+    assert resp.status_code == 404, resp.text
+    assert SqlAlchemyScheduledTaskStore(db_uri).list_pending_runs() == []
+
+
+@pytest.mark.parametrize("auth_app", [True], indirect=True)
+async def test_database_scheduler_run_now_503_when_scheduler_not_running(
+    auth_app: FastAPI,
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    created = (
+        await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    ).json()
+    await auth_app.state.scheduled_task_scheduler.stop()
+    monkeypatch.setattr(auth_app.state, "scheduled_task_scheduler", None)
+    resp = await auth_client.post(f"/v1/scheduled-tasks/{created['id']}/run", headers=_headers())
+    assert resp.status_code == 503, resp.text
+    assert SqlAlchemyScheduledTaskStore(db_uri).list_pending_runs() == []
+
+
+@pytest.mark.parametrize("auth_app", [True], indirect=True)
+@pytest.mark.parametrize("scheduler_available", [True, False])
+async def test_database_scheduler_crud_uses_persisted_next_run(
+    auth_app: FastAPI,
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    scheduler_available: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from datetime import datetime
+
+    # The opt-in scheduler has no per-task timers to update; each request persists
+    # its schedule and renders that same value without another scheduler lookup.
+    assert isinstance(auth_app.state.scheduled_task_scheduler, PersistentTaskScheduler)
+    assert auth_app.state.scheduled_task_scheduler.is_started
+    store = SqlAlchemyScheduledTaskStore(db_uri)
+    if not scheduler_available:
+        await auth_app.state.scheduled_task_scheduler.stop()
+        monkeypatch.setattr(auth_app.state, "scheduled_task_scheduler", None)
+    created = await auth_client.post(
+        "/v1/scheduled-tasks", json=_create_body(), headers=_headers()
+    )
+    assert created.status_code == 200, created.text
+    task = created.json()
+    assert (
+        datetime.fromisoformat(task["next_run_at"]).timestamp()
+        == store.get(task["id"]).next_run_at
+    )
+    url = f"/v1/scheduled-tasks/{task['id']}"
+    fetched = await auth_client.get(url, headers=_headers())
+    assert fetched.status_code == 200, fetched.text
+    assert fetched.json()["next_run_at"] == task["next_run_at"]
+    listed = await auth_client.get("/v1/scheduled-tasks", headers=_headers())
+    assert listed.status_code == 200, listed.text
+    assert listed.json()["scheduled_tasks"][0]["next_run_at"] == task["next_run_at"]
+    for edit in ({"rrule": "FREQ=DAILY;BYHOUR=17"}, {"timezone": "Asia/Tokyo"}):
+        changed = await auth_client.patch(url, json=edit, headers=_headers())
+        assert changed.status_code == 200, changed.text
+        assert all(changed.json()[key] == value for key, value in edit.items())
+        assert changed.json()["next_run_at"] != fetched.json()["next_run_at"]
+        assert (
+            datetime.fromisoformat(changed.json()["next_run_at"]).timestamp()
+            == store.get(task["id"]).next_run_at
+        )
+        fetched = changed
+    paused = await auth_client.patch(url, json={"state": "paused"}, headers=_headers())
+    assert paused.status_code == 200, paused.text
+    assert paused.json()["next_run_at"] is None
+    resumed = await auth_client.patch(url, json={"state": "active"}, headers=_headers())
+    assert resumed.status_code == 200, resumed.text
+    assert resumed.json()["next_run_at"] is not None
+    deleted = await auth_client.delete(url, headers=_headers())
+    assert deleted.status_code == 200, deleted.text
+    assert store.get(task["id"]) is None
+
+
+@pytest.mark.parametrize("load_fails", [False, True])
+async def test_legacy_retry_keeps_tasks_created_and_edited_during_load(
+    auth_app, db_uri, monkeypatch, load_fails
+):
+    import asyncio
+    from threading import Event
+
+    from tests._helpers.polling import poll_until_async
+
+    store = SqlAlchemyScheduledTaskStore(db_uri)
+    existing = store.create(
+        "0123456789abcdef0123456789abcdef",
+        "existing",
+        "prompt",
+        "FREQ=DAILY;BYHOUR=9",
+        "alice@example.com",
+        builtin_agent_id(CLAUDE_NATIVE_AGENT_NAME),
+        "UTC",
+    )
+    entered, release = asyncio.Event(), Event()
+    loop = asyncio.get_running_loop()
+    load = SqlAlchemyScheduledTaskStore.list_active_all_workspaces
+    attempts = 0
+
+    def fail_then_snapshot(self):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("temporary database outage")
+        snapshot = load(self)
+        loop.call_soon_threadsafe(entered.set)
+        assert release.wait(10), "Startup snapshot was never released"
+        if load_fails and attempts == 2:
+            raise RuntimeError("database read failed after route mutations")
+        return snapshot
+
+    monkeypatch.setattr(
+        SqlAlchemyScheduledTaskStore, "list_active_all_workspaces", fail_then_snapshot
+    )
+    async with auth_app.router.lifespan_context(auth_app):
+        assert auth_app.state.scheduled_task_scheduler is None
+        try:
+            await asyncio.wait_for(entered.wait(), 10)
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=auth_app), base_url="http://test"
+            ) as client:
+                created = await client.post(
+                    "/v1/scheduled-tasks", json=_create_body(), headers=_headers()
+                )
+                assert created.status_code == 200, created.text
+                edited = await client.patch(
+                    f"/v1/scheduled-tasks/{existing.id}",
+                    json={"rrule": "FREQ=DAILY;BYHOUR=17", "timezone": "Asia/Tokyo"},
+                    headers=_headers(),
+                )
+                assert edited.status_code == 200, edited.text
+                assert created.json()["next_run_at"] is not None
+                assert edited.json()["next_run_at"] is not None
+        finally:
+            release.set()
+        await poll_until_async(
+            lambda: (
+                auth_app.state.scheduled_task_scheduler is not None
+                and auth_app.state.scheduled_task_scheduler.is_started
+            ),
+            timeout_s=10,
+        )
+        scheduler = auth_app.state.scheduled_task_scheduler
+        assert scheduler.job_count == 2
+        assert scheduler.next_run_at(created.json()["id"]) == created.json()["next_run_at"]
+        assert scheduler.next_run_at(existing.id) == edited.json()["next_run_at"]
+
+
+_HOST_ID = "4b653f6031f35d168cc0b37caa1306d1"
+
+
+def _owned_session(
+    db_uri: str, owner: str = "alice@example.com", *, archived: bool = False, **fields: object
+) -> str:
+    """A top-level session on the test host, with an owner grant for *owner*."""
+    from omnigent.server.auth import LEVEL_OWNER
+
+    conversations = SqlAlchemyConversationStore(db_uri)
+    values: dict[str, object] = {
+        "agent_id": builtin_agent_id(CLAUDE_NATIVE_AGENT_NAME),
+        "host_id": _HOST_ID,
+        "workspace": "/repo",
+    }
+    values.update(fields)
+    conv = conversations.create_conversation(**values)  # type: ignore[arg-type]
+    if archived:
+        conversations.update_conversation(conv.id, archived=True)
+    SqlAlchemyPermissionStore(db_uri).grant(owner, conv.id, LEVEL_OWNER)
+    return conv.id
+
+
+async def test_picking_a_session_pins_the_host_it_runs_on(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """The session cannot move, so an unpinned task routes every run to its host."""
+    session_id = _owned_session(db_uri)
+    created = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(
+            session_mode="continue", session_id=session_id, host_id=None, workspace=None
+        ),
+        headers=_headers(),
+    )
+    assert created.status_code == 200, created.text
+    assert created.json()["host_id"] == _HOST_ID
+
+    unpinned = (
+        await auth_client.post(
+            "/v1/scheduled-tasks",
+            json=_create_body(session_mode="continue", host_id=None, workspace=None),
+            headers=_headers(),
+        )
+    ).json()
+    assert unpinned["host_id"] is None
+    picked = await auth_client.patch(
+        f"/v1/scheduled-tasks/{unpinned['id']}",
+        json={"session_id": _owned_session(db_uri)},
+        headers=_headers(),
+    )
+    assert picked.status_code == 200, picked.text
+    assert picked.json()["host_id"] == _HOST_ID
+
+
+async def test_session_mode_round_trips_and_a_null_session_starts_a_new_one(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """``continue`` keeps the first run's session until a PATCH clears it or picks ``new``."""
+    default = (
+        await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    ).json()
+    assert (default["session_mode"], default["session_id"]) == ("new", None)
+
+    created = (
+        await auth_client.post(
+            "/v1/scheduled-tasks",
+            json=_create_body(session_mode="continue"),
+            headers=_headers(),
+        )
+    ).json()
+    assert (created["session_mode"], created["session_id"]) == ("continue", None)
+    task_id = created["id"]
+    first_session = _owned_session(db_uri)
+    schedules = SqlAlchemyScheduledTaskStore(db_uri)
+    snapshot = schedules.get(task_id)
+    assert schedules.adopt_session(task_id, first_session, snapshot=snapshot) == "adopted"
+
+    renamed = await auth_client.patch(
+        f"/v1/scheduled-tasks/{task_id}", json={"name": "renamed"}, headers=_headers()
+    )
+    assert renamed.json()["session_id"] == first_session
+
+    cleared = await auth_client.patch(
+        f"/v1/scheduled-tasks/{task_id}", json={"session_id": None}, headers=_headers()
+    )
+    assert cleared.status_code == 200, cleared.text
+    assert (cleared.json()["session_mode"], cleared.json()["session_id"]) == ("continue", None)
+
+    picked = await auth_client.patch(
+        f"/v1/scheduled-tasks/{task_id}", json={"session_id": first_session}, headers=_headers()
+    )
+    assert picked.status_code == 200, picked.text
+    assert picked.json()["session_id"] == first_session
+
+    to_new = await auth_client.patch(
+        f"/v1/scheduled-tasks/{task_id}", json={"session_mode": "new"}, headers=_headers()
+    )
+    assert (to_new.json()["session_mode"], to_new.json()["session_id"]) == ("new", None)
+
+
+async def test_create_can_continue_a_session_the_owner_picked(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    session_id = _owned_session(db_uri)
+
+    resp = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(session_mode="continue", session_id=session_id),
+        headers=_headers(),
+    )
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert (body["session_mode"], body["session_id"]) == ("continue", session_id)
+    # The task runs the session's own agent rather than taking a copy.
+    assert body["agent_id"] == builtin_agent_id(CLAUDE_NATIVE_AGENT_NAME)
+
+
+async def test_a_picked_session_must_be_the_owners_and_fit_the_task(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    _make_user(db_uri, "bob@example.com")
+    bobs = _owned_session(db_uri, "bob@example.com")
+    cases = {
+        "someone else's": (bobs, 404),
+        # Nothing else about a session the caller can't see is told.
+        "someone else's archived": (_owned_session(db_uri, "bob@example.com", archived=True), 404),
+        "someone else's sub-agent": (
+            _owned_session(db_uri, "bob@example.com", parent_conversation_id=bobs),
+            404,
+        ),
+        "missing": ("cd" * 16, 404),
+        "archived": (_owned_session(db_uri, archived=True), 400),
+        "on another workspace": (_owned_session(db_uri, workspace="/elsewhere"), 400),
+    }
+    for label, (session_id, status) in cases.items():
+        resp = await auth_client.post(
+            "/v1/scheduled-tasks",
+            json=_create_body(session_mode="continue", session_id=session_id),
+            headers=_headers(),
+        )
+        assert resp.status_code == status, (label, resp.text)
+
+    new_mode = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(session_id=_owned_session(db_uri)),
+        headers=_headers(),
+    )
+    assert new_mode.status_code == 422, new_mode.text
+
+
+async def test_a_patch_that_picks_a_session_takes_no_agent_copy(
+    auth_client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A picked session keeps the agent it runs, so switching to it copies nothing."""
+    from omnigent.native.native_coding_agents import CODEX_NATIVE_AGENT_NAME
+
+    created = (
+        await auth_client.post(
+            "/v1/scheduled-tasks", json=_create_body(session_mode="continue"), headers=_headers()
+        )
+    ).json()
+    copies: list[str] = []
+
+    def _copy(
+        agent_store: object, artifact_store: object, agent: SimpleNamespace, user_id: object
+    ) -> SimpleNamespace:
+        # Stands in for an agent shared by another user, which binding copies;
+        # this app has no fixture for one.
+        copies.append(agent.id)
+        return SimpleNamespace(id=uuid.uuid4().hex)
+
+    monkeypatch.setattr(scheduled_tasks_routes, "agent_for_user", _copy)
+    codex = builtin_agent_id(CODEX_NATIVE_AGENT_NAME)
+    session_id = _owned_session(db_uri, agent_id=codex)
+
+    patched = await auth_client.patch(
+        f"/v1/scheduled-tasks/{created['id']}",
+        json={"agent_id": codex, "session_id": session_id},
+        headers=_headers(),
+    )
+
+    assert patched.status_code == 200, patched.text
+    assert (patched.json()["agent_id"], patched.json()["session_id"]) == (codex, session_id)
+    assert copies == []
+
+
+async def test_changing_where_a_task_runs_starts_a_new_session(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """A continued session cannot follow a new pin, so the next run starts a new one."""
+    session_id = _owned_session(db_uri)
+    created = (
+        await auth_client.post(
+            "/v1/scheduled-tasks",
+            json=_create_body(session_mode="continue", session_id=session_id),
+            headers=_headers(),
+        )
+    ).json()
+
+    resent = await auth_client.patch(
+        f"/v1/scheduled-tasks/{created['id']}",
+        json={"name": "renamed", "host_id": _HOST_ID, "workspace": "/repo"},
+        headers=_headers(),
+    )
+    assert resent.json()["session_id"] == session_id
+
+    moved = await auth_client.patch(
+        f"/v1/scheduled-tasks/{created['id']}", json={"workspace": "/other"}, headers=_headers()
+    )
+
+    assert moved.status_code == 200, moved.text
+    assert (moved.json()["session_mode"], moved.json()["session_id"]) == ("continue", None)

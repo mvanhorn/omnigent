@@ -30,8 +30,9 @@
 # arm64 hosts (Apple Silicon laptops, arm64 clusters) as well as amd64.
 # Nothing below is arch-specific: the python/node base images are
 # multi-arch and apt/pip/npm/COPY-from-node all resolve per-arch under
-# buildx. Amd64-only consumers (Modal, Daytona, CoreWeave) keep pulling
-# the amd64 variant from the manifest list, unchanged.
+# buildx. Only web-builder is pinned to $BUILDPLATFORM (see that stage).
+# Amd64-only consumers (Modal, Daytona, CoreWeave) keep pulling the
+# amd64 variant from the manifest list, unchanged.
 #
 # Build (from repo root):
 #
@@ -40,6 +41,11 @@
 #
 #   docker build -t omnigent-host:latest --target host \
 #                -f deploy/docker/Dockerfile .
+#
+# To bake extra harness CLIs into a host image beyond the default set, build
+# with EXTRA_HARNESS_CLIS="goose jcode opencode" — harness names, optional
+# @version pins, or npm:<pkg-spec> entries (see deploy/docker/README.md and
+# deploy/docker/install-harness-cli.sh for the supported names).
 #
 # Behind corporate package proxies (the host target also installs the
 # harness CLIs from npm, so it needs the npm proxy too):
@@ -55,7 +61,7 @@
 
 # Must satisfy pyproject requires-python (>=3.12); 3.11 fails dependency resolution.
 ARG PYTHON_VERSION=3.12
-ARG NODE_VERSION=20
+ARG NODE_VERSION=22
 
 # ── Web UI builder ──────────────────────────────────────
 # Builds the web SPA so `docker build` works from a clean checkout —
@@ -65,17 +71,33 @@ ARG NODE_VERSION=20
 # /web/omnigent/server/static/web-ui, which the server builder overlays.
 # Server-only: the host target never reaches this stage.
 #
+# Pinned to the build host's platform: the bundle is arch-independent
+# (plain JS/CSS/HTML), and vite's native bundler has stalled indefinitely
+# at "rendering chunks" under QEMU arm64 emulation, timing out releases.
+#
 # Behind a corporate npm proxy, pass it through:
 #   --build-arg NPM_CONFIG_REGISTRY=https://npm-proxy.example.com
-FROM node:${NODE_VERSION}-slim AS web-builder
+FROM --platform=$BUILDPLATFORM node:${NODE_VERSION}-slim AS web-builder
 ARG NPM_CONFIG_REGISTRY=
-ENV NPM_CONFIG_REGISTRY=${NPM_CONFIG_REGISTRY}
-WORKDIR /web/web
-# Manifests first so the install layer caches across pure source edits.
-COPY web/package.json web/package-lock.json ./
-RUN npm install --no-audit --no-fund
-COPY web/ ./
-RUN npm run build
+ENV NPM_CONFIG_REGISTRY=${NPM_CONFIG_REGISTRY:-https://registry.npmjs.org}
+# pnpm 11 uses PNPM_CONFIG_ settings; npm uses NPM_CONFIG_.
+ENV PNPM_CONFIG_REGISTRY=${NPM_CONFIG_REGISTRY}
+WORKDIR /web
+
+# Workspace manifests + lockfile first so the install layer caches across pure
+# source edits. The electron package JSON is included so the root workspace is
+# structurally complete, but we --filter web to avoid downloading Electron.
+COPY pnpm-workspace.yaml pnpm-lock.yaml ./
+COPY patches/ ./patches/
+COPY web/package.json ./web/
+COPY web/electron/package.json ./web/electron/
+
+RUN npm install -g pnpm@11.15.1
+RUN pnpm install --frozen-lockfile --filter web
+
+COPY web/ ./web/
+ARG VITE_OMNIGENT_HOST_ROUTING=false
+RUN pnpm --filter web run build
 
 # ── Python builder (shared: server + host) ──────────────
 # Installs the package (and its transitive native-extension deps) into
@@ -200,9 +222,11 @@ ENV PYTHONUNBUFFERED=1 \
     PATH="/opt/venv/bin:${PATH}" \
     IS_SANDBOX=1
 
+# bzip2 ships on every host so the goose EXTRA_HARNESS_CLIS row works without
+# another package-list edit (goose's release archive is .tar.bz2).
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-      git tmux procps lsof bubblewrap curl ca-certificates unzip \
+      git tmux procps lsof bubblewrap curl ca-certificates unzip bzip2 \
       iproute2 nftables \
  && rm -rf /var/lib/apt/lists/*
 
@@ -294,7 +318,7 @@ RUN set -eu; \
 #
 # Version + integrity pin: the native harness is behaviorally coupled to a
 # specific agy build (out-of-order transcript writes, connect-RPC quirks, and TUI
-# injection are all verified against 1.0.10 — grep ``agy 1.0.10`` under
+# injection are all verified against 1.1.16 — grep ``agy 1.1.16`` under
 # omnigent/antigravity_native*). The official ``install.sh`` bootstrapper has NO
 # version flag — it always fetches the LATEST build from an auto-updater manifest
 # and old builds are not retained at any stable, reconstructable URL — so it
@@ -304,9 +328,15 @@ RUN set -eu; \
 # supply-chain control (a version-string check alone is not). To adopt a new agy:
 # re-verify the coupled behavior, then bump AGY_VERSION and both SHA256s (from
 # https://github.com/google-antigravity/antigravity-cli/releases).
-ARG AGY_VERSION=1.0.10
-ARG AGY_SHA256_AMD64=6547cf9a37227f26004fa4b805418b1df96f54c57b9723ca7d10864d2610bb0f
-ARG AGY_SHA256_ARM64=4674fabc3681221e54c90d15077c9a97a25ea71222001dabe44bf1576e888593
+ARG AGY_VERSION=1.1.16
+ARG AGY_SHA256_AMD64=7742953b7835b457e9102f1357a493913657dfd147435584f609d58356ec085a
+ARG AGY_SHA256_ARM64=c71599bb548cf72dfe7a8f6c411b3c7a3623cd4b0f6276bae89c69f769d6c92d
+# Exported for install-harness-cli.sh's agy row, so a build that adds
+# EXTRA_HARNESS_CLIS=agy pins the same version + sha256 as the install above
+# (and UBI — which has no baked agy — pins the same values).
+ENV AGY_VERSION=${AGY_VERSION} \
+    AGY_SHA256_AMD64=${AGY_SHA256_AMD64} \
+    AGY_SHA256_ARM64=${AGY_SHA256_ARM64}
 RUN set -eu; \
     arch="$(dpkg --print-architecture)"; \
     case "$arch" in \
@@ -328,6 +358,38 @@ RUN set -eu; \
     fi; \
     echo "agy ${AGY_VERSION} pinned (sha256 verified)"
 
+# GitHub CLI (`gh`) — the read-only "GitHub" side panel shells out to `gh` in the
+# runner (omnigent/runner/github_resource.py: `gh pr view` / `gh pr diff` /
+# `gh api .../pulls/<n>/files`) to render the session branch's PR + file diffs, so
+# a managed host image must carry it or the panel degrades to a "gh not installed"
+# state. Pinned + SHA256-verified per arch, like agy above; to bump, update
+# GH_VERSION and both SHA256s from the release's `gh_<ver>_checksums.txt` at
+# https://github.com/cli/cli/releases.
+ARG GH_VERSION=2.103.0
+ARG GH_SHA256_AMD64=fdd768eb70f6409f80fcfa9f3a1c0adf0fc98d827ab3ce0bed2ac22762c5d786
+ARG GH_SHA256_ARM64=7f322df34e624d14f5ec0c4acb121fd6dfa14392fdbbd1066aa8e0a05ac3721e
+RUN set -eu; \
+    arch="$(dpkg --print-architecture)"; \
+    case "$arch" in \
+      amd64) sha="$GH_SHA256_AMD64" ;; \
+      arm64) sha="$GH_SHA256_ARM64" ;; \
+      *) echo "ERROR: unsupported arch '$arch' for gh" >&2; exit 1 ;; \
+    esac; \
+    asset="gh_${GH_VERSION}_linux_${arch}.tar.gz"; \
+    curl -fsSL -o /tmp/gh.tar.gz \
+      "https://github.com/cli/cli/releases/download/v${GH_VERSION}/${asset}"; \
+    echo "${sha}  /tmp/gh.tar.gz" | sha256sum -c -; \
+    tar -xzf /tmp/gh.tar.gz -C /tmp "gh_${GH_VERSION}_linux_${arch}/bin/gh"; \
+    install -m 0755 "/tmp/gh_${GH_VERSION}_linux_${arch}/bin/gh" /usr/local/bin/gh; \
+    rm -rf /tmp/gh.tar.gz "/tmp/gh_${GH_VERSION}_linux_${arch}"; \
+    test -x /usr/local/bin/gh; \
+    installed="$(/usr/local/bin/gh --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)"; \
+    if [ "$installed" != "$GH_VERSION" ]; then \
+      echo "ERROR: gh reports '${installed:-<unparseable>}', expected '$GH_VERSION'." >&2; \
+      exit 1; \
+    fi; \
+    echo "gh ${GH_VERSION} pinned (sha256 verified)"
+
 # Copy the venv and source tree. The editable install's .pth files reference
 # /build/omnigent and /build/sdks/* -- both denied by the k8s Landlock LSM
 # policy. Re-install without -e so the package bytes land in the venv's
@@ -343,6 +405,19 @@ RUN pip install --no-cache-dir /build /build/sdks/python-client /build/sdks/ui \
 # resolve to the system Python instead of the venv. profile.d snippets
 # are sourced after that reset, so this puts the venv back in front.
 RUN echo 'export PATH="/opt/venv/bin:${PATH}"' > /etc/profile.d/omnigent-venv.sh
+
+# Optional extra harness CLIs, off by default: space-separated harness names
+# with optional @version pins, or npm:<pkg-spec> — see install-harness-cli.sh
+# and deploy/docker/README.md. Kept at the end of the stage so script churn
+# doesn't bust the layers above. `set -f` stops glob expansion in the unquoted
+# arg list (npm specs may contain *). The script is removed after use.
+ARG EXTRA_HARNESS_CLIS=
+COPY deploy/docker/install-harness-cli.sh /tmp/install-harness-cli.sh
+RUN if [ -n "${EXTRA_HARNESS_CLIS}" ]; then \
+        set -f; \
+        bash /tmp/install-harness-cli.sh ${EXTRA_HARNESS_CLIS}; \
+    fi; \
+    rm -f /tmp/install-harness-cli.sh
 
 WORKDIR /root
 

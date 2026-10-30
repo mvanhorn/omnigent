@@ -19,7 +19,7 @@ import logging
 import secrets
 from typing import Any
 
-from omnigent.host.frames import HostFsRequestFrame, encode_host_frame
+from omnigent.host.frames import HostFsRequestFrame, HostFsWriteFrame, encode_host_frame
 from omnigent.server.host_registry import HostConnection, HostRegistry
 
 _logger = logging.getLogger(__name__)
@@ -49,11 +49,11 @@ class HostFsError(Exception):
 
 
 class HostFsUnavailableError(Exception):
-    """The host could not be reached for a filesystem read.
+    """A host filesystem operation lost its connection or result.
 
     Connection loss or no reply within the timeout — an infrastructure
     condition. Callers treat it like a runner-offline result (fall
-    through to the next resolver link / 502).
+    through to the next resolver link / 502). A write may already have applied.
     """
 
 
@@ -71,7 +71,11 @@ async def read_workspace_from_host(
     :param host_registry: Registry used to enqueue the outbound frame.
     :param host_conn: Live host connection for the session's host.
     :param op: Operation name — ``"list_or_read"`` / ``"changes"`` /
-        ``"diff"`` / ``"search"``.
+        ``"diff"`` / ``"search"`` / ``"github_info"`` / ``"github_changes"`` /
+        ``"github_diff"`` / ``"github_pr_diff"`` / ``"github_labels"`` /
+        ``"github_merge_options"`` / ``"github_reviewers"`` /
+        ``"github_review_threads"`` / ``"github_review_thread_comments"``. The ``github_*`` ops
+        serve every git provider; their names are stable wire ids.
     :param workspace: Absolute workspace path on the host.
     :param session_id: Session id, forwarded to the change registry.
     :param params: Operation-specific arguments.
@@ -101,7 +105,7 @@ async def read_workspace_from_host(
             ) from exc
         try:
             result = await asyncio.wait_for(future, timeout=_FS_TIMEOUT_S)
-        except asyncio.TimeoutError as exc:
+        except TimeoutError as exc:
             _logger.warning(
                 "host '%s' did not answer fs op %r within %.0fs",
                 host_conn.host_id,
@@ -128,6 +132,94 @@ async def read_workspace_from_host(
     status = result.get("error_status")
     code = result.get("error_code") or "fs_read_failed"
     message = result.get("error") or "host filesystem read failed"
+    if not isinstance(status, int):
+        status = 500
+    raise HostFsError(status, str(code), str(message))
+
+
+async def write_workspace_from_host(
+    *,
+    host_registry: HostRegistry,
+    host_conn: HostConnection,
+    op: str,
+    workspace: str,
+    session_id: str,
+    params: dict[str, Any],
+    timeout: float = _FS_TIMEOUT_S,
+) -> dict[str, Any]:
+    """Send a ``host.fs_write_request`` frame and await its result.
+
+    The write counterpart of :func:`read_workspace_from_host` — for the small set
+    of host-servable writes (currently ``"github_set_preference"``,
+    ``"github_prs_update"``, ``"github_labels_update"``, ``"github_reviewers_update"``,
+    ``"github_details_update"``, ``"github_comment_create"``,
+    ``"github_review_thread_reply"``, ``"github_review_thread_create"``,
+    ``"github_attachment_upload"``, ``"github_merge"``,
+    and ``"github_disable_auto_merge"``) so a preference change, a PR attach/remove,
+    a label, reviewer, title, or description edit, a comment, an attachment upload, or a merge
+    works when the session's runner is offline.
+    Shares the result frame, the ``pending_fs_requests`` correlation map, and the
+    error mapping with reads.
+
+    :param op: Write op name — currently ``"github_set_preference"``,
+        ``"github_prs_update"``, ``"github_labels_update"``,
+        ``"github_reviewers_update"``, ``"github_details_update"``, ``"github_comment_create"``,
+        ``"github_review_thread_reply"``, ``"github_review_thread_create"``,
+        ``"github_attachment_upload"``, ``"github_merge"``, or
+        ``"github_disable_auto_merge"``.
+    :param params: Operation-specific arguments, e.g. ``{"account": ...}``.
+    :param timeout: Seconds to wait for the host, longer for a slow op like an upload.
+    :returns: The refreshed payload on success.
+    :raises HostFsError: When the host reports a failure (reproduces the runner's
+        response).
+    :raises HostFsUnavailableError: On connection loss or timeout.
+    """
+    request_id = secrets.token_hex(8)
+    frame = encode_host_frame(
+        HostFsWriteFrame(
+            request_id=request_id,
+            op=op,
+            workspace=workspace,
+            session_id=session_id,
+            params=params,
+        )
+    )
+    future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
+    host_conn.pending_fs_requests[request_id] = future
+    try:
+        try:
+            host_registry.send_text(host_conn, frame)
+        except ConnectionError as exc:
+            raise HostFsUnavailableError(
+                f"host '{host_conn.host_id}' connection lost during fs write"
+            ) from exc
+        try:
+            result = await asyncio.wait_for(future, timeout=timeout)
+        except TimeoutError as exc:
+            _logger.warning(
+                "host '%s' did not answer fs write op %r within %.0fs",
+                host_conn.host_id,
+                op,
+                timeout,
+            )
+            raise HostFsUnavailableError(
+                f"host '{host_conn.host_id}' did not respond to fs write within "
+                f"{timeout:.0f}s (it may be running an older version)"
+            ) from exc
+    finally:
+        host_conn.pending_fs_requests.pop(request_id, None)
+
+    if result.get("status") == "ok":
+        payload = result.get("payload")
+        if not isinstance(payload, dict):
+            raise HostFsUnavailableError(
+                f"host '{host_conn.host_id}' returned an incomplete fs write result"
+            )
+        return payload
+
+    status = result.get("error_status")
+    code = result.get("error_code") or "fs_write_failed"
+    message = result.get("error") or "host filesystem write failed"
     if not isinstance(status, int):
         status = 500
     raise HostFsError(status, str(code), str(message))

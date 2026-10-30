@@ -1,21 +1,88 @@
-"""E2E: claude-native model picker offers Fable and both Sonnet generations."""
+"""E2E: claude-native model picker follows its live Databricks catalog."""
 
 from __future__ import annotations
 
 import json
+import os
+import re
+import signal
+import uuid
+from collections.abc import Iterator
+from pathlib import Path
 from urllib.parse import urlparse
 
+import httpx
+import pytest
 from playwright.sync_api import Page, Route, expect
 
-# Capability order, most powerful first. The default "sonnet" alias stays
-# bound to Sonnet 4.6; "sonnet_5" is Claude Code's one custom /model slot,
-# an opt-in for the newer Sonnet offered alongside it.
+from omnigent.harnesses.claude_native.bridge import (
+    BRIDGE_ID_LABEL_KEY,
+    bridge_dir_for_bridge_id,
+    read_claude_status_model,
+    read_transcript_path,
+)
+from omnigent.harnesses.claude_native.main import (
+    ClaudeNativeUcodeConfig,
+    claude_native_model_options,
+)
+from tests._helpers.host import isolated_host
+from tests._helpers.native_session import create_native_session
+from tests._helpers.polling import poll_until
+from tests.e2e.conftest import get_mock_message_requests
+from tests.e2e_ui.conftest import (
+    fetch_with_retry,
+    reset_mock_llm,
+    seed_committed_turn,
+    set_fallback_mock_llm,
+)
+from tests.e2e_ui.messages.test_message_render_parity import _ASSISTANT, _WORKING
+from tests.e2e_ui.messages.test_native_claude_render_parity import (
+    _ensure_chat_view,
+    _open_terminal_view,
+    _pane_process_ids,
+    _send_turn_and_settle,
+    _signal_each,
+    _tmux_advert,
+    _wait_for_transcript_message,
+    _wait_terminal_connected,
+)
+from tests.helpers.ui_configuration import validate_native_claude_mock_routing
+
 _EXPECTED_ROWS = [
-    ("fable", "Fable"),
-    ("opus", "Opus"),
-    ("sonnet", "Sonnet 4.6"),
-    ("sonnet_5", "Sonnet 5"),
-    ("haiku", "Haiku"),
+    ("opus", "Opus 4.10"),
+    ("sonnet", "Sonnet 5"),
+    ("haiku", "Haiku 4.5"),
+]
+
+
+@pytest.fixture(autouse=True)
+def _finish_snapshot_routes(page: Page) -> Iterator[None]:
+    """Drain snapshot response handlers before Playwright disposes the page."""
+    yield
+    # A recording run closes the page when the test body ends.
+    if not page.is_closed():
+        page.unroute_all(behavior="wait")
+
+
+_MODEL_OPTIONS = [
+    {
+        "id": "opus",
+        "model": "system.ai.claude-opus-4-10",
+        "displayName": "Opus 4.10",
+        "isDefault": False,
+    },
+    {
+        "id": "sonnet",
+        "model": "system.ai.claude-sonnet-5",
+        "displayName": "Sonnet 5",
+        "isDefault": True,
+    },
+    {
+        "id": "haiku",
+        "model": "system.ai.claude-haiku-4-5",
+        "displayName": "Haiku 4.5",
+        "isDefault": False,
+    },
 ]
 
 
@@ -23,22 +90,37 @@ def _patch_session_as_claude_native(
     page: Page,
     session_id: str,
     model_override: str | None = None,
+    catalog_state: dict[str, bool] | None = None,
+    model_options: list[dict] | None = None,
+    llm_model: str = "system.ai.claude-sonnet-5",
+    host_asleep: bool = False,
+    permission_mode: str | None = None,
 ) -> list[dict]:
     """Patch the browser's session snapshot into a claude-native response.
 
     The server fixture seeds a normal ``hello_world`` session so the page can
     boot against the real app/server. This route patch changes only ``GET``
     and ``PATCH /v1/sessions/{session_id}`` responses as seen by the browser,
-    simulating the snapshot of a claude-native (Claude Code terminal) session
-    bound to a concrete Sonnet 5 gateway model.
+    simulating a Claude-native session whose launch-time Databricks query
+    returned only Opus 4.10, Sonnet 5, and Haiku 4.5.
 
     :param page: Playwright page before navigation.
     :param session_id: Session id to patch, e.g. ``"conv_abc123"``.
     :param model_override: Optional session-scoped model override to expose.
+    :param catalog_state: Optional mutable readiness gate for delayed options.
+    :param model_options: Catalog rows to expose; defaults to the live-alias set.
+    :param llm_model: Bound model id shown for the session.
+    :param host_asleep: Shape the snapshot like a dormant resumable managed
+        host (host-bound, resumable, aged past the startup grace); pair with
+        :func:`_force_asleep_liveness` to drive the ``host_asleep`` state.
+    :param permission_mode: Initial ``omnigent.claude_native.permission_mode``
+        label value; required for the permission-mode picker to appear.
     :returns: Captured PATCH request bodies.
     """
     latest_payload: dict | None = None
     patch_bodies: list[dict] = []
+    # Mutable so the PATCH handler can update it without rebinding the name.
+    cur_permission_mode: list[str | None] = [permission_mode]
 
     def _handle(route: Route) -> None:
         nonlocal latest_payload
@@ -50,7 +132,7 @@ def _patch_session_as_claude_native(
 
         headers = {"content-type": "application/json"}
         if request.method == "GET":
-            response = route.fetch()
+            response = fetch_with_retry(route)
             payload = response.json()
             headers = {**response.headers, **headers}
         elif request.method == "PATCH":
@@ -59,20 +141,34 @@ def _patch_session_as_claude_native(
             payload = dict(latest_payload or {})
             if "model_override" in request_body:
                 payload["model_override"] = request_body["model_override"]
+            if "permission_mode" in request_body:
+                cur_permission_mode[0] = request_body["permission_mode"]
         else:
             route.continue_()
             return
 
+        extra_labels: dict[str, str] = {}
+        if cur_permission_mode[0] is not None:
+            extra_labels["omnigent.claude_native.permission_mode"] = cur_permission_mode[0]
         payload["labels"] = {
             **payload.get("labels", {}),
             "omnigent.wrapper": "claude-code-native-ui",
+            **extra_labels,
         }
         payload["harness"] = "claude"
-        # A concrete newer-generation id: must light up the opt-in "Sonnet 5"
-        # row, not the default "sonnet" row (both ids contain "sonnet").
-        payload["llm_model"] = "databricks-claude-sonnet-5"
+        payload["llm_model"] = llm_model
+        catalog = _MODEL_OPTIONS if model_options is None else model_options
+        payload["model_options"] = (
+            catalog if catalog_state is None or catalog_state["ready"] else []
+        )
         if model_override is not None:
             payload["model_override"] = model_override
+        if host_asleep:
+            payload["host_id"] = payload.get("host_id") or "host_test_managed"
+            payload["host_resumable"] = True
+            # Age the session past the startup grace so liveness can't read
+            # the runner-down state as a cold boot (see useSessionLiveness).
+            payload["created_at"] = 1_700_000_000
         latest_payload = dict(payload)
         route.fulfill(
             status=200,
@@ -84,17 +180,11 @@ def _patch_session_as_claude_native(
     return patch_bodies
 
 
-def test_claude_native_picker_lists_fable_and_both_sonnets(
+def test_claude_native_picker_lists_only_live_databricks_models(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
-    """The picker offers Fable, Opus, Sonnet 4.6, Sonnet 5, and Haiku.
-
-    Covers the user-facing change: Fable returns to the list, and the newer
-    Sonnet is added as a separate opt-in row without moving the default
-    "sonnet" alias. The bound Sonnet 5 model must highlight its own opt-in
-    row rather than the default Sonnet row — the substring-disambiguation
-    this change adds.
+    """The picker shows friendly labels for only the live gateway aliases.
 
     :param page: Playwright page fixture.
     :param seeded_session: ``(base_url, session_id)`` for a real server-backed
@@ -106,30 +196,223 @@ def test_claude_native_picker_lists_fable_and_both_sonnets(
 
     page.goto(f"{base_url}/c/{session_id}")
 
-    trigger = page.get_by_test_id("agent-picker-trigger")
-    expect(trigger).to_be_visible(timeout=15_000)
-    trigger.click()
+    # The Model dropdown lives in the config gear modal now.
+    gear = page.get_by_test_id("composer-config-gear")
+    expect(gear).to_be_visible(timeout=15_000)
+    gear.click()
+    page.get_by_test_id("composer-agent-edit").click()
 
-    rows = page.locator('[data-testid="model-picker-item"]')
+    # The model options carry the same data-model-id rows as before (plus the
+    # "Default" sentinel row the modal always offers).
+    rows = page.locator('[role="menuitemcheckbox"][data-model-id]')
     expect(rows).to_have_count(len(_EXPECTED_ROWS))
     for index, (model_id, label) in enumerate(_EXPECTED_ROWS):
         row = rows.nth(index)
         expect(row).to_have_attribute("data-model-id", model_id)
         expect(row).to_contain_text(label)
 
-    # The bound databricks-claude-sonnet-5 model implicitly selects the opt-in
-    # row; the default "sonnet" row (Sonnet 4.6) must not light up too.
-    sonnet_5_row = page.locator('[data-testid="model-picker-item"][data-model-id="sonnet_5"]')
-    expect(sonnet_5_row).to_have_attribute("data-active", "true")
-    sonnet_default_row = page.locator('[data-testid="model-picker-item"][data-model-id="sonnet"]')
-    expect(sonnet_default_row).not_to_have_attribute("data-active", "true")
+    # The bound system.ai.claude-sonnet-5 model implicitly selects the "sonnet"
+    # (Sonnet 5) row; fable / sonnet_5 aren't in the live catalog at all.
+    sonnet_row = page.locator('[role="menuitemcheckbox"][data-model-id="sonnet"]')
+    expect(sonnet_row).to_have_attribute("aria-checked", "true")
+    expect(page.locator('[role="menuitemcheckbox"][data-model-id="fable"]')).to_have_count(0)
+    expect(page.locator('[role="menuitemcheckbox"][data-model-id="sonnet_5"]')).to_have_count(0)
+    _screenshot(page, "pinned-catalog-picker")
 
 
-def test_claude_native_sonnet_5_selection_persists(
+def _install_catalog_stream(page: Page, session_id: str) -> None:
+    """Keep the stream open so tests can announce catalog readiness explicitly."""
+    stream_script = """
+        (() => {
+          const sessionId = __SESSION_ID__;
+          const originalFetch = window.fetch.bind(window);
+          window.fetch = (input, init) => {
+            const url = typeof input === "string" ? input : input.url;
+            const streamPath = `/v1/sessions/${sessionId}/stream`;
+            if (new URL(url, window.location.origin).pathname === streamPath) {
+              const body = new ReadableStream({
+                start(controller) {
+                  window.__claudeModelStreamController = controller;
+                },
+              });
+              return Promise.resolve(new Response(body, {
+                status: 200,
+                headers: { "content-type": "text/event-stream" },
+              }));
+            }
+            return originalFetch(input, init);
+          };
+        })()
+        """.replace("__SESSION_ID__", json.dumps(session_id))
+    page.add_init_script(
+        stream_script,
+    )
+
+
+def _announce_catalog(page: Page, session_id: str) -> None:
+    page.wait_for_function("window.__claudeModelStreamController !== undefined")
+    page.evaluate(
+        """
+        ({ sessionId }) => {
+          const frame = `event: session.model_options\ndata: ${JSON.stringify({
+            conversation_id: sessionId,
+          })}\n\n`;
+          window.__claudeModelStreamController.enqueue(new TextEncoder().encode(frame));
+        }
+        """,
+        {"sessionId": session_id},
+    )
+
+
+@pytest.mark.parametrize("viewport", [(1600, 900), (390, 844)], ids=["desktop", "mobile"])
+def test_claude_native_picker_updates_after_delayed_catalog(
+    page: Page,
+    seeded_session: tuple[str, str],
+    tmp_path: Path,
+    viewport: tuple[int, int],
+) -> None:
+    """Cold labels spin; refreshes and new tabs reuse the exact session name.
+
+    The cache is display-only, the menu remains usable during loading, and
+    the cross-session sticky selection is never PATCHed onto the session.
+    """
+    base_url, session_id = seeded_session
+    catalog_state = {"ready": False}
+    patch_bodies = _patch_session_as_claude_native(
+        page,
+        session_id,
+        catalog_state=catalog_state,
+    )
+    _install_catalog_stream(page, session_id)
+    page.add_init_script(_LABEL_RECORDER)
+    page.add_init_script("window.localStorage.setItem('omnigent.picker.model', 'opus')")
+    page.set_viewport_size({"width": viewport[0], "height": viewport[1]})
+
+    page.goto(f"{base_url}/c/{session_id}")
+
+    label = page.get_by_test_id("composer-agent-config-value")
+    spinner = page.get_by_test_id("composer-model-loading")
+    expect(spinner).to_be_visible(timeout=15_000)
+    expect(label).not_to_contain_text("system.ai.")
+    page.screenshot(path=str(tmp_path / "session-model-cold-spinner.png"))
+    gear = page.get_by_test_id("composer-config-gear")
+    expect(gear).to_be_enabled()
+    gear.click()
+    page.get_by_test_id("composer-agent-edit").click()
+    expect(page.get_by_test_id("composer-agent-config-menu")).to_be_visible()
+    expect(page.get_by_test_id("composer-agent-config-menu")).not_to_contain_text("system.ai.")
+
+    catalog_state["ready"] = True
+    _announce_catalog(page, session_id)
+
+    # The catalog labels the reported model; the sticky ("opus") is never
+    # silently written as a request.
+    expect(label).to_contain_text("Sonnet 5", timeout=10_000)
+    expect(spinner).to_have_count(0)
+    assert not any("model_override" in body for body in patch_bodies)
+    expect(page.locator('[role="menuitemcheckbox"][data-model-id]')).to_have_count(
+        len(_EXPECTED_ROWS)
+    )
+    log = page.evaluate("window.__modelLabelLog")
+    assert any(entry["loading"] for entry in log), "never recorded the cold loading state"
+    assert not any("system.ai." in entry["text"] for entry in log), log
+    page.wait_for_function(
+        """() => Object.keys(localStorage).some(key =>
+            key.startsWith('omnigent:session-model-label:v1:') &&
+            JSON.parse(localStorage.getItem(key)).displayName === 'Sonnet 5')"""
+    )
+
+    catalog_state["ready"] = False
+    page.reload()
+    expect(label).to_contain_text("Sonnet 5", timeout=15_000)
+    expect(spinner).to_have_count(0)
+    page.screenshot(path=str(tmp_path / "session-model-cached-reload.png"))
+    page.wait_for_function("window.__modelLabelLog.some(entry => entry.text.includes('Sonnet 5'))")
+    log = page.evaluate("window.__modelLabelLog")
+    assert not any(entry["loading"] or "system.ai." in entry["text"] for entry in log), log
+    gear.click()
+    expect(page.get_by_test_id("composer-agent-model-summary")).to_have_text("Sonnet 5")
+    page.screenshot(path=str(tmp_path / "session-model-cached-menu.png"))
+    page.get_by_test_id("composer-agent-edit").click()
+    expect(page.get_by_test_id("composer-agent-config-menu")).to_be_visible()
+
+    new_tab = page.context.new_page()
+    try:
+        _patch_session_as_claude_native(new_tab, session_id, catalog_state=catalog_state)
+        _install_catalog_stream(new_tab, session_id)
+        new_tab.add_init_script(_LABEL_RECORDER)
+        new_tab.set_viewport_size({"width": viewport[0], "height": viewport[1]})
+        new_tab.goto(f"{base_url}/c/{session_id}")
+        expect(new_tab.get_by_test_id("composer-agent-config-value")).to_contain_text(
+            "Sonnet 5", timeout=15_000
+        )
+        expect(new_tab.get_by_test_id("composer-model-loading")).to_have_count(0)
+        new_tab.screenshot(path=str(tmp_path / "session-model-cached-new-tab.png"))
+        new_tab.wait_for_function(
+            "window.__modelLabelLog.some(entry => entry.text.includes('Sonnet 5'))"
+        )
+        log = new_tab.evaluate("window.__modelLabelLog")
+        assert not any(entry["loading"] or "system.ai." in entry["text"] for entry in log), log
+    finally:
+        new_tab.unroute_all(behavior="wait")
+        new_tab.close()
+
+
+def test_cached_session_model_label_recovers_after_delayed_identity(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
-    """Picking Sonnet 5 PATCHes its id and the trigger shows the label.
+    """A boot identity timeout must not strand a warm cache behind a spinner."""
+    base_url, session_id = seeded_session
+    catalog_state = {"ready": True}
+    _patch_session_as_claude_native(page, session_id, catalog_state=catalog_state)
+    _install_catalog_stream(page, session_id)
+    page.goto(f"{base_url}/c/{session_id}")
+    label = page.get_by_test_id("composer-agent-config-value")
+    expect(label).to_contain_text("Sonnet 5", timeout=15_000)
+    page.wait_for_function(
+        """() => Object.keys(localStorage).some(key =>
+            key.startsWith('omnigent:session-model-label:v1:') &&
+            JSON.parse(localStorage.getItem(key)).displayName === 'Sonnet 5')"""
+    )
+
+    catalog_state["ready"] = False
+    page.add_init_script(
+        """(() => {
+          const originalFetch = window.fetch.bind(window);
+          window.fetch = async (input, init) => {
+            const url = typeof input === 'string' ? input : input.url;
+            const response = await originalFetch(input, init);
+            if (new URL(url, location.origin).pathname === '/v1/me') {
+              await new Promise(resolve => { window.__releaseModelIdentity = resolve; });
+            }
+            return response;
+          };
+        })()"""
+    )
+    page.add_init_script(_LABEL_RECORDER)
+    page.reload()
+    spinner = page.get_by_test_id("composer-model-loading")
+    expect(spinner).to_be_visible(timeout=15_000)
+    expect(label).not_to_contain_text("system.ai.")
+    page.wait_for_function("typeof window.__releaseModelIdentity === 'function'")
+    page.evaluate("window.__releaseModelIdentity()")
+    expect(label).to_contain_text("Sonnet 5", timeout=5_000)
+    expect(spinner).to_have_count(0)
+    assert not catalog_state["ready"], "the label must come from cache, not a live catalog"
+    log = page.evaluate("window.__modelLabelLog")
+    assert not any("system.ai." in entry["text"] for entry in log), log
+
+
+def test_claude_native_alias_selection_persists(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """Picking Opus PATCHes its row id; the label keeps the reported model.
+
+    The pick is a REQUEST — it persists verbatim as ``model_override`` —
+    while the composer label keeps rendering the harness's reported model
+    until a confirmation report arrives.
 
     :param page: Playwright page fixture.
     :param seeded_session: ``(base_url, session_id)`` for a real server-backed
@@ -141,9 +424,123 @@ def test_claude_native_sonnet_5_selection_persists(
 
     page.goto(f"{base_url}/c/{session_id}")
 
-    trigger = page.get_by_test_id("agent-picker-trigger")
-    expect(trigger).to_be_visible(timeout=15_000)
-    trigger.click()
+    gear = page.get_by_test_id("composer-config-gear")
+    expect(gear).to_be_visible(timeout=15_000)
+    gear.click()
+    page.get_by_test_id("composer-agent-edit").click()
+
+    # Selecting only drafts the pick; the PATCH fires on Save.
+    with page.expect_response(
+        lambda response: (
+            response.request.method == "PATCH"
+            and urlparse(response.url).path == f"/v1/sessions/{session_id}"
+            and response.status == 200
+        )
+    ):
+        page.locator('[role="menuitemcheckbox"][data-model-id="opus"]').click()
+
+    assert patch_bodies[-1] == {"model_override": "opus"}
+    # The read-only composer label keeps the reported model — a request is
+    # not truth until the harness confirms it.
+    expect(page.get_by_test_id("composer-agent-config-value")).to_contain_text("Sonnet 5")
+
+
+def _force_asleep_liveness(page: Page, session_id: str) -> None:
+    """Patch the browser's liveness view of ``session_id`` to runner+host down.
+
+    Paired with ``_patch_session_as_claude_native(..., host_asleep=True)``
+    this yields the ``host_asleep`` liveness variant (mirrors
+    ``tests/e2e_ui/sessions/test_host_asleep_composer.py``): the ``/health``
+    poll reports both tunnels down, the sidebar list drops the session so the
+    open view derives liveness from the patched host-bound snapshot, and the
+    updates WS is blocked so a live push can't revert to the real online
+    state.
+
+    :param page: Playwright page before navigation.
+    :param session_id: Session id to patch, e.g. ``"conv_abc123"``.
+    """
+
+    def _patch_health(route: Route) -> None:
+        request = route.request
+        if request.method != "GET" or urlparse(request.url).path != "/health":
+            route.continue_()
+            return
+        response = fetch_with_retry(route)
+        payload = response.json()
+        offline = {"runner_online": False, "host_online": False}
+        if isinstance(payload.get("sessions"), dict):
+            payload["sessions"][session_id] = offline
+        if isinstance(payload.get("session"), dict):
+            payload["session"] = {**payload["session"], **offline}
+        route.fulfill(
+            status=200,
+            headers={**response.headers, "content-type": "application/json"},
+            body=json.dumps(payload),
+        )
+
+    def _drop_from_list(route: Route) -> None:
+        request = route.request
+        if request.method != "GET" or urlparse(request.url).path != "/v1/sessions":
+            route.continue_()
+            return
+        response = fetch_with_retry(route)
+        payload = response.json()
+        rows = payload.get("data") if isinstance(payload, dict) else None
+        if isinstance(rows, list):
+            payload["data"] = [
+                r for r in rows if not (isinstance(r, dict) and r.get("id") == session_id)
+            ]
+        route.fulfill(
+            status=200,
+            headers={**response.headers, "content-type": "application/json"},
+            body=json.dumps(payload),
+        )
+
+    page.route(re.compile(r"/v1/sessions(\?|$)"), _drop_from_list)
+    page.route(re.compile(r"/health(\?|$)"), _patch_health)
+    page.route_web_socket(re.compile(r"/v1/sessions/updates"), lambda ws: None)
+
+
+def test_claude_native_picker_saves_model_while_host_asleep(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """An asleep session keeps the config gear live and Save PATCHes the model.
+
+    A model/effort change persists server-side and applies when the next
+    message wakes the session, so wherever the composer stays open (here:
+    ``host_asleep``) the gear must stay enabled with the catalog-backed
+    dropdown — not inert behind a live-runner requirement.
+
+    :param page: Playwright page fixture.
+    :param seeded_session: ``(base_url, session_id)`` for a real server-backed
+        session; the browser view is patched to an asleep claude-native shape.
+    :returns: None.
+    """
+    base_url, session_id = seeded_session
+    _force_asleep_liveness(page, session_id)
+    patch_bodies = _patch_session_as_claude_native(page, session_id, host_asleep=True)
+
+    # Wait for the /health poll that resolves liveness to host_asleep to land
+    # before the gear assertions, so they exercise the settled asleep state and
+    # not the initial not-yet-polled window. (The composer placeholder is no
+    # longer state-specific, so it can't be the signal.)
+    with page.expect_response(
+        lambda r: urlparse(r.url).path == "/health" and r.status == 200,
+        timeout=15_000,
+    ):
+        page.goto(f"{base_url}/c/{session_id}")
+
+    gear = page.get_by_test_id("composer-config-gear")
+    expect(gear).to_have_attribute("aria-disabled", "false")
+    gear.click()
+    page.get_by_test_id("composer-agent-edit").click()
+    expect(page.get_by_test_id("composer-agent-config-menu")).to_be_visible()
+    # The catalog still populates the dropdown while the session sleeps.
+    expect(page.locator('[role="menuitemcheckbox"][data-model-id]')).to_have_count(
+        len(_EXPECTED_ROWS)
+    )
+    _screenshot(page, "asleep-config-gear")
 
     with page.expect_response(
         lambda response: (
@@ -152,30 +549,755 @@ def test_claude_native_sonnet_5_selection_persists(
             and response.status == 200
         )
     ):
-        page.locator('[data-testid="model-picker-item"][data-model-id="sonnet_5"]').click()
+        page.locator('[role="menuitemcheckbox"][data-model-id="opus"]').click()
 
-    assert patch_bodies[-1] == {"model_override": "sonnet_5"}
-    expect(trigger).to_contain_text("Sonnet 5")
+    assert patch_bodies[-1] == {"model_override": "opus"}
 
 
-def test_claude_native_picker_prefers_session_override_over_sticky_model(
+def _screenshot(page: Page, name: str) -> None:
+    """Save a demo screenshot when E2E_SCREENSHOT_DIR is set (local runs)."""
+    shot_dir = os.environ.get("E2E_SCREENSHOT_DIR")
+    if shot_dir:
+        page.screenshot(path=str(Path(shot_dir) / f"{name}.png"))
+
+
+def test_claude_native_unpinned_gateway_catalog_offers_only_the_routable_default(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
-    """The active row follows the session override, not another session's pick."""
-    page.add_init_script("window.localStorage.setItem('omnigent.picker.model', 'sonnet')")
+    """A pin-less gateway config renders one concrete row and no alias rows.
+
+    The catalog is produced by the real ``claude_native_model_options`` for a
+    provider config with no ``ANTHROPIC_DEFAULT_*_MODEL`` pins — the setup
+    where the subscription aliases used to appear and canonicalize to
+    Anthropic ids the gateway rejects at launch.
+    """
     base_url, session_id = seeded_session
-    _patch_session_as_claude_native(page, session_id, model_override="sonnet_5")
+    default_model = "databricks-claude-sonnet-4-5"
+    catalog = claude_native_model_options(
+        ClaudeNativeUcodeConfig(
+            env={"ANTHROPIC_BASE_URL": "https://example.databricks.com/ai-gateway/anthropic"},
+            model=default_model,
+        )
+    )
+    _patch_session_as_claude_native(
+        page,
+        session_id,
+        model_options=catalog,
+        llm_model=default_model,
+    )
 
     page.goto(f"{base_url}/c/{session_id}")
 
-    trigger = page.get_by_test_id("agent-picker-trigger")
-    expect(trigger).to_be_visible(timeout=15_000)
-    trigger.click()
+    # Visible labels omit the catalog prefix; routing keeps the full model id.
+    expect(page.get_by_test_id("composer-agent-config-value")).to_have_text(
+        "claude-sonnet-4-5", timeout=15_000
+    )
+    _screenshot(page, "unpinned-gateway-composer")
 
-    expect(
-        page.locator('[data-testid="model-picker-item"][data-model-id="sonnet_5"]')
-    ).to_have_attribute("data-active", "true")
-    expect(
-        page.locator('[data-testid="model-picker-item"][data-model-id="sonnet"]')
-    ).not_to_have_attribute("data-active", "true")
+    page.get_by_test_id("composer-config-gear").click()
+
+    page.get_by_test_id("composer-agent-edit").click()
+
+    # Exactly one row — the provider's routable default, pre-selected — so no
+    # alias row exists to canonicalize into an id the gateway rejects. Picking
+    # it can only ever PATCH the concrete gateway id, which the launch
+    # resolver passes through verbatim.
+    rows = page.locator('[role="menuitemcheckbox"][data-model-id]')
+    expect(rows).to_have_count(1)
+    expect(rows.first).to_have_text("claude-sonnet-4-5")
+    expect(rows.first).to_have_attribute("data-model-id", default_model)
+    expect(rows.first).to_have_attribute("aria-checked", "true")
+    _screenshot(page, "unpinned-gateway-picker")
+
+
+_CODEX_MODEL_ID = "gpt-5.5"
+_CODEX_MODEL_LABEL = "Codex Pretty 5.5"
+_CODEX_MODEL_OPTIONS = [
+    {
+        "id": _CODEX_MODEL_ID,
+        "model": "databricks-gpt-5-5",
+        "displayName": _CODEX_MODEL_LABEL,
+        "isDefault": True,
+    }
+]
+_CLAUDE_LLM_MODEL = "system.ai.claude-sonnet-5"
+# Long enough that the stale-label window is unmissable, short enough to keep
+# the test quick. Only the switch back to the Claude session is delayed.
+_SNAPSHOT_DELAY_MS = 2_000
+
+# Sample each painted frame against React's committed session, not history:
+# BrowserRouter updates history before committing its concurrent route render.
+# Keep transient labels that retrying expect() assertions would miss.
+_LABEL_RECORDER = """
+(() => {
+  window.__modelLabelLog = [];
+  const record = () => {
+    const el = document.querySelector('[data-testid="composer-agent-config-value"]');
+    const current = document.querySelector('main[data-session-id]');
+    const entry = {
+      path: `/c/${current?.dataset.sessionId}`,
+      text: el ? el.textContent.trim() : "",
+      loading: !!document.querySelector('[data-testid="composer-model-loading"]'),
+    };
+    const log = window.__modelLabelLog;
+    const last = log[log.length - 1];
+    if (!last || last.path !== entry.path || last.text !== entry.text ||
+        last.loading !== entry.loading) log.push(entry);
+    requestAnimationFrame(record);
+  };
+  requestAnimationFrame(record);
+})()
+"""
+
+# Holds the incoming session's snapshot GET so the pre-bind window — where the
+# store has dropped the outgoing session's model fields but not yet hydrated the
+# incoming one's — lasts long enough to observe. Armed via `__delaySnapshot`
+# right before the switch so the first visit stays fast.
+_SNAPSHOT_DELAY = """
+(() => {
+  const sessionId = __SESSION_ID__;
+  const delayMs = __DELAY_MS__;
+  const originalFetch = window.fetch.bind(window);
+  window.fetch = async (input, init) => {
+    const url = typeof input === "string" ? input : input.url;
+    if (
+      window.__delaySnapshot &&
+      new URL(url, window.location.origin).pathname === `/v1/sessions/${sessionId}`
+    ) {
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+    return originalFetch(input, init);
+  };
+})()
+"""
+
+
+def _patch_native_session_pair(page: Page, codex_session_id: str, claude_session_id: str) -> None:
+    """Patch two session snapshots at once: one codex-native, one claude-native.
+
+    The sibling single-session helpers each own a ``**/v1/sessions/**`` route
+    and ``continue_()`` past the ids they don't serve, so two of them can't be
+    composed (the first matching handler wins and goes straight to the
+    network). This serves both ids from one handler instead.
+
+    :param page: Playwright page before navigation.
+    :param codex_session_id: Session id to shape as codex-native, pinned to
+        ``gpt-5.5`` via ``model_override`` so binding it leaves that model as
+        the cross-session sticky pick.
+    :param claude_session_id: Session id to shape as claude-native, bound to
+        Sonnet 5 with no override of its own.
+    """
+
+    def _handle(route: Route) -> None:
+        request = route.request
+        path = urlparse(request.url).path
+        if request.method != "GET" or path not in (
+            f"/v1/sessions/{codex_session_id}",
+            f"/v1/sessions/{claude_session_id}",
+        ):
+            route.continue_()
+            return
+
+        response = fetch_with_retry(route)
+        payload = response.json()
+        if path == f"/v1/sessions/{codex_session_id}":
+            wrapper, harness = "codex-native-ui", "codex"
+            payload["llm_model"] = _CODEX_MODEL_ID
+            payload["model_override"] = _CODEX_MODEL_ID
+            payload["model_options"] = _CODEX_MODEL_OPTIONS
+        else:
+            wrapper, harness = "claude-code-native-ui", "claude"
+            payload["llm_model"] = _CLAUDE_LLM_MODEL
+            payload["model_options"] = _MODEL_OPTIONS
+        payload["labels"] = {**payload.get("labels", {}), "omnigent.wrapper": wrapper}
+        payload["harness"] = harness
+        route.fulfill(
+            status=200,
+            headers={**response.headers, "content-type": "application/json"},
+            body=json.dumps(payload),
+        )
+
+    page.route("**/v1/sessions/**", _handle)
+
+
+def test_composer_model_label_never_shows_the_previous_sessions_model(
+    page: Page,
+    seeded_session_pair: tuple[str, str, str],
+) -> None:
+    """Opening a Claude session must not paint the previous session's model.
+
+    Failure mode this catches: a COLD open clears (never had) the
+    session-scoped model fields (``sessionModelOverride`` / ``llmModel`` /
+    ``codexModelOptions``) but deliberately keeps ``selectedModel``, the
+    cross-session sticky pick. If the composer mounts before the snapshot
+    lands, it resolves that sticky and reads ``gpt-5.5`` on a Claude session
+    before correcting itself to Sonnet 5. The store must hold the hydrating
+    placeholder for the whole snapshot round trip so the composer never
+    mounts against empty session-scoped state.
+
+    Cold open, not switch-back, on purpose: a conversation already visited is
+    now held live (its stream stays open in the background), so returning to
+    it repaints its own settled state with no snapshot fetch and therefore no
+    pre-bind window at all. The first open is the only place this window
+    still exists.
+
+    :param page: Playwright page fixture.
+    :param seeded_session_pair: ``(base_url, codex_session, claude_session)``
+        for two real server-backed sessions; both snapshots are patched into
+        native shapes as seen by the browser.
+    """
+    base_url, codex_session, claude_session = seeded_session_pair
+    # Both sessions need a committed transcript so the composer renders rather
+    # than falling back to the empty-session state.
+    for session_id in (codex_session, claude_session):
+        seed_committed_turn(session_id, prompt="ping", reply="pong")
+    _patch_native_session_pair(page, codex_session, claude_session)
+    page.add_init_script(_LABEL_RECORDER)
+    page.add_init_script(
+        _SNAPSHOT_DELAY.replace("__SESSION_ID__", json.dumps(claude_session)).replace(
+            "__DELAY_MS__", str(_SNAPSHOT_DELAY_MS)
+        )
+    )
+
+    label = page.get_by_test_id("composer-agent-config-value")
+
+    # Open the Codex session FIRST and only — binding it makes gpt-5.5 the
+    # sticky pick, and leaves Claude never-visited so its open is cold.
+    page.goto(f"{base_url}/c/{codex_session}")
+    expect(label).to_contain_text(_CODEX_MODEL_LABEL, timeout=15_000)
+    expect(page.locator("main[data-session-id]")).to_have_attribute(
+        "data-session-id", codex_session
+    )
+
+    # Cold-open Claude with its snapshot held, and watch every label the
+    # composer paints under the Claude route.
+    page.evaluate("window.__delaySnapshot = true")
+    page.evaluate("window.__modelLabelLog = []")
+    page.locator(f'a[href="/c/{claude_session}"]').click()
+    page.wait_for_url(re.compile(rf"/c/{re.escape(claude_session)}"))
+    expect(label).to_contain_text("Sonnet 5", timeout=15_000)
+
+    page.wait_for_function(
+        """sessionId => window.__modelLabelLog.some(entry =>
+            entry.path === `/c/${sessionId}` && entry.text.includes("Sonnet 5")
+        )""",
+        arg=claude_session,
+    )
+    log = page.evaluate("window.__modelLabelLog")
+    claude_labels = [e["text"] for e in log if e["path"] == f"/c/{claude_session}"]
+    # Guard against a no-op run: the held snapshot must have produced at least
+    # one pre-bind paint before the settled Sonnet 5 label.
+    assert len(claude_labels) > 1, (
+        f"the delayed-bind window was never observed (labels: {claude_labels}); "
+        "the snapshot delay did not take effect, so this run proves nothing"
+    )
+    leaked = [
+        text for text in claude_labels if _CODEX_MODEL_ID in text or _CODEX_MODEL_LABEL in text
+    ]
+    assert not leaked, (
+        f"the Codex session's model leaked into the Claude session's composer: {leaked} "
+        f"(full label sequence under the Claude route: {claude_labels}). The composer must "
+        "never surface another session's sticky model while the snapshot is in flight."
+    )
+
+
+def test_claude_model_label_never_claims_a_version_the_catalog_didnt_give(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """The label waits for the catalog instead of flashing an ID or guessed name.
+
+    The chip renders only the harness's reported model: a spinner
+    until the catalog can name it, the catalog's display name after — and
+    at no point a version the catalog didn't give (the old fallback said
+    "Sonnet 4.6" while the catalog resolves to Sonnet 5). Every label the
+    page ever paints is recorded, so a transient wrong label can't hide
+    from a retrying ``expect()``.
+    """
+    base_url, session_id = seeded_session
+    catalog_state = {"ready": False}
+    one_m_catalog = [
+        *_MODEL_OPTIONS,
+        {
+            "id": "sonnet[1m]",
+            "model": "system.ai.claude-sonnet-5[1m]",
+            "displayName": "Sonnet 5 (1M context)",
+            "isDefault": False,
+        },
+    ]
+    _patch_session_as_claude_native(
+        page,
+        session_id,
+        model_override="sonnet[1m]",
+        catalog_state=catalog_state,
+        model_options=one_m_catalog,
+        llm_model="system.ai.claude-sonnet-5[1m]",
+    )
+    _install_catalog_stream(page, session_id)
+    page.add_init_script(_LABEL_RECORDER)
+
+    page.goto(f"{base_url}/c/{session_id}")
+
+    # Pre-catalog: loading, without inventing a name from the wire id.
+    label = page.get_by_test_id("composer-agent-config-value")
+    expect(page.get_by_test_id("composer-model-loading")).to_be_visible(timeout=15_000)
+    expect(label).not_to_contain_text("system.ai.")
+
+    # The catalog lands: its display name supersedes the fallback.
+    catalog_state["ready"] = True
+    _announce_catalog(page, session_id)
+    expect(label).to_contain_text("Sonnet 5 1M", timeout=10_000)
+
+    log = page.evaluate("window.__modelLabelLog")
+    labels = [entry["text"] for entry in log if entry["text"]]
+    assert labels, "the recorder never saw a composer label"
+    offending = [text for text in labels if "4.6" in text or "system.ai." in text]
+    assert not offending, (
+        f"the composer painted a raw ID or a version the catalog didn't give: {offending} "
+        f"(full label sequence: {labels}). Labels render the reported model — "
+        "a spinner before the catalog names it, the catalog's name after — never an "
+        "invented version."
+    )
+    _screenshot(page, "one-m-label-settled")
+
+
+def test_union_catalog_pick_patches_the_row_id_verbatim(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """Picking a probe-contributed row saves exactly that row's id.
+
+    A gateway session's catalog is the configured∪probe union: pinned
+    family rows carrying gateway model ids next to probe rows like
+    ``sonnet[1m]``. Picking the probe row must PATCH its id verbatim —
+    the id is the launch contract the runner types into the pane, so any
+    client-side rewrite here switches the session to a model the user
+    did not choose (the bug this guards showed a Fable pick landing on
+    Opus; the web layer was innocent, and must stay that way).
+
+    :param page: Playwright page fixture.
+    :param seeded_session: ``(base_url, session_id)`` for a real
+        server-backed session; the browser snapshot is patched to a
+        claude-native shape with the union catalog.
+    :returns: None.
+    """
+    base_url, session_id = seeded_session
+    union_catalog = [
+        {
+            "id": "opus",
+            "model": "databricks-claude-opus-5",
+            "displayName": "Opus 5",
+            "isDefault": True,
+        },
+        {
+            "id": "sonnet",
+            "model": "databricks-claude-sonnet-5",
+            "displayName": "Sonnet 5",
+            "isDefault": False,
+        },
+        {
+            "id": "sonnet[1m]",
+            "model": "databricks-claude-sonnet-5[1m]",
+            "displayName": "Sonnet 5 (1M context)",
+        },
+    ]
+    # No fixture-pinned model_override: the route fake would force it back
+    # onto every response, including the PATCH echo the store adopts. The
+    # bound ``llm_model`` already implicitly selects the sonnet row.
+    patch_bodies = _patch_session_as_claude_native(
+        page,
+        session_id,
+        model_options=union_catalog,
+        llm_model="databricks-claude-sonnet-5",
+    )
+
+    page.goto(f"{base_url}/c/{session_id}")
+
+    gear = page.get_by_test_id("composer-config-gear")
+    expect(gear).to_be_visible(timeout=15_000)
+    gear.click()
+    page.get_by_test_id("composer-agent-edit").click()
+    bracket_row = page.locator('[role="menuitemcheckbox"][data-model-id="sonnet[1m]"]')
+    expect(bracket_row).to_contain_text("Sonnet 5 (1M context)")
+    with page.expect_response(
+        lambda response: (
+            response.request.method == "PATCH"
+            and urlparse(response.url).path == f"/v1/sessions/{session_id}"
+            and response.status == 200
+        )
+    ):
+        bracket_row.click()
+
+    assert patch_bodies[-1] == {"model_override": "sonnet[1m]"}
+    # The label keeps the reported model ("Sonnet 5" — the bound
+    # databricks-claude-sonnet-5); the request flips nothing until the
+    # harness confirms.
+    expect(page.get_by_test_id("composer-agent-config-value")).to_contain_text("Sonnet 5")
+
+
+def test_claude_native_picker_highlights_the_reported_model(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """The active row follows the reported model — not the request or sticky.
+
+    The session carries a pending request ("opus") and another session's
+    sticky pick ("haiku"), but the pane reports Sonnet 5: only its row may
+    read as active.
+    """
+    page.add_init_script("window.localStorage.setItem('omnigent.picker.model', 'haiku')")
+    base_url, session_id = seeded_session
+    _patch_session_as_claude_native(page, session_id, model_override="opus")
+
+    page.goto(f"{base_url}/c/{session_id}")
+
+    gear = page.get_by_test_id("composer-config-gear")
+    expect(gear).to_be_visible(timeout=15_000)
+    gear.click()
+    page.get_by_test_id("composer-agent-edit").click()
+
+    expect(page.locator('[role="menuitemcheckbox"][data-model-id="sonnet"]')).to_have_attribute(
+        "aria-checked", "true"
+    )
+    expect(page.locator('[role="menuitemcheckbox"][data-model-id="opus"]')).not_to_have_attribute(
+        "aria-checked", "true"
+    )
+    expect(page.locator('[role="menuitemcheckbox"][data-model-id="haiku"]')).not_to_have_attribute(
+        "aria-checked", "true"
+    )
+
+
+def test_claude_native_permission_mode_switch_persists(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """Picking a permission mode in the gear modal PATCHes the server.
+
+    Selecting "Auto" sends ``{"permission_mode": "auto"}`` to
+    ``PATCH /v1/sessions/{id}``, exercising the new in-chat permission-mode
+    control introduced by the claude-web-auto-mode feature.
+
+    :param page: Playwright page fixture.
+    :param seeded_session: ``(base_url, session_id)`` for a real server-backed
+        session; the browser snapshot is patched to a claude-native session
+        already in ``default`` (Manual) mode.
+    :returns: None.
+    """
+    base_url, session_id = seeded_session
+    patch_bodies = _patch_session_as_claude_native(page, session_id, permission_mode="default")
+
+    page.goto(f"{base_url}/c/{session_id}")
+
+    perm = page.get_by_test_id("composer-permission-chip")
+    expect(perm).to_be_visible(timeout=15_000)
+    perm.click()
+    with page.expect_response(
+        lambda response: (
+            response.request.method == "PATCH"
+            and urlparse(response.url).path == f"/v1/sessions/{session_id}"
+            and response.status == 200
+        )
+    ):
+        page.get_by_test_id("composer-permission-option-auto").click()
+
+    assert patch_bodies[-1] == {"permission_mode": "auto"}
+    expect(perm).to_contain_text("Auto")
+
+
+_PINNED_CLAUDE_MODELS = {
+    "sonnet": "claude-sonnet-4-20250514",
+    "opus": "system.ai.claude-opus-4-8[1m]",
+}
+
+
+@pytest.fixture
+def native_claude_pinned_mock_session(
+    live_server: str,
+    mock_llm_server_url: str,
+    tmp_path: Path,
+    claude_managed_settings: None,
+) -> Iterator[tuple[str, str]]:
+    """Use the real native wrapper with exact generation and context pins."""
+    validate_native_claude_mock_routing(mock_llm_server_url)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    providers = {
+        "pinned-claude": {
+            "kind": "key",
+            "default": ["anthropic"],
+            "anthropic": {
+                "base_url": mock_llm_server_url,
+                "api_key": "mock-key",
+                "models": {"default": _PINNED_CLAUDE_MODELS["sonnet"], **_PINNED_CLAUDE_MODELS},
+            },
+        }
+    }
+    with (
+        httpx.Client(base_url=live_server, timeout=20) as client,
+        isolated_host(
+            tmp_path / "host",
+            live_server,
+            config={"providers": providers},
+            env={
+                "CLAUDE_CONFIG_DIR": str(tmp_path / "claude-config"),
+                "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+            },
+            cwd=workspace,
+        ) as host,
+    ):
+        host.wait_online(client, timeout=120, poll_interval=0.5)
+        created = create_native_session(
+            client,
+            live_server,
+            harness="claude",
+            metadata={"host_id": host.host_id, "workspace": str(workspace)},
+        )
+        session_id = str(created["session_id"])
+        try:
+            yield live_server, session_id
+        finally:
+            client.delete(f"/v1/sessions/{session_id}").raise_for_status()
+
+
+def _live_claude_snapshot(base_url: str, session_id: str) -> dict:
+    response = httpx.get(f"{base_url}/v1/sessions/{session_id}", timeout=10.0)
+    response.raise_for_status()
+    return response.json()
+
+
+def _open_live_claude_model_menu(page: Page, entry: str = "gear") -> None:
+    if entry == "hotkey":
+        page.get_by_placeholder("Send a message…").focus()
+        page.keyboard.press("Control+Shift+M")
+    else:
+        trigger = "composer-agent-config-value" if entry == "pill" else "composer-config-gear"
+        page.get_by_test_id(trigger).click()
+        page.get_by_test_id("composer-agent-edit").click()
+    expect(page.get_by_test_id("composer-agent-config-menu")).to_be_visible()
+
+
+def _assert_mock_claude_turn(mock_url: str, marker: str, model: str) -> None:
+    """Check the request Claude sent for this turn: its wire model and, for ``[1m]``, the beta."""
+    wire_model = model.removesuffix("[1m]")
+    requests = get_mock_message_requests(mock_url, key=wire_model)
+    turn_requests = [
+        request
+        for request in requests
+        if any(
+            marker in json.dumps(message.get("content"))
+            for message in request["body"].get("messages", [])
+            if message.get("role") == "user"
+        )
+    ]
+    assert turn_requests, (
+        f"The mock received no {wire_model!r} request containing {marker!r}: {requests!r}"
+    )
+    if model.endswith("[1m]"):
+        assert any(
+            beta.startswith("context-1m-")
+            for request in turn_requests
+            for beta in request["betas"]
+        ), f"No {wire_model!r} request for {marker!r} sent the 1M-context beta: {turn_requests!r}"
+
+
+def _assert_native_claude_turn(base_url: str, session_id: str, reply: str, model: str) -> None:
+    """Read Claude's own record of the reply: the alias it requested and the wire model."""
+    snapshot = _live_claude_snapshot(base_url, session_id)
+    bridge_id = snapshot["labels"].get(BRIDGE_ID_LABEL_KEY) or session_id
+    bridge_dir = bridge_dir_for_bridge_id(bridge_id)
+    assert read_claude_status_model(bridge_dir) == model
+    transcript = read_transcript_path(bridge_dir)
+    assert transcript is not None, "The native Claude process reported no transcript"
+    records = [json.loads(line) for line in transcript.read_text().splitlines() if line.strip()]
+    assistant = next(
+        record
+        for record in records
+        if record.get("type") == "assistant"
+        and reply in json.dumps(record.get("message", {}).get("content"))
+    )
+    wire_model = model.removesuffix("[1m]")
+    assert assistant["requestedModel"] == model
+    assert assistant["message"]["model"] == wire_model
+
+
+@pytest.mark.nightly
+@pytest.mark.timeout(420)
+def test_claude_native_picker_repeated_pins_reach_the_real_terminal(
+    page: Page,
+    native_claude_pinned_mock_session: tuple[str, str],
+    mock_llm_server_url: str,
+) -> None:
+    """Repeated alias picks retain their generation and context on subsequent turns."""
+    base_url, session_id = native_claude_pinned_mock_session
+    page.set_viewport_size({"width": 1800, "height": 900})
+    page.goto(f"{base_url}/c/{session_id}")
+    _open_terminal_view(page)
+    _wait_terminal_connected(page)
+    _ensure_chat_view(page)
+    poll_until(
+        lambda: (
+            _live_claude_snapshot(base_url, session_id).get("llm_model")
+            == _PINNED_CLAUDE_MODELS["sonnet"]
+        ),
+        timeout_s=120,
+    )
+    snapshot = _live_claude_snapshot(base_url, session_id)
+    catalog = {row["id"]: row["model"] for row in snapshot.get("model_options", [])}
+    assert all(catalog.get(alias) == model for alias, model in _PINNED_CLAUDE_MODELS.items()), (
+        f"The native catalog did not preserve its configured pins: {catalog!r}"
+    )
+    reset_mock_llm(mock_llm_server_url)
+
+    # The second Opus pick keeps the same resolved model; the following Sonnet
+    # turn proves switching back, rather than accepting an unchanged pane.
+    selections = (("opus", "gear"), ("opus", "pill"), ("sonnet", "hotkey"))
+    for index, (alias, entry) in enumerate(selections, start=1):
+        _open_live_claude_model_menu(page, entry)
+        with page.expect_response(
+            lambda response: (
+                response.request.method == "PATCH"
+                and urlparse(response.url).path == f"/v1/sessions/{session_id}"
+            ),
+            timeout=60_000,
+        ) as switched:
+            page.locator(f'[role="menuitemcheckbox"][data-model-id="{alias}"]').click()
+        response = switched.value
+        assert response.status == 200, response.text()
+        expected_override = (
+            "default" if alias == "sonnet" and snapshot.get("inference_configured") else alias
+        )
+        assert json.loads(response.request.post_data or "{}") == {
+            "model_override": expected_override
+        }
+        model = _PINNED_CLAUDE_MODELS[alias]
+        poll_until(
+            lambda expected=model: (
+                _live_claude_snapshot(base_url, session_id).get("llm_model") == expected
+            ),
+            timeout_s=30,
+        )
+        expect(page.get_by_test_id("composer-model-pending")).to_have_count(0, timeout=35_000)
+        page.keyboard.press("Escape")
+        nonce = uuid.uuid4().hex[:8]
+        marker, reply = f"pin-user-{nonce}", f"pin-reply-{nonce}"
+        set_fallback_mock_llm(mock_llm_server_url, model.removesuffix("[1m]"), reply)
+        _send_turn_and_settle(
+            page,
+            mock_llm_server_url,
+            base_url=base_url,
+            session_id=session_id,
+            index=index,
+            user_marker=marker,
+            assistant_token=reply,
+            expected_assistant_bubbles=index,
+        )
+        expect(page.locator(_ASSISTANT, has_text=reply)).to_have_count(1)
+        _wait_for_transcript_message(page, base_url, session_id, reply, role="assistant")
+        _assert_mock_claude_turn(mock_llm_server_url, marker, model)
+        _assert_native_claude_turn(base_url, session_id, reply, model)
+        expect(page.get_by_test_id("error-headline")).to_have_count(0)
+
+    _open_terminal_view(page)
+    _wait_terminal_connected(page)
+    _screenshot(page, "real-native-pinned-model-switches")
+
+
+@pytest.mark.nightly
+@pytest.mark.timeout(420)
+def test_claude_native_refusal_preserves_a_newer_same_model_selection(
+    page: Page,
+    native_claude_pinned_mock_session: tuple[str, str],
+    mock_llm_server_url: str,
+) -> None:
+    """A real late refusal preserves newer launch metadata, including a repeated pick."""
+    live_server, session_id = native_claude_pinned_mock_session
+    with httpx.Client(base_url=live_server, timeout=20) as client:
+        pane_pids: list[int] = []
+        try:
+            page.goto(f"{live_server}/c/{session_id}")
+            _open_terminal_view(page)
+            _wait_terminal_connected(page)
+            _ensure_chat_view(page)
+            reset_mock_llm(mock_llm_server_url)
+            nonce = uuid.uuid4().hex[:8]
+            marker, reply = f"refusal-user-{nonce}", f"refusal-reply-{nonce}"
+            _send_turn_and_settle(
+                page,
+                mock_llm_server_url,
+                base_url=live_server,
+                session_id=session_id,
+                index=1,
+                user_marker=marker,
+                assistant_token=reply,
+                expected_assistant_bubbles=1,
+            )
+            expect(page.locator(_ASSISTANT, has_text=reply)).to_have_count(1)
+            _wait_for_transcript_message(page, live_server, session_id, reply, role="assistant")
+            _assert_mock_claude_turn(mock_llm_server_url, marker, _PINNED_CLAUDE_MODELS["sonnet"])
+            _assert_native_claude_turn(
+                live_server, session_id, reply, _PINNED_CLAUDE_MODELS["sonnet"]
+            )
+            expect(page.locator(_WORKING)).to_have_count(0)
+            client.patch(
+                f"/v1/sessions/{session_id}",
+                json={"model_override": "sonnet", "reasoning_effort": "high", "silent": True},
+            ).raise_for_status()
+            snapshot = _live_claude_snapshot(live_server, session_id)
+            assert snapshot["host_id"] is not None
+            assert snapshot["llm_model"] == _PINNED_CLAUDE_MODELS["sonnet"]
+            assert snapshot["llm_model"] != _PINNED_CLAUDE_MODELS["opus"]
+            _open_live_claude_model_menu(page)
+            opus = page.locator('[role="menuitemcheckbox"][data-model-id="opus"]')
+            expect(opus).to_be_enabled()
+            advert = _tmux_advert(live_server, session_id)
+            assert advert is not None, "The owned Claude terminal advertised no tmux pane"
+            pane_pids = _pane_process_ids(advert)
+            assert pane_pids, "The owned Claude pane has no processes"
+
+            # Claude stays idle on Sonnet and cannot consume the queued /model.
+            # The server and runner continue handling the real HTTP request.
+            _signal_each(pane_pids, signal.SIGSTOP)
+            with page.expect_response(
+                lambda response: (
+                    response.request.method == "PATCH"
+                    and urlparse(response.url).path == f"/v1/sessions/{session_id}"
+                ),
+                timeout=60_000,
+            ) as refused:
+                opus.click()
+                poll_until(
+                    lambda: (
+                        _live_claude_snapshot(live_server, session_id).get("model_override")
+                        == "opus"
+                    ),
+                    timeout_s=5,
+                    interval_s=0.05,
+                )
+                # A launch can repeat the same selection while the live request
+                # is pending; equal values still represent a newer write.
+                newer = client.patch(
+                    f"/v1/sessions/{session_id}",
+                    json={"model_override": "opus", "reasoning_effort": "low", "silent": True},
+                )
+                assert newer.status_code == 200, newer.text
+
+            response = refused.value
+            assert response.status == 503, response.text()
+            assert json.loads(response.request.post_data or "{}") == {"model_override": "opus"}
+            assert "Please check the current selection and try again" in response.text()
+            saved = _live_claude_snapshot(live_server, session_id)
+            assert saved["model_override"] == "opus"
+            assert saved["reasoning_effort"] == "low"
+            assert saved["llm_model"] == _PINNED_CLAUDE_MODELS["sonnet"]
+            expect(page.get_by_test_id("composer-model-pending")).to_have_count(0, timeout=10_000)
+            headline = page.get_by_test_id("error-headline").first
+            expect(headline).to_be_visible(timeout=10_000)
+            headline.click()
+            expect(
+                page.get_by_text("The terminal was not switched to opus:", exact=False)
+            ).to_be_visible()
+            _screenshot(page, "real-native-late-model-refusal")
+        finally:
+            # Discard the queued command instead of letting it run after refusal.
+            _signal_each(pane_pids, signal.SIGKILL)

@@ -23,8 +23,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import datetime
 import json
+import signal
 import sys
 from pathlib import Path
 
@@ -52,6 +54,8 @@ from dev.benchmarks.omnigent.schema import build_report
 # runner journeys drive turns through the in-process openai-agents SDK harness.
 _HTTP_HARNESS = "http-only"
 _RUNNER_HARNESS = "openai-agents"
+# How often a SIGTERM cancellation is re-sent while the run has not yet unwound.
+_RECANCEL_INTERVAL_S = 0.5
 
 
 def _backend_of(database_uri: str | None) -> str:
@@ -135,9 +139,12 @@ def _skipped_block(journey: Journey, backend: str, exc: Exception) -> dict[str, 
     }
 
 
-async def run_benchmark(args: argparse.Namespace) -> tuple[dict[str, object], bool]:
+async def run_benchmark(
+    args: argparse.Namespace, *, teardown_started: asyncio.Event | None = None
+) -> tuple[dict[str, object], bool]:
     """Run all selected journeys and build the report.
 
+    :param teardown_started: Set once the benchmark environment begins teardown.
     :returns: ``(report, passed)`` where *passed* is ``False`` if any journey
         breached a supplied threshold.
     """
@@ -157,7 +164,11 @@ async def run_benchmark(args: argparse.Namespace) -> tuple[dict[str, object], bo
     harness = _RUNNER_HARNESS if with_runner else _HTTP_HARNESS
 
     async with BenchEnvironment(
-        with_runner=with_runner, with_host=with_host, database_uri=args.database_uri
+        with_runner=with_runner,
+        with_host=with_host,
+        database_uri=args.database_uri,
+        network_delay_ms=args.network_delay_ms,
+        teardown_started=teardown_started,
     ) as env:
         for journey in journeys:
             console.print(f"\n[bold]Benchmarking[/bold] {journey.name} [dim]({backend})[/dim]")
@@ -206,8 +217,9 @@ async def run_benchmark(args: argparse.Namespace) -> tuple[dict[str, object], bo
         "warmup": args.warmup,
         "with_runner": with_runner,
         "backend": backend,
+        "network_delay_ms": args.network_delay_ms,
     }
-    generated_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    generated_at = datetime.datetime.now(datetime.UTC).isoformat()
     report = build_report(
         journey_results,
         generated_at=generated_at,
@@ -277,6 +289,16 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         help="Warmup operations discarded before each run (default: 10).",
     )
     parser.add_argument(
+        "--network-delay-ms",
+        type=float,
+        default=0.0,
+        metavar="MS",
+        help="Simulated client→server network latency, in ms, injected before "
+        "each request the benchmark sends (default: 0 = loopback speed). Models "
+        "a real network hop for testing network optimizations; per-op request "
+        "counts times this delay approximate the round-trip wall cost.",
+    )
+    parser.add_argument(
         "--output",
         type=Path,
         default=None,
@@ -307,9 +329,44 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+async def _run_until_terminated(args: argparse.Namespace) -> tuple[dict[str, object], bool]:
+    """Run the benchmark, turning SIGTERM into cancellation so teardown still runs.
+
+    Without this, SIGTERM (``timeout``, ``kill``) ends the process before
+    :class:`BenchEnvironment` stops its server, runner, host, and mock.
+    """
+    task = asyncio.current_task()
+    assert task is not None
+    loop = asyncio.get_running_loop()
+    teardown_started = asyncio.Event()
+    cancelled = False
+
+    def _cancel_until_teardown() -> None:
+        # httpx's anyio internals can consume a native cancel as their own and
+        # keep going, so repeat it until teardown starts (then never interrupt it).
+        if not task.done() and not teardown_started.is_set():
+            task.cancel()
+            loop.call_later(_RECANCEL_INTERVAL_S, _cancel_until_teardown)
+
+    def _on_sigterm() -> None:
+        # Ignore repeats: a second SIGTERM must not cancel the teardown in flight.
+        nonlocal cancelled
+        if not cancelled:
+            cancelled = True
+            _cancel_until_teardown()
+
+    with contextlib.suppress(NotImplementedError):  # no loop signal handlers on Windows
+        loop.add_signal_handler(signal.SIGTERM, _on_sigterm)
+    return await run_benchmark(args, teardown_started=teardown_started)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv if argv is not None else sys.argv[1:])
-    report, passed = asyncio.run(run_benchmark(args))
+    try:
+        report, passed = asyncio.run(_run_until_terminated(args))
+    except asyncio.CancelledError:
+        console.print("\n[red]Terminated; benchmark processes stopped.[/red]")
+        return 128 + signal.SIGTERM
     if args.output is not None:
         args.output.write_text(json.dumps(report, indent=2))
         console.print(f"\n  Results written to [cyan]{args.output}[/cyan]")

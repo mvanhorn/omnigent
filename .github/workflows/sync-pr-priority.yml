@@ -1,0 +1,73 @@
+name: Sync PR Priority
+
+# Mirrors a linked issue's priority label (P0-P3) onto the PR that closes it.
+# Only closing links (closes/fixes/resolves #n) count -- a plain "related to
+# #n" mention is ignored. Runs on PR events and re-syncs when an issue's labels
+# change. Uses only default-branch code and never checks out or executes PR
+# files; it edits labels through the API. Labels set via GITHUB_TOKEN never
+# trigger this, so issue-prioritization-v2.yml syncs the ones it sets.
+
+on:
+  # No `synchronize`: priority is derived from the linked issue's label and the
+  # PR body's closing reference, so pushing a new commit can't change it --
+  # re-running on every push was pure waste. The `edited` event still catches a
+  # closing link added/changed after open, and `issues` catches label changes.
+  pull_request_target:
+    types:
+      - opened
+      - edited
+      - reopened
+      - ready_for_review
+  issues:
+    types:
+      - labeled
+      - unlabeled
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "PR number to sync"
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync-pr-priority-${{ github.event.pull_request.number || github.event.issue.number || github.event.inputs.pr_number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  sync:
+    # On issue label events, only react when the changed label is a priority
+    # (P0-P3) label; other label edits (Bug, triaged, ...) never affect sync.
+    if: >-
+      github.repository == 'omnigent-ai/omnigent' &&
+      (github.event_name != 'issues' ||
+       contains(fromJSON('["P0-critical", "P1-high", "P2-medium", "P3-low"]'), github.event.label.name))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Checkout default-branch script
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          sparse-checkout: .github/scripts/sync_pr_priority.py
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      # PR and dispatch events name the PR. An issue label event re-syncs every
+      # open PR that closes the issue; a failed lookup warns instead of failing.
+      - name: Sync priority labels
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number || github.event.inputs.pr_number }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        run: python3 .github/scripts/sync_pr_priority.py

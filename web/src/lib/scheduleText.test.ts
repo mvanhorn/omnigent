@@ -1,0 +1,559 @@
+// Tests for the client-side schedule text + next-run derivation, and the RRULE
+// builder + validation that feed them. Covers every shape the create form can
+// produce: the simple presets (Hourly/Daily/Weekdays/Weekly) and all five
+// Custom frequencies (with INTERVAL, multi weekday/month-day selects, and
+// yearly BYMONTH), plus the 1-hour-floor validation.
+
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  describeRunFailure,
+  describeSchedule,
+  formatClockTime,
+  formatNextRunAt,
+  formatRunDuration,
+  formatRunTimestamp,
+  nextRunAtMs,
+} from "./scheduleText";
+import {
+  buildRRule,
+  DEFAULT_SCHEDULE_MODEL,
+  validateSchedule,
+  type ScheduleModel,
+} from "./scheduleBuilder";
+
+/** Convenience: a model with overrides on top of the default. */
+function model(overrides: Partial<ScheduleModel>): ScheduleModel {
+  return { ...DEFAULT_SCHEDULE_MODEL, ...overrides };
+}
+
+describe("formatClockTime", () => {
+  it("formats 12-hour times with AM/PM", () => {
+    expect(formatClockTime(8, 0)).toBe("8:00 AM");
+    expect(formatClockTime(0, 0)).toBe("12:00 AM");
+    expect(formatClockTime(12, 30)).toBe("12:30 PM");
+    expect(formatClockTime(13, 5)).toBe("1:05 PM");
+    expect(formatClockTime(23, 59)).toBe("11:59 PM");
+  });
+});
+
+describe("buildRRule — simple presets", () => {
+  it("hourly (no inputs)", () => {
+    expect(buildRRule(model({ preset: "hourly" }))).toBe("FREQ=HOURLY;BYMINUTE=0");
+  });
+
+  it("daily (time only)", () => {
+    expect(buildRRule(model({ preset: "daily", hour: 9, minute: 0 }))).toBe(
+      "FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
+    );
+  });
+
+  it("weekdays (Mon–Fri + time)", () => {
+    expect(buildRRule(model({ preset: "weekdays", hour: 8, minute: 0 }))).toBe(
+      "FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=8;BYMINUTE=0",
+    );
+  });
+
+  it("weekly (multi weekday, sorted to calendar order)", () => {
+    expect(
+      buildRRule(model({ preset: "weekly", weekdays: ["FR", "MO"], hour: 8, minute: 0 })),
+    ).toBe("FREQ=WEEKLY;BYDAY=MO,FR;BYHOUR=8;BYMINUTE=0");
+  });
+
+  it("weekly falls back to MO when the (invalid) empty set is built", () => {
+    // validateSchedule blocks submit, but buildRRule must still emit a legal rule.
+    expect(buildRRule(model({ preset: "weekly", weekdays: [], hour: 8, minute: 0 }))).toBe(
+      "FREQ=WEEKLY;BYDAY=MO;BYHOUR=8;BYMINUTE=0",
+    );
+  });
+});
+
+describe("buildRRule — custom frequencies with INTERVAL", () => {
+  it("custom hourly: every X hours at minute Y", () => {
+    expect(
+      buildRRule(model({ preset: "custom", customFreq: "hourly", interval: 2, minute: 15 })),
+    ).toBe("FREQ=HOURLY;INTERVAL=2;BYMINUTE=15");
+  });
+
+  it("custom daily: every X days at h:m", () => {
+    expect(
+      buildRRule(
+        model({ preset: "custom", customFreq: "daily", interval: 3, hour: 9, minute: 30 }),
+      ),
+    ).toBe("FREQ=DAILY;INTERVAL=3;BYHOUR=9;BYMINUTE=30");
+  });
+
+  it("custom weekly: every X weeks on <days> at h:m", () => {
+    expect(
+      buildRRule(
+        model({
+          preset: "custom",
+          customFreq: "weekly",
+          interval: 2,
+          weekdays: ["MO", "WE", "FR"],
+          hour: 8,
+          minute: 0,
+        }),
+      ),
+    ).toBe("FREQ=WEEKLY;INTERVAL=2;BYDAY=MO,WE,FR;BYHOUR=8;BYMINUTE=0");
+  });
+
+  it("custom monthly: every X months on <multi days> at h:m", () => {
+    expect(
+      buildRRule(
+        model({
+          preset: "custom",
+          customFreq: "monthly",
+          interval: 3,
+          monthDays: [15, 1],
+          hour: 6,
+          minute: 0,
+        }),
+      ),
+    ).toBe("FREQ=MONTHLY;INTERVAL=3;BYMONTHDAY=1,15;BYHOUR=6;BYMINUTE=0");
+  });
+
+  it("custom yearly: every X years in month Y on <multi days> at h:m", () => {
+    expect(
+      buildRRule(
+        model({
+          preset: "custom",
+          customFreq: "yearly",
+          interval: 2,
+          month: 3,
+          monthDays: [1],
+          hour: 9,
+          minute: 0,
+        }),
+      ),
+    ).toBe("FREQ=YEARLY;INTERVAL=2;BYMONTH=3;BYMONTHDAY=1;BYHOUR=9;BYMINUTE=0");
+  });
+
+  it("clamps a bad interval up to 1 in the built rule", () => {
+    expect(buildRRule(model({ preset: "custom", customFreq: "daily", interval: 0 }))).toContain(
+      "INTERVAL=1",
+    );
+  });
+
+  it("allows day-of-month up to 31 (short months handled by rrule)", () => {
+    expect(
+      buildRRule(model({ preset: "custom", customFreq: "monthly", interval: 1, monthDays: [31] })),
+    ).toContain("BYMONTHDAY=31");
+  });
+});
+
+describe("validateSchedule — 1-hour floor + required selections", () => {
+  it("accepts every simple preset", () => {
+    expect(validateSchedule(model({ preset: "hourly" }))).toBeNull();
+    expect(validateSchedule(model({ preset: "daily" }))).toBeNull();
+    expect(validateSchedule(model({ preset: "weekdays" }))).toBeNull();
+    expect(validateSchedule(model({ preset: "weekly", weekdays: ["MO"] }))).toBeNull();
+  });
+
+  it("rejects an empty weekly weekday set", () => {
+    expect(validateSchedule(model({ preset: "weekly", weekdays: [] }))).toMatch(
+      /at least one day/i,
+    );
+  });
+
+  it("rejects a sub-1 interval (the 1h floor) on custom hourly", () => {
+    expect(
+      validateSchedule(model({ preset: "custom", customFreq: "hourly", interval: 0 })),
+    ).toMatch(/at least 1/i);
+  });
+
+  it("rejects a non-integer / <1 interval for any custom frequency", () => {
+    expect(validateSchedule(model({ preset: "custom", customFreq: "daily", interval: 0 }))).toMatch(
+      /at least 1/i,
+    );
+    expect(
+      validateSchedule(model({ preset: "custom", customFreq: "daily", interval: 1.5 })),
+    ).toMatch(/whole number/i);
+  });
+
+  it("accepts a valid custom hourly interval (>=1 → within the floor)", () => {
+    expect(
+      validateSchedule(model({ preset: "custom", customFreq: "hourly", interval: 1 })),
+    ).toBeNull();
+    expect(
+      validateSchedule(model({ preset: "custom", customFreq: "hourly", interval: 6 })),
+    ).toBeNull();
+  });
+
+  it("requires at least one custom weekly weekday and monthly/yearly day", () => {
+    expect(
+      validateSchedule(
+        model({ preset: "custom", customFreq: "weekly", interval: 1, weekdays: [] }),
+      ),
+    ).toMatch(/at least one day/i);
+    expect(
+      validateSchedule(
+        model({ preset: "custom", customFreq: "monthly", interval: 1, monthDays: [] }),
+      ),
+    ).toMatch(/at least one day of the month/i);
+    expect(
+      validateSchedule(
+        model({ preset: "custom", customFreq: "yearly", interval: 1, monthDays: [] }),
+      ),
+    ).toMatch(/at least one day of the month/i);
+  });
+});
+
+describe("describeSchedule", () => {
+  it("collapses the Mon–Fri set to Weekdays", () => {
+    expect(describeSchedule("FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=8;BYMINUTE=0")).toBe(
+      "Weekdays at 8:00 AM",
+    );
+  });
+
+  it("renders a daily rule", () => {
+    expect(describeSchedule("FREQ=DAILY;BYHOUR=9;BYMINUTE=0")).toBe("Every day at 9:00 AM");
+  });
+
+  it("renders a specific weekly day and a multi-day set", () => {
+    expect(describeSchedule("FREQ=WEEKLY;BYDAY=MO;BYHOUR=14;BYMINUTE=30")).toBe(
+      "Weekly on Monday at 2:30 PM",
+    );
+    expect(describeSchedule("FREQ=WEEKLY;BYDAY=MO,FR;BYHOUR=8;BYMINUTE=0")).toBe(
+      "Weekly on Monday and Friday at 8:00 AM",
+    );
+  });
+
+  it("renders weekends", () => {
+    expect(describeSchedule("FREQ=WEEKLY;BYDAY=SA,SU;BYHOUR=10;BYMINUTE=0")).toBe(
+      "Weekends at 10:00 AM",
+    );
+  });
+
+  it("renders plain hourly and interval-hourly", () => {
+    expect(describeSchedule("FREQ=HOURLY;BYMINUTE=0")).toBe("Hourly");
+    // interval-1 hourly with a non-zero BYMINUTE shows the minute (not bare "Hourly").
+    expect(describeSchedule("FREQ=HOURLY;BYMINUTE=30")).toBe("Hourly at :30");
+    expect(describeSchedule("FREQ=HOURLY;INTERVAL=2;BYMINUTE=15")).toBe("Every 2 hours at :15");
+  });
+
+  it("renders interval daily / weekly", () => {
+    expect(describeSchedule("FREQ=DAILY;INTERVAL=3;BYHOUR=9;BYMINUTE=30")).toBe(
+      "Every 3 days at 9:30 AM",
+    );
+    expect(describeSchedule("FREQ=WEEKLY;INTERVAL=2;BYDAY=MO,WE;BYHOUR=8;BYMINUTE=0")).toBe(
+      "Every 2 weeks on Monday and Wednesday at 8:00 AM",
+    );
+  });
+
+  it("renders monthly with single + multi day, plain + interval", () => {
+    expect(describeSchedule("FREQ=MONTHLY;BYMONTHDAY=1;BYHOUR=6;BYMINUTE=0")).toBe(
+      "Monthly on the 1st at 6:00 AM",
+    );
+    expect(describeSchedule("FREQ=MONTHLY;INTERVAL=3;BYMONTHDAY=1,15;BYHOUR=6;BYMINUTE=0")).toBe(
+      "Every 3 months on the 1st and 15th at 6:00 AM",
+    );
+  });
+
+  it("renders yearly with month + day, plain + interval", () => {
+    expect(describeSchedule("FREQ=YEARLY;BYMONTH=3;BYMONTHDAY=1;BYHOUR=9;BYMINUTE=0")).toBe(
+      "Yearly in March on the 1st at 9:00 AM",
+    );
+    expect(
+      describeSchedule("FREQ=YEARLY;INTERVAL=2;BYMONTH=12;BYMONTHDAY=25;BYHOUR=9;BYMINUTE=0"),
+    ).toBe("Every 2 years in December on the 25th at 9:00 AM");
+  });
+
+  it("falls back to the raw rule for an unparseable string", () => {
+    expect(describeSchedule("not a rule")).toBe("not a rule");
+  });
+
+  it("round-trips every builder output to non-empty readable text", () => {
+    const cases: ScheduleModel[] = [
+      model({ preset: "hourly" }),
+      model({ preset: "daily" }),
+      model({ preset: "weekdays" }),
+      model({ preset: "weekly", weekdays: ["TU", "TH"] }),
+      model({ preset: "custom", customFreq: "hourly", interval: 4, minute: 0 }),
+      model({ preset: "custom", customFreq: "daily", interval: 2 }),
+      model({ preset: "custom", customFreq: "weekly", interval: 2, weekdays: ["MO"] }),
+      model({ preset: "custom", customFreq: "monthly", interval: 1, monthDays: [1, 15] }),
+      model({ preset: "custom", customFreq: "yearly", interval: 1, month: 6, monthDays: [1] }),
+    ];
+    for (const m of cases) {
+      const text = describeSchedule(buildRRule(m));
+      expect(text.length).toBeGreaterThan(0);
+      // Never leaks the raw FREQ= rule as the "readable" text.
+      expect(text.startsWith("FREQ=")).toBe(false);
+    }
+  });
+});
+
+describe("nextRunAtMs", () => {
+  it("computes the next daily occurrence after now", () => {
+    // 2026-01-01 06:00 UTC; a 9:00 UTC daily rule fires later the same day.
+    const now = new Date("2026-01-01T06:00:00Z");
+    const next = nextRunAtMs("FREQ=DAILY;BYHOUR=9;BYMINUTE=0", "UTC", now);
+    expect(next).not.toBeNull();
+    const d = new Date(next!);
+    expect(d.getUTCHours()).toBe(9);
+    expect(d.getUTCDate()).toBe(1);
+  });
+
+  it("rolls to the next day when today's time has passed", () => {
+    const now = new Date("2026-01-01T12:00:00Z");
+    const next = nextRunAtMs("FREQ=DAILY;BYHOUR=9;BYMINUTE=0", "UTC", now);
+    expect(new Date(next!).getUTCDate()).toBe(2);
+  });
+
+  it("handles interval-daily (every 3 days)", () => {
+    const now = new Date("2026-01-01T00:00:00Z");
+    const next = nextRunAtMs("FREQ=DAILY;INTERVAL=3;BYHOUR=9;BYMINUTE=0", "UTC", now);
+    expect(next).not.toBeNull();
+    expect(new Date(next!).getUTCHours()).toBe(9);
+  });
+
+  it("handles yearly with BYMONTH + BYMONTHDAY", () => {
+    const now = new Date("2026-01-01T00:00:00Z");
+    const next = nextRunAtMs("FREQ=YEARLY;BYMONTH=3;BYMONTHDAY=1;BYHOUR=9;BYMINUTE=0", "UTC", now);
+    expect(next).not.toBeNull();
+    const d = new Date(next!);
+    expect(d.getUTCMonth()).toBe(2); // March (0-indexed)
+    expect(d.getUTCDate()).toBe(1);
+  });
+
+  it("handles multi-day monthly (picks the nearest upcoming day)", () => {
+    const now = new Date("2026-01-10T00:00:00Z");
+    const next = nextRunAtMs("FREQ=MONTHLY;BYMONTHDAY=1,15;BYHOUR=9;BYMINUTE=0", "UTC", now);
+    expect(next).not.toBeNull();
+    // Next after the 10th is the 15th of the same month.
+    expect(new Date(next!).getUTCDate()).toBe(15);
+  });
+
+  it("returns null for an unparseable rule", () => {
+    expect(nextRunAtMs("garbage", "UTC")).toBeNull();
+  });
+
+  // Reference results from rrule.js with DTSTART=2000-01-01T00:00:00Z.
+  // Keep them explicit so the test does not enumerate decades of hourly occurrences.
+  it.each([
+    ["FREQ=HOURLY;BYMINUTE=3", "2026-07-24T05:03:00Z"],
+    ["FREQ=HOURLY;INTERVAL=3", "2026-07-24T06:00:00Z"],
+    ["FREQ=DAILY;BYHOUR=9;BYMINUTE=0", "2026-07-24T09:00:00Z"],
+    ["FREQ=WEEKLY;BYDAY=MO,WE;BYHOUR=8", "2026-07-27T08:00:00Z"],
+    ["FREQ=DAILY;INTERVAL=3", "2026-07-25T00:00:00Z"],
+    ["FREQ=MONTHLY;BYMONTHDAY=15", "2026-08-15T00:00:00Z"],
+    ["FREQ=YEARLY;BYMONTH=3", "2027-03-01T00:00:00Z"],
+  ])("matches the deterministic 2000-anchor result for %s", (rrule, expected) => {
+    const now = new Date("2026-07-24T05:00:00Z");
+    expect(nextRunAtMs(rrule, "UTC", now)).toBe(Date.parse(expected));
+  });
+
+  it("computes hourly next-run values without iterating from the 2000 anchor", () => {
+    const start = performance.now();
+    const next = nextRunAtMs("FREQ=HOURLY;BYMINUTE=30", "UTC", new Date("2026-07-24T05:00:00Z"));
+    const elapsedMs = performance.now() - start;
+
+    expect(next).not.toBeNull();
+    expect(elapsedMs).toBeLessThan(30);
+  });
+});
+
+describe("formatNextRunAt (relative delta from the server's next-run, full words)", () => {
+  // A fixed "now" so the delta buckets are deterministic.
+  const NOW = new Date("2026-03-10T12:00:00Z"); // Tue 2026-03-10, 12:00 UTC
+  const iso = (ms: number) => new Date(NOW.getTime() + ms).toISOString();
+  const MIN = 60_000;
+  const HR = 60 * MIN;
+  const DAY = 24 * HR;
+
+  it("returns null for null / empty / unparseable input", () => {
+    expect(formatNextRunAt(null, NOW)).toBeNull();
+    expect(formatNextRunAt(undefined, NOW)).toBeNull();
+    expect(formatNextRunAt("", NOW)).toBeNull();
+    expect(formatNextRunAt("not-a-date", NOW)).toBeNull();
+  });
+
+  it("formats a sub-hour delta in minutes, pluralizing", () => {
+    expect(formatNextRunAt(iso(8 * MIN), NOW)).toBe("in 8 mins");
+    expect(formatNextRunAt(iso(30 * MIN), NOW)).toBe("in 30 mins");
+    // Minimum bucket is 1 min (just over the 'soon' threshold), singular.
+    expect(formatNextRunAt(iso(MIN), NOW)).toBe("in 1 min");
+  });
+
+  it("formats a sub-day delta in hours, pluralizing", () => {
+    expect(formatNextRunAt(iso(HR), NOW)).toBe("in 1 hour");
+    expect(formatNextRunAt(iso(3 * HR), NOW)).toBe("in 3 hours");
+    expect(formatNextRunAt(iso(15 * HR), NOW)).toBe("in 15 hours");
+  });
+
+  it("formats a multi-day delta in days, pluralizing", () => {
+    expect(formatNextRunAt(iso(DAY), NOW)).toBe("in 1 day");
+    expect(formatNextRunAt(iso(2 * DAY), NOW)).toBe("in 2 days");
+    expect(formatNextRunAt(iso(6 * DAY), NOW)).toBe("in 6 days");
+  });
+
+  it("rounds to the nearest unit (not floor)", () => {
+    // The user's exact case: 1h49m away reads "in 2 hours", not "in 1 hour".
+    expect(formatNextRunAt(iso(HR + 49 * MIN), NOW)).toBe("in 2 hours");
+    expect(formatNextRunAt(iso(HR + 20 * MIN), NOW)).toBe("in 1 hour"); // rounds down
+    expect(formatNextRunAt(iso(HR + 30 * MIN), NOW)).toBe("in 2 hours"); // half rounds up
+    expect(formatNextRunAt(iso(8 * MIN + 30_000), NOW)).toBe("in 9 mins");
+    expect(formatNextRunAt(iso(8 * MIN + 29_000), NOW)).toBe("in 8 mins");
+    expect(formatNextRunAt(iso(2 * DAY + 12 * HR), NOW)).toBe("in 3 days");
+    expect(formatNextRunAt(iso(2 * DAY + 11 * HR), NOW)).toBe("in 2 days");
+  });
+
+  it("promotes to the next unit when rounding carries (no 'in 60 mins' / 'in 24 hours')", () => {
+    // Rounds to 60 min → promote to hours as "in 1 hour".
+    expect(formatNextRunAt(iso(59 * MIN + 40_000), NOW)).toBe("in 1 hour");
+    expect(formatNextRunAt(iso(59 * MIN + 59_000), NOW)).toBe("in 1 hour");
+    // Rounds to 24 h → promote to days as "in 1 day".
+    expect(formatNextRunAt(iso(23 * HR + 40 * MIN), NOW)).toBe("in 1 day");
+    expect(formatNextRunAt(iso(23 * HR + 59 * MIN), NOW)).toBe("in 1 day");
+    // Rounds up within the day bucket (6d23h → 7 days).
+    expect(formatNextRunAt(iso(6 * DAY + 23 * HR), NOW)).toBe("in 7 days");
+  });
+
+  it("returns 'soon' for an imminent or just-passed delta (< 1 minute)", () => {
+    expect(formatNextRunAt(iso(20_000), NOW)).toBe("soon"); // 20s out
+    expect(formatNextRunAt(iso(0), NOW)).toBe("soon"); // exactly now
+    expect(formatNextRunAt(iso(-5 * MIN), NOW)).toBe("soon"); // 5m in the past (skew)
+  });
+
+  it("bucket boundaries: 60m → hours, 24h → days", () => {
+    expect(formatNextRunAt(iso(60 * MIN), NOW)).toBe("in 1 hour");
+    expect(formatNextRunAt(iso(24 * HR), NOW)).toBe("in 1 day");
+  });
+});
+
+describe("formatRunDuration", () => {
+  it("formats sub-minute runs in bare seconds", () => {
+    expect(formatRunDuration(1000, 1003)).toBe("3s");
+    expect(formatRunDuration(1000, 1059)).toBe("59s");
+  });
+
+  it("formats minute-scale runs as 'Nm Ss', dropping a zero seconds", () => {
+    // 1m 42s.
+    expect(formatRunDuration(1000, 1000 + 102)).toBe("1m 42s");
+    // Exactly 2 minutes → no trailing seconds.
+    expect(formatRunDuration(1000, 1000 + 120)).toBe("2m");
+  });
+
+  it("formats hour-scale runs as 'Nh Mm', dropping a zero minutes", () => {
+    expect(formatRunDuration(0, 3600 + 5 * 60)).toBe("1h 5m"); // 1h 5m 0s
+    expect(formatRunDuration(0, 2 * 3600)).toBe("2h"); // exactly 2h
+  });
+
+  it("rounds a sub-second (but non-zero) run up to 1s", () => {
+    expect(formatRunDuration(1000, 1000.4)).toBe("1s");
+  });
+
+  it("returns null when the run hasn't finished or never fired", () => {
+    expect(formatRunDuration(1000, null)).toBeNull();
+    expect(formatRunDuration(null, 1000)).toBeNull();
+    expect(formatRunDuration(undefined, undefined)).toBeNull();
+  });
+
+  it("returns null for a negative or non-finite span", () => {
+    expect(formatRunDuration(2000, 1000)).toBeNull();
+    expect(formatRunDuration(Number.NaN, 1000)).toBeNull();
+  });
+});
+
+describe("formatRunTimestamp", () => {
+  // A fixed viewer-local reference. formatRunTimestamp works in local time, so
+  // build the run instants relative to NOW's local midnight to stay
+  // zone-independent.
+  const NOW = new Date("2026-07-27T15:30:00");
+
+  // The formatter uses the runtime's locale; pin it so the labels don't depend
+  // on the machine running the tests.
+  beforeEach(() => {
+    const { toLocaleTimeString, toLocaleDateString } = Date.prototype;
+    vi.spyOn(Date.prototype, "toLocaleTimeString").mockImplementation(function (
+      this: Date,
+      _locales?: Intl.LocalesArgument,
+      options?: Intl.DateTimeFormatOptions,
+    ) {
+      return toLocaleTimeString.call(this, "en-US", options);
+    });
+    vi.spyOn(Date.prototype, "toLocaleDateString").mockImplementation(function (
+      this: Date,
+      _locales?: Intl.LocalesArgument,
+      options?: Intl.DateTimeFormatOptions,
+    ) {
+      return toLocaleDateString.call(this, "en-US", options);
+    });
+  });
+  afterEach(() => vi.restoreAllMocks());
+
+  function atLocal(daysAgo: number, hour: number, minute: number): number {
+    const d = new Date(NOW.getFullYear(), NOW.getMonth(), NOW.getDate() - daysAgo, hour, minute, 0);
+    return Math.floor(d.getTime() / 1000);
+  }
+
+  it("labels a same-day run 'Today, <time>'", () => {
+    expect(formatRunTimestamp(atLocal(0, 8, 0), NOW)).toBe("Today, 8:00 AM");
+  });
+
+  it("labels a previous-calendar-day run 'Yesterday, <time>'", () => {
+    expect(formatRunTimestamp(atLocal(1, 14, 30), NOW)).toBe("Yesterday, 2:30 PM");
+  });
+
+  it("labels an older same-year run 'Mon D, <time>' without a year", () => {
+    const label = formatRunTimestamp(atLocal(10, 8, 0), NOW)!;
+    expect(label).toMatch(/^Jul \d{1,2}, 8:00 AM$/);
+    expect(label).not.toContain("2026");
+  });
+
+  it("includes the year for a run from a different year", () => {
+    const priorYear = Math.floor(new Date(2025, 11, 25, 9, 0, 0).getTime() / 1000);
+    const label = formatRunTimestamp(priorYear, NOW)!;
+    expect(label).toContain("2025");
+  });
+
+  it("returns null for a null / non-finite timestamp", () => {
+    expect(formatRunTimestamp(null, NOW)).toBeNull();
+    expect(formatRunTimestamp(undefined, NOW)).toBeNull();
+    expect(formatRunTimestamp(Number.NaN, NOW)).toBeNull();
+  });
+});
+
+describe("describeRunFailure", () => {
+  it("names the stage each fire-path error code stopped at", () => {
+    expect(describeRunFailure("reauthorization_required", "failed").stage).toBe("Owner");
+    expect(describeRunFailure("host_offline", "failed")).toEqual({
+      stage: "Host",
+      reason: "The host was offline.",
+    });
+    expect(describeRunFailure("session_create_failed", "failed").stage).toBe("Session");
+    expect(describeRunFailure("sandbox_create_failed", "failed").stage).toBe("Sandbox");
+    expect(describeRunFailure("sandbox_registration_timeout", "failed").stage).toBe("Sandbox");
+    expect(describeRunFailure("runner_start_failed", "failed").stage).toBe("Runner");
+    expect(describeRunFailure("startup_expired", "failed").stage).toBe("Startup");
+    expect(describeRunFailure("incomplete", "failed").stage).toBe("Running");
+  });
+
+  it("points settings failures at editing the automation", () => {
+    const missing = describeRunFailure("missing_host_id", "failed");
+    expect(missing.stage).toBe("Settings");
+    expect(missing.reason).toContain("Edit the automation");
+    expect(describeRunFailure("missing_workspace", "failed")).toEqual(missing);
+    expect(describeRunFailure("missing_execution_input", "failed")).toEqual(missing);
+    expect(describeRunFailure("invalid_input", "failed").reason).toContain("Edit the automation");
+  });
+
+  it("falls back to a status-worded reason with no stage for unknown or missing codes", () => {
+    expect(describeRunFailure("some_new_code", "skipped")).toEqual({
+      stage: null,
+      reason: "Run skipped.",
+    });
+    expect(describeRunFailure(null, "failed")).toEqual({ stage: null, reason: "Run failed." });
+    expect(describeRunFailure(undefined, "incomplete")).toEqual({
+      stage: null,
+      reason: "Run failed.",
+    });
+  });
+
+  it("does not treat inherited object keys as codes", () => {
+    expect(describeRunFailure("toString", "failed")).toEqual({
+      stage: null,
+      reason: "Run failed.",
+    });
+  });
+});

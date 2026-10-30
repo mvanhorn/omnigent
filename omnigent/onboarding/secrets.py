@@ -39,6 +39,8 @@ import os
 import keyring
 import keyring.errors
 
+from omnigent.errors import ErrorCode, OmnigentError
+
 # The subset of keyring exceptions that mean "this backend can't serve the
 # request" (locked / headless / no backend) — we fall back to the file
 # backend rather than crash.
@@ -154,9 +156,12 @@ def _write_secrets_file(secrets: dict[str, str]) -> None:
     """
     path = _secrets_path()
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    # Open with 0600 from the start (umask is applied by the OS, so chmod
-    # after the write guarantees the final mode regardless of umask).
-    with open(path, "w", encoding="utf-8") as f:
+    # Create the file 0600 from the start via os.open(O_CREAT, 0o600) rather than
+    # a plain open()+chmod-after: the latter briefly leaves a freshly-created
+    # secrets file group/world-readable until the chmod lands. The trailing chmod
+    # still tightens an already-existing file a prior run may have created wider.
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
         json.dump(secrets, f, indent=2)
     os.chmod(path, 0o600)
 
@@ -189,20 +194,32 @@ def load_secret(name: str) -> str | None:
     """Return the secret stored under *name*, or ``None`` if absent.
 
     Tries the OS keychain when enabled; on a :class:`keyring.errors.KeyringError`
-    it falls back to the file backend. A missing secret (in either backend)
-    returns ``None`` so callers can fail loud with a name-specific message.
+    it falls back to the file backend. If no file secret exists, it reports
+    the keyring access failure instead of treating the secret as absent.
 
     :param name: The stable secret name, e.g. ``"anthropic"``.
     :returns: The stored secret value, e.g. ``"sk-ant-..."``, or ``None``
-        when no secret is stored under *name*.
+        when the selected backend is accessible but has no secret under *name*.
+    :raises OmnigentError: If the keyring is inaccessible and no file secret exists.
     """
+    keyring_error_name: str | None = None
     if _use_keyring():
         try:
             stored: str | None = keyring.get_password(_KEYRING_SERVICE, name)
             return stored
-        except _KEYRING_ERRORS:
-            pass
-    return _read_secrets_file().get(name)
+        except _KEYRING_ERRORS as exc:
+            keyring_error_name = type(exc).__name__
+    stored = _read_secrets_file().get(name)
+    if stored is None and keyring_error_name is not None:
+        raise OmnigentError(
+            f"could not read secret {name!r} from the OS keyring "
+            f"({keyring_error_name}); no file-backed secret is available. "
+            "Check that a keyring backend is available and unlocked, then restart "
+            "the Omnigent host from the same desktop session. On Linux, check "
+            "DBUS_SESSION_BUS_ADDRESS and XDG_RUNTIME_DIR.",
+            code=ErrorCode.INVALID_INPUT,
+        ) from None
+    return stored
 
 
 def delete_secret(name: str) -> None:

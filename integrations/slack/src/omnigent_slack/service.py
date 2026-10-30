@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from dataclasses import dataclass, field
 from typing import Any
@@ -12,19 +13,23 @@ from omnigent_slack.approvals import (
 )
 from omnigent_slack.auth_manager import pack_user_key
 from omnigent_slack.elicitation import ElicitationController, ElicitationTurnState
-from omnigent_slack.models import SlackTurn, ThreadKey
+from omnigent_slack.models import SlackTurn, ThreadKey, event_is_dm
 from omnigent_slack.notifications import (
     SlackNotifier,
     format_output_file,
     format_policy_denied,
+    format_todos,
 )
 from omnigent_slack.omnigent import (
     AuthRequiredError,
     HarnessNotConfiguredError,
+    HostType,
     HostUnavailableError,
     OmnigentClient,
     OmnigentClientPool,
+    RunnerUnavailableError,
     ServerUnreachableError,
+    StreamInterruptedError,
     extract_assistant_text,
     extract_delta,
     extract_elicitation_request,
@@ -40,7 +45,7 @@ from omnigent_slack.streaming import (
     SlackClientProtocol,
     _AnswerReply,
 )
-from omnigent_slack.text import strip_bot_mention
+from omnigent_slack.text import GENERIC_FAILURE_TEXT, strip_bot_mention
 
 # Immediate acknowledgement shown while the session spins up and while the agent
 # works before the first streamed tokens arrive. Deleted only once real content
@@ -49,25 +54,86 @@ from omnigent_slack.text import strip_bot_mention
 # the placeholder vanishing and the reply appearing.
 _ACK_TEXT = "_Working on it…_"
 
+# How long the read loop waits for the next stream event before treating the
+# stream as idle and force-flushing any buffered-but-unshown answer text. The
+# SDK flushes to Slack only when its buffer fills, so a short burst the agent
+# then pauses after (a tool call, thinking) can stay invisible until more text
+# arrives or the turn ends. This is a SENSITIVITY window, not a display delay:
+# during active streaming the buffer still flushes immediately on fill; this only
+# fires once the stream actually goes quiet. Small enough to feel live, large
+# enough not to fragment a steady token stream into one API call per token.
+_IDLE_FLUSH_SECONDS = 2.0
+
 _SERVER_UNREACHABLE_TEXT = (
     ":warning: I couldn't reach your Omnigent server. If it moved or is "
     "down, run /omnigent to reconfigure."
 )
 
-# Shown when the server rejects the request as unauthenticated — the user's
-# delegated login is missing or expired (e.g. the bot restarted and in-memory
-# tokens were lost). They re-authenticate by running /omnigent.
-_AUTH_REQUIRED_TEXT = (
-    ":lock: Your Omnigent login has expired or isn't set up. Run /omnigent to log in again."
+# An unauthenticated turn (a grant that can no longer be refreshed, or a bot
+# restart that dropped in-memory tokens) is NOT delivered through this plain-text
+# path. The user was already set up, so they get a DM with a re-login setup
+# button instead (see ``SlackOmnigentService._notify_auth_expired``), which is
+# reliably delivered and actionable — unlike a thread ephemeral Slack may never
+# render.
+
+# Shown when the live turn stream kept dropping and reconnect was exhausted. The
+# server was reachable throughout (a proxy severed the long-lived stream, e.g. a
+# ~5-minute duration cap), and the turn may still be running server-side — so
+# this is NOT the "server is down / reconfigure" case. Its result may still land
+# in the thread when the turn finishes.
+_STREAM_INTERRUPTED_TEXT = (
+    ":warning: I lost my live connection to the running turn. Its result may "
+    "still arrive here — send another message if it doesn't."
+)
+
+# Posted in place of the "Working on it…" ack when shutdown cancels a turn
+# mid-flight: the restarted bot is no longer listening for that turn, so its
+# result will never land here — say so instead of leaving the ack up forever.
+_RESTART_ABANDONED_TEXT = (
+    ":warning: I was restarted while working on this and lost track of it, so "
+    "I won't be replying here. Please send your message again."
+)
+
+# How long a cancelled turn may spend replacing its ack with the notice above.
+# Shutdown's gather waits on every cancelled turn, so this bounds the restart.
+_SHUTDOWN_NOTICE_GRACE_SECONDS = 5.0
+
+# Shown when a MANAGED session has no runner: usually the server is still
+# provisioning its sandbox (tens of seconds on a first message), but the server
+# raises the SAME 503 ``runner_unavailable`` when the sandbox launch failed
+# outright, and the client discards the discriminating server message (it may
+# carry internal detail). The wording is therefore cause-neutral: it names the
+# not-ready sandbox and asks for a retry without promising the wait will
+# resolve, and escalates to the operator when it keeps happening (the
+# failed-launch subcase).
+_MANAGED_SANDBOX_NOT_READY_TEXT = (
+    ":warning: Your managed sandbox isn't ready yet. Try again in a moment; if it "
+    "keeps happening, contact your Omnigent operator."
+)
+
+# The same "no runner" report on an EXTERNAL host: no runner is bound, and the
+# mid-turn relaunch-and-retry — where it runs — did not recover one. Waiting is
+# the ask; a host the server knows to be offline raises HostUnavailableError.
+_RUNNER_UNAVAILABLE_TEXT = (
+    ":warning: No runner is available for this session yet. Try again in a moment."
 )
 
 
 class _TurnAborted(Exception):
-    """A turn can't proceed; ``text`` is the user-facing reason to deliver."""
+    """A turn can't proceed; ``text`` is the public user-facing reason to deliver."""
 
     def __init__(self, text: str) -> None:
         super().__init__(text)
         self.text = text
+
+
+class _AuthExpired(Exception):
+    """The server rejected the turn as unauthenticated (expired/lost token).
+
+    Distinct from :class:`_TurnAborted` because it is not delivered as plain
+    text: the caller DMs the user a re-login setup button instead (a reliable,
+    actionable notice for a grant that can no longer be refreshed).
+    """
 
 
 @dataclass
@@ -76,22 +142,36 @@ class _StreamState:
 
     # Timestamp of the live plan/todo message, edited in place across updates.
     todos_ts: str | None = None
-    # In-band ``response.error`` text captured for finalization.
-    error_text: str | None = None
+    # Whether the turn failed. The user-visible signal; a failure's raw detail is
+    # logged at the point of failure (never stored — it can carry stack traces /
+    # internal paths), and the user only ever sees the generic failure message.
+    errored: bool = False
     # Set when a known error was delivered mid-stream and the turn should stop.
     aborted: bool = False
     # In-flight elicitation cards this turn (owned by the ElicitationController).
     elicitations: ElicitationTurnState = field(default_factory=ElicitationTurnState)
 
 
-def _turn_error_text(exc: BaseException, server_url: str) -> str | None:
-    """User-facing message for a known startup/turn error, else ``None``.
+def _classify_turn_error(
+    exc: BaseException, server_url: str, *, host_type: HostType
+) -> str | None:
+    """Map a known startup/turn error to its public user-facing text.
 
     Single source of truth shared by the session-creation and mid-turn error
-    paths so the two stay in sync.
+    paths, so the text can't drift. All these errors affect everyone on the
+    thread and are delivered publicly. Returns ``None`` for an unrecognized error
+    (the caller falls back to the generic failure). Auth errors do NOT flow
+    through here — the caller intercepts them for a DM re-login prompt.
+
+    Pass the turn's ``host_type``: a missing runner reads differently on a managed
+    session (the server's sandbox is still coming up) than on the user's own host.
+    It is required rather than defaulted so a new call site can't silently tell an
+    external-host user their sandbox is starting.
     """
-    if isinstance(exc, AuthRequiredError):
-        return _AUTH_REQUIRED_TEXT
+    if isinstance(exc, StreamInterruptedError):
+        # A mid-stream drop with reconnect exhausted — the server stayed
+        # reachable, so this is NOT the "reconfigure" case. Its result may still land.
+        return _STREAM_INTERRUPTED_TEXT
     if isinstance(exc, ServerUnreachableError):
         return _SERVER_UNREACHABLE_TEXT
     if isinstance(exc, HostUnavailableError):
@@ -100,6 +180,14 @@ def _turn_error_text(exc: BaseException, server_url: str) -> str | None:
         # The server's message is curated, actionable guidance for this code —
         # surface it so the user knows to run `omnigent setup` on the host.
         return f":warning: {exc}"
+    if isinstance(exc, RunnerUnavailableError):
+        # No runner is serving the session. Usually recoverable by waiting, but
+        # the managed 503 also covers a failed sandbox launch and the class does
+        # not discriminate — so name the not-ready state instead of the generic
+        # failure, without promising that waiting will resolve it.
+        if host_type == "managed":
+            return _MANAGED_SANDBOX_NOT_READY_TEXT
+        return _RUNNER_UNAVAILABLE_TEXT
     return None
 
 
@@ -161,6 +249,9 @@ class SlackOmnigentService:
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        # Cancel any elicitation resolver tasks still awaiting a click so they
+        # aren't orphaned ("Task was destroyed but it is pending").
+        await self._elicitation.shutdown()
 
     async def handle_app_mention(
         self,
@@ -182,31 +273,38 @@ class SlackOmnigentService:
         if not accepted:
             return
 
-        team_id = _team_id(body, event)
-        key = ThreadKey.from_event(team_id, event)
-        text = strip_bot_mention(str(event.get("text") or ""), bot_user_id)
-        if not text:
-            self._logger.info(
-                "Slack app_mention had no text after mention thread=%s",
-                key.display(),
-            )
-            await client.chat_postMessage(
-                channel=key.channel_id,
-                thread_ts=key.thread_ts,
-                text="Send a message after mentioning me to start a session.",
-            )
-            return
+        # The event is now claimed and Bolt has auto-acked, so Slack won't
+        # redeliver. If handling fails before the turn is underway, release the
+        # claim so a redelivery / re-send isn't silently deduped away.
+        try:
+            team_id = _team_id(body, event)
+            key = ThreadKey.from_event(team_id, event)
+            text = strip_bot_mention(str(event.get("text") or ""), bot_user_id)
+            if not text:
+                self._logger.info(
+                    "Slack app_mention had no text after mention thread=%s",
+                    key.display(),
+                )
+                await client.chat_postMessage(
+                    channel=key.channel_id,
+                    thread_ts=key.reply_ts,
+                    text="Send a message after mentioning me to start a session.",
+                )
+                return
 
-        self._logger.info(
-            "Accepted Slack app_mention thread=%s chars=%s", key.display(), len(text)
-        )
-        await self._route_turn(
-            key=key,
-            event=event,
-            text=text,
-            client=client,
-            in_channel=not _is_direct_message(event),
-        )
+            self._logger.info(
+                "Accepted Slack app_mention thread=%s chars=%s", key.display(), len(text)
+            )
+            await self._route_turn(
+                key=key,
+                event=event,
+                text=text,
+                client=client,
+                in_channel=not event_is_dm(event),
+            )
+        except Exception:
+            await self._unclaim_event(body, event)
+            raise
 
     async def handle_message(
         self,
@@ -229,44 +327,51 @@ class SlackOmnigentService:
         if not accepted:
             return
 
-        if not _is_direct_message(event):
-            # In channels Omnigent only joins a thread when @-mentioned (which
-            # arrives as an app_mention event). Plain messages — even a reply in
-            # a thread that already has a session, and even one that mentions the
-            # bot (app_mention handles that copy) — are human discussion and must
-            # not be added to the Omnigent session.
+        # The event is now claimed and Bolt has auto-acked, so Slack won't
+        # redeliver. If handling fails before the turn is underway, release the
+        # claim so a redelivery / re-send isn't silently deduped away.
+        try:
+            if not event_is_dm(event):
+                # In channels Omnigent only joins a thread when @-mentioned (which
+                # arrives as an app_mention event). Plain messages — even a reply in
+                # a thread that already has a session, and even one that mentions the
+                # bot (app_mention handles that copy) — are human discussion and must
+                # not be added to the Omnigent session.
+                self._logger.info(
+                    "Ignoring channel message channel=%s ts=%s",
+                    event.get("channel"),
+                    event.get("ts"),
+                )
+                return
+
+            team_id = _team_id(body, event)
+            key = ThreadKey.from_event(team_id, event)
+
+            # DMs do not fire app_mention, so a "<@bot>" here is the only event we
+            # get — strip the mention (if any) and treat it like any other DM rather
+            # than dropping it as a duplicate.
+            text = strip_bot_mention(str(event.get("text") or ""), bot_user_id)
+            if not text:
+                self._logger.info("Ignoring empty Slack direct message thread=%s", key.display())
+                return
+
+            # A DM maps one session per thread (like a channel): a top-level message
+            # starts a new session, a threaded reply continues it.
             self._logger.info(
-                "Ignoring channel message channel=%s ts=%s",
-                event.get("channel"),
-                event.get("ts"),
+                "Accepted Slack direct message thread=%s chars=%s",
+                key.display(),
+                len(text),
             )
-            return
-
-        team_id = _team_id(body, event)
-        key = ThreadKey.from_event(team_id, event)
-
-        # DMs do not fire app_mention, so a "<@bot>" here is the only event we
-        # get — strip the mention (if any) and treat it like any other DM rather
-        # than dropping it as a duplicate.
-        text = strip_bot_mention(str(event.get("text") or ""), bot_user_id)
-        if not text:
-            self._logger.info("Ignoring empty Slack direct message thread=%s", key.display())
-            return
-
-        # A DM has no human-only discussion to gate on: the whole thread maps to
-        # one Omnigent session, created on the first message and reused after.
-        self._logger.info(
-            "Accepted Slack direct message thread=%s chars=%s",
-            key.display(),
-            len(text),
-        )
-        await self._route_turn(
-            key=key,
-            event=event,
-            text=text,
-            client=client,
-            in_channel=False,
-        )
+            await self._route_turn(
+                key=key,
+                event=event,
+                text=text,
+                client=client,
+                in_channel=False,
+            )
+        except Exception:
+            await self._unclaim_event(body, event)
+            raise
 
     async def _route_turn(
         self,
@@ -285,6 +390,31 @@ class SlackOmnigentService:
             self._logger.warning("Dropping Slack event with no user thread=%s", key.display())
             return
 
+        # Authoritative thread-ownership gate, independent of the session store.
+        # Slack stamps ``parent_user_id`` (the thread root's author) on every
+        # threaded event; when it's present and is NOT the requester, this is a
+        # reply into someone else's thread → refuse, since a Slack thread maps 1:1
+        # to a session. This is ground truth from Slack that survives a bot
+        # restart, unlike the (ephemeral) store: without it, a restart that drops
+        # the thread→session record would let ANY user's reply create a fresh
+        # session in another user's thread. A root-level mention (new thread) has
+        # no ``parent_user_id`` and falls through to the normal store-backed path.
+        #
+        # Skip this in a DM: a 1:1 DM has no cross-user ownership concern (only the
+        # one user and the bot are there), and a reply threaded under a BOT message
+        # carries ``parent_user_id == <bot id>`` — which would wrongly refuse the
+        # user's own message.
+        parent_user_id = str(event.get("parent_user_id") or "")
+        if not key.is_dm and parent_user_id and parent_user_id != requester:
+            self._logger.info(
+                "Ignoring reply from non-owner thread=%s parent=%s requester=%s",
+                key.display(),
+                parent_user_id,
+                requester,
+            )
+            await self._notifier.notify_non_owner(client, key, requester)
+            return
+
         # LOCAL concurrency guard: reserve the thread SYNCHRONOUSLY here (no await
         # before this add) so two near-simultaneous messages can't both open a
         # stream and double-render. If already reserved, a turn is streaming in
@@ -301,11 +431,25 @@ class SlackOmnigentService:
             if record is not None and record.owner_user_id != requester:
                 await self._notifier.notify_non_owner(client, key, requester)
             else:
+                # A parked turn (awaiting an approval/question) is STILL streaming,
+                # so it holds this reservation — meaning this branch, not the
+                # server-activity one below, handles a new message during a pending
+                # elicitation. Ask the server whether the session needs user action
+                # so we show "respond to the pending request above" rather than the
+                # generic "still working" notice. Best-effort: no record / unknown
+                # activity falls back to the busy notice.
+                needs_action = False
+                if record is not None:
+                    omnigent = await self._pool.get(
+                        self._server_url, pack_user_key(key.team_id, requester)
+                    )
+                    activity = await omnigent.get_session_activity(record.session_id)
+                    needs_action = activity.needs_user_action
                 await self._notifier.notify_thread_busy(
                     client,
                     key,
                     requester,
-                    needs_action=False,
+                    needs_action=needs_action,
                     session_id=record.session_id if record is not None else None,
                 )
             return
@@ -338,19 +482,44 @@ class SlackOmnigentService:
                 )
                 activity = await omnigent.get_session_activity(record.session_id)
                 if activity.needs_user_action or activity.is_busy:
-                    self._logger.info(
-                        "Server busy thread=%s status=%s pending=%s; deflecting",
-                        key.display(),
-                        activity.status,
-                        activity.pending_elicitation,
-                    )
-                    await self._notifier.notify_thread_busy(
-                        client,
-                        key,
-                        requester,
-                        needs_action=activity.needs_user_action,
-                        session_id=record.session_id,
-                    )
+                    # A busy verdict can be a dead promise: a still-set inflight
+                    # marker with no local stream means a restart abandoned this
+                    # thread's turn, so nobody would ever deliver the promised
+                    # reply. Tell the owner honestly instead — but do NOT run
+                    # the follow-up into the busy session: the boolean marker
+                    # cannot prove the running response is the abandoned Slack
+                    # turn (a cancel before submission strands the marker, and
+                    # the owner may have started a web-UI turn after the
+                    # restart), and attaching a Slack renderer to the
+                    # session-wide event stream would replay another surface's
+                    # in-flight output into the channel. A pending elicitation
+                    # keeps its deflection — answering it (here or in the web
+                    # UI) works across a restart.
+                    if record.turn_inflight and not activity.needs_user_action:
+                        self._logger.info(
+                            "Server busy thread=%s status=%s but the turn was "
+                            "abandoned by a restart; posting the honest loss "
+                            "notice instead of a still-working promise",
+                            key.display(),
+                            activity.status,
+                        )
+                        await self._notifier.notify_stale_turn_dropped(
+                            client, key, requester, session_id=record.session_id
+                        )
+                    else:
+                        self._logger.info(
+                            "Server busy thread=%s status=%s pending=%s; deflecting",
+                            key.display(),
+                            activity.status,
+                            activity.pending_elicitation,
+                        )
+                        await self._notifier.notify_thread_busy(
+                            client,
+                            key,
+                            requester,
+                            needs_action=activity.needs_user_action,
+                            session_id=record.session_id,
+                        )
                     return
                 self._spawn_turn(
                     SlackTurn(
@@ -366,6 +535,10 @@ class SlackOmnigentService:
                         owner_user_id=record.owner_user_id or requester,
                         workspace=record.workspace,
                         host_id=record.host_id,
+                        # From the SESSION, not the user's current config: a
+                        # thread keeps running where it was created even if the
+                        # user re-runs setup and switches host type.
+                        host_type=record.host_type,
                     )
                 )
                 spawned = True
@@ -382,7 +555,7 @@ class SlackOmnigentService:
                     client,
                     requester,
                     channel=key.channel_id,
-                    thread_ts=key.thread_ts,
+                    thread_ts=key.reply_ts,
                     in_channel=in_channel,
                 )
                 return
@@ -399,6 +572,7 @@ class SlackOmnigentService:
                     owner_user_id=requester,
                     workspace=config.workspace,
                     host_id=config.host_id,
+                    host_type=config.host_type,
                 )
             )
             spawned = True
@@ -445,6 +619,9 @@ class SlackOmnigentService:
 
         try:
             session_id = await self._ensure_session(turn, omnigent)
+        except _AuthExpired:
+            await self._notify_auth_expired(turn, reply)
+            return
         except _TurnAborted as aborted:
             await reply.stop_with(aborted.text)
             return
@@ -459,39 +636,61 @@ class SlackOmnigentService:
         # flush, and is cleared once the reply is actually on screen.
         reply.set_ack(await self._notifier.post_ack(turn.slack_client, turn.key, _ACK_TEXT))
 
-        # Baseline the newest assistant message BEFORE the turn runs, so the
-        # no-delta fallback below can tell this turn's answer from a prior one.
-        baseline = await omnigent.latest_assistant_message(session_id)
-
+        cancelled = False
         try:
-            error_text = await self._stream_turn(turn, omnigent, session_id, reply)
-        except _TurnAborted:
-            # A known mid-stream error already delivered its message and stopped
-            # the reply; nothing left to finalize.
-            return
+            # Baseline the newest assistant message BEFORE the turn runs, so the
+            # no-delta fallback below can tell this turn's answer from a prior one.
+            baseline = await omnigent.latest_assistant_message(session_id)
 
-        if reply.needs_fallback_text():
-            # Last-resort safety net: the turn delivered no answer text on the
-            # stream at all. Recover the server's newest assistant message, but
-            # only when it's genuinely new: it must differ from the pre-turn
-            # baseline (else a no-answer turn like a denied approval would
-            # resurrect the PREVIOUS turn's message) AND not be something an
-            # earlier sealed segment this turn already showed (else a trailing
-            # notice would re-post the answer we just streamed). Compare the whole
-            # (id, text) tuple so an id-less message is judged by its text.
-            # (The pure-push elicitation model keeps the stream reading across a
-            # park, so a post-approval answer now streams normally rather than
-            # relying on this fetch.)
-            latest = await omnigent.latest_assistant_message(session_id)
-            if (
-                latest is not None
-                and latest != baseline
-                and not reply.already_delivered(latest[1])
-            ):
-                reply.set_fallback_text(latest[1])
-        delivered_answer = await reply.finalize(error_text=error_text)
-        if error_text and delivered_answer:
-            await self._notifier.post_failure_reply(turn.slack_client, turn.key, error_text)
+            # Persist that this process owns the thread's live stream before the
+            # turn reaches the server. Cleared on every ending except a mid-flight
+            # cancellation, where the surviving marker tells the next follow-up
+            # that nobody is streaming this turn anymore (see _route_turn).
+            await self._mark_turn_inflight(turn.key, True)
+
+            try:
+                errored = await self._stream_turn(turn, omnigent, session_id, reply)
+            except _TurnAborted:
+                # A known mid-stream error already delivered its message and stopped
+                # the reply; nothing left to finalize.
+                return
+
+            if reply.needs_fallback_text():
+                # Last-resort safety net: the turn delivered no answer text on the
+                # stream at all. Recover the server's newest assistant message, but
+                # only when it's genuinely new: it must differ from the pre-turn
+                # baseline (else a no-answer turn like a denied approval would
+                # resurrect the PREVIOUS turn's message) AND not be something an
+                # earlier sealed segment this turn already showed (else a trailing
+                # notice would re-post the answer we just streamed). Compare the whole
+                # (id, text) tuple so an id-less message is judged by its text.
+                # (The pure-push elicitation model keeps the stream reading across a
+                # park, so a post-approval answer now streams normally rather than
+                # relying on this fetch.)
+                latest = await omnigent.latest_assistant_message(session_id)
+                if (
+                    latest is not None
+                    and latest != baseline
+                    and not reply.already_delivered(latest[1])
+                ):
+                    reply.set_fallback_text(latest[1])
+            delivered_answer = await reply.finalize(errored=errored)
+            if errored and delivered_answer:
+                # An answer streamed AND the turn errored — post the generic failure
+                # as a separate reply so the answer stays intact. The detail was
+                # already logged in _stream_turn; never echo it to the channel.
+                await self._notifier.post_failure_reply(turn.slack_client, turn.key)
+        except asyncio.CancelledError:
+            # Bot shutdown (deploy/restart) cancelled the turn mid-flight: swap
+            # the stranded "Working on it…" ack for an honest notice. The
+            # inflight marker stays set so a follow-up isn't deflected with a
+            # "still working" promise nobody will keep.
+            cancelled = True
+            await self._deliver_restart_notice(turn, reply)
+            raise
+        finally:
+            if not cancelled:
+                await self._mark_turn_inflight(turn.key, False)
 
         self._logger.info(
             "Completed Slack turn thread=%s session=%s streamed_chars=%s segments=%s errored=%s",
@@ -499,8 +698,80 @@ class SlackOmnigentService:
             session_id,
             reply.streamed_len,
             reply.segments,
-            bool(error_text),
+            errored,
         )
+
+    async def _mark_turn_inflight(self, key: ThreadKey, inflight: bool) -> None:
+        # Best-effort: marker bookkeeping must never fail or abort a turn. A
+        # missed write only degrades to the old deflection behavior.
+        try:
+            await self._store.set_turn_inflight(key, inflight)
+        except Exception:
+            self._logger.warning(
+                "Failed to persist turn-inflight=%s thread=%s", inflight, key.display()
+            )
+
+    async def _deliver_restart_notice(self, turn: SlackTurn, reply: _AnswerReply) -> None:
+        """Replace the stranded ack with an honest notice for a cancelled turn.
+
+        Best-effort and time-bounded: shutdown's gather waits on the cancelled
+        turn, so a slow or failing Slack call must not stall the restart, and
+        the caller re-raises the cancellation either way.
+        """
+        try:
+            await asyncio.wait_for(
+                reply.stop_with(_RESTART_ABANDONED_TEXT), _SHUTDOWN_NOTICE_GRACE_SECONDS
+            )
+        except asyncio.CancelledError:
+            # A second cancel arrived during the grace window: give up quietly
+            # (the caller re-raises the original cancellation).
+            self._logger.warning(
+                "Restart notice cancelled mid-delivery thread=%s", turn.key.display()
+            )
+        except Exception:
+            self._logger.warning("Failed to deliver restart notice thread=%s", turn.key.display())
+
+    async def _notify_auth_expired(self, turn: SlackTurn, reply: _AnswerReply) -> None:
+        """Deliver the expired-login re-login prompt as a DM with a setup button.
+
+        Reached when a configured user's grant can no longer be refreshed
+        (revoked, or the refresh token itself expired) or a restart dropped
+        in-memory tokens — so this must be reliably seen and actionable rather
+        than a thread ephemeral that Slack may never render. Clears the
+        "Working on it…" placeholder first so a failed turn leaves nothing behind.
+        Best-effort: a DM failure is logged, never raised (the turn is already
+        aborting). In a channel, an ephemeral pointer nudges the user to their DM;
+        in a DM the re-login post already lands in the same conversation, so no
+        redundant pointer is posted (``in_channel`` is False there).
+        """
+        await reply.stop_with("")  # clear the ack placeholder without posting text
+        try:
+            await self._setup.prompt_relogin(
+                turn.slack_client,
+                turn.owner_user_id,
+                channel=turn.key.channel_id,
+                thread_ts=turn.key.reply_ts,
+                in_channel=not turn.key.is_dm,
+            )
+        except Exception:
+            self._logger.warning("Failed to deliver re-login prompt thread=%s", turn.key.display())
+
+    async def _discard_unlaunched_session(
+        self, omnigent: OmnigentClient, session_id: str, turn: SlackTurn
+    ) -> None:
+        """Best-effort delete of a session whose runner launch failed.
+
+        A delete failure is logged and swallowed: the user's launch-failure
+        message must still be delivered.
+        """
+        try:
+            await omnigent.delete_session(session_id)
+        except Exception:
+            self._logger.warning(
+                "Failed to delete unlaunched session session_id=%s thread=%s",
+                session_id,
+                turn.key.display(),
+            )
 
     async def _ensure_session(self, turn: SlackTurn, omnigent: OmnigentClient) -> str | None:
         """Return the session id for this turn, creating one if needed.
@@ -525,25 +796,63 @@ class SlackOmnigentService:
             return None
 
         try:
-            session_id = await omnigent.create_session(turn.agent_id, turn.title)
-            runner_id = await omnigent.launch_runner(
-                session_id, workspace=turn.workspace or "", host_id=turn.host_id
+            session_id = await omnigent.create_session(
+                turn.agent_id, turn.title, host_type=turn.host_type
             )
+            runner_id: str | None = None
+            if turn.host_type == "managed":
+                # The server provisions this session's sandbox in the background,
+                # so there is no host to launch a runner on — and none is needed:
+                # the server holds the first message until the launch settles.
+                self._logger.info(
+                    "Managed session; the server provisions its host thread=%s session_id=%s",
+                    turn.key.display(),
+                    session_id,
+                )
+            else:
+                try:
+                    runner_id = await omnigent.launch_runner(
+                        session_id, workspace=turn.workspace or "", host_id=turn.host_id
+                    )
+                except Exception:
+                    # The binding write below never runs when the launch fails,
+                    # so nothing could find this session again — delete it
+                    # rather than strand it on the server (a retry creates a
+                    # fresh one).
+                    await self._discard_unlaunched_session(omnigent, session_id, turn)
+                    raise
+        except AuthRequiredError as exc:
+            # Expired/lost token: DM a re-login button rather than a plain notice.
+            self._logger.info(
+                "Session startup needs re-login thread=%s: %s", turn.key.display(), exc
+            )
+            raise _AuthExpired() from exc
         except (
-            AuthRequiredError,
             ServerUnreachableError,
             HostUnavailableError,
             HarnessNotConfiguredError,
+            RunnerUnavailableError,
         ) as exc:
             self._logger.info("Session startup failed thread=%s: %s", turn.key.display(), exc)
-            raise _TurnAborted(_turn_error_text(exc, self._server_url) or str(exc)) from exc
+            # These are curated bot-composed messages; fall back to the generic
+            # failure rather than str(exc) so no server detail can leak.
+            raise _TurnAborted(
+                _classify_turn_error(exc, self._server_url, host_type=turn.host_type)
+                or GENERIC_FAILURE_TEXT
+            ) from exc
         except Exception as exc:
             # Any other startup failure (e.g. a 500 surfaced as OmnigentError)
             # must still report rather than strand the thread on "Working on it…".
+            # The detail is logged here; the user gets a GENERIC message — the raw
+            # error can carry a stack trace / internal path and the thread is
+            # visible to the whole channel (DESIGN.md: server bodies are not echoed).
             self._logger.exception(
                 "Failed to start Omnigent session thread=%s", turn.key.display()
             )
-            raise _TurnAborted(f":warning: Omnigent request failed: {exc}") from exc
+            raise _TurnAborted(
+                ":warning: Something went wrong starting your Omnigent session. Please try "
+                "again; if it keeps happening, contact your Omnigent operator."
+            ) from exc
 
         await self._store.upsert_session(
             turn.key,
@@ -552,6 +861,7 @@ class SlackOmnigentService:
             owner_user_id=turn.owner_user_id,
             host_id=turn.host_id,
             workspace=turn.workspace,
+            host_type=turn.host_type,
         )
         self._logger.info(
             "Mapped Slack thread to new Omnigent session thread=%s session_id=%s runner_id=%s",
@@ -585,8 +895,11 @@ class SlackOmnigentService:
         omnigent: OmnigentClient,
         session_id: str,
         reply: _AnswerReply,
-    ) -> str | None:
-        """Stream the turn's events into ``reply``. Returns any error text.
+    ) -> bool:
+        """Stream the turn's events into ``reply``. Returns whether it errored.
+
+        A failure's detail is logged server-side only; the caller surfaces the
+        generic failure message (never the raw detail — see :data:`_StreamState`).
 
         Slack renders markdown server-side and owns chunking, so there's no
         mrkdwn conversion or msg_too_long handling here — just event routing.
@@ -597,29 +910,80 @@ class SlackOmnigentService:
         # Timestamp of the live plan/todo message, edited in place across updates.
         state = _StreamState()
         try:
-            async for event in omnigent.run_turn(
-                session_id, turn.text, workspace=turn.workspace, host_id=turn.host_id
-            ):
-                await self._dispatch_stream_event(event, turn, omnigent, session_id, reply, state)
+            # Explicit iteration (not ``async for``) so a gap between events can
+            # be detected: when the stream goes quiet for ``_IDLE_FLUSH_SECONDS``
+            # we force any buffered answer text onto the screen, rather than
+            # letting the SDK's size-only buffer hold it invisible until the turn
+            # ends. A single in-flight "next event" task is kept alive across
+            # idle windows (a timeout must NOT cancel it — that would end the
+            # generator); we re-await it next window.
+            events = omnigent.run_turn(
+                session_id,
+                turn.text,
+                workspace=turn.workspace,
+                host_id=turn.host_id,
+                host_type=turn.host_type,
+            ).__aiter__()
+            pending: asyncio.Task[dict[str, Any]] | None = None
+            try:
+                while True:
+                    if pending is None:
+                        pending = asyncio.ensure_future(events.__anext__())
+                    done, _ = await asyncio.wait({pending}, timeout=_IDLE_FLUSH_SECONDS)
+                    if not done:
+                        # Stream idle this window — reveal any buffered text now.
+                        await reply.flush_if_buffered()
+                        continue
+                    try:
+                        event = await pending
+                    except StopAsyncIteration:
+                        break
+                    pending = None
+                    await self._dispatch_stream_event(
+                        event, turn, omnigent, session_id, reply, state
+                    )
+            finally:
+                # Reap the in-flight read so the generator isn't left running when
+                # its scope exits (mirrors _run_turn_once's teardown).
+                if pending is not None:
+                    pending.cancel()
+                    with contextlib.suppress(asyncio.CancelledError, Exception):
+                        await pending
+        except AuthRequiredError as exc:
+            # Token expired mid-turn: DM a re-login button (see _notify_auth_expired).
+            self._logger.info(
+                "Turn needs re-login mid-stream thread=%s: %s", turn.key.display(), exc
+            )
+            await self._notify_auth_expired(turn, reply)
+            state.aborted = True
         except (
-            AuthRequiredError,
             ServerUnreachableError,
+            StreamInterruptedError,
             HostUnavailableError,
             HarnessNotConfiguredError,
+            RunnerUnavailableError,
         ) as exc:
             self._logger.info("Turn error mid-stream thread=%s: %s", turn.key.display(), exc)
-            await reply.stop_with(_turn_error_text(exc, self._server_url) or str(exc))
+            # Curated bot-composed messages; fall back to the generic failure
+            # rather than str(exc) so no server detail can leak.
+            await reply.stop_with(
+                _classify_turn_error(exc, self._server_url, host_type=turn.host_type)
+                or GENERIC_FAILURE_TEXT
+            )
             state.aborted = True
-        except Exception as exc:
+        except Exception:
+            # Log the detail here (never surfaced — it can carry a stack trace /
+            # internal path); the user gets the generic failure via ``errored``.
             self._logger.exception("Omnigent turn failed for %s", turn.key.display())
-            state.error_text = str(exc)
+            state.errored = True
         finally:
             # Settle any card still open (turn ended before its resolution push,
-            # or was torn down) so no resolver task leaks.
-            await self._elicitation.finish_pending(turn, state.elicitations)
+            # or was torn down) so no resolver task leaks; an unanswered one is
+            # declined server-side to release the park.
+            await self._elicitation.finish_pending(omnigent, turn, state.elicitations)
         if state.aborted:
             raise _TurnAborted("")  # already delivered; signal the caller to stop
-        return state.error_text
+        return state.errored
 
     async def _dispatch_stream_event(
         self,
@@ -641,7 +1005,11 @@ class SlackOmnigentService:
 
         delta = extract_delta(event)
         if delta:
-            await reply.add_delta(delta)
+            # ``message_id`` (native terminal harnesses tag each assistant message
+            # item; None for in-process streaming) lets the reply insert a
+            # paragraph break between back-to-back messages.
+            mid = event.get("message_id")
+            await reply.add_delta(delta, mid if isinstance(mid, str) else None)
             return
 
         elicitation = extract_elicitation_request(event, session_id)
@@ -678,8 +1046,12 @@ class SlackOmnigentService:
         todos = extract_todos(event)
         if todos is not None:
             # The first plan post is a new out-of-band message → seal before it;
-            # later updates edit it in place (no boundary, no fragmentation).
-            if state.todos_ts is None:
+            # later updates edit it in place (no boundary, no fragmentation). Seal
+            # ONLY when a message will actually land: an empty todos render posts
+            # nothing and leaves todos_ts None, so sealing on it would fragment the
+            # answer into extra segments with no notice between them.
+            will_post = state.todos_ts is None and format_todos(todos) is not None
+            if will_post:
                 await reply.seal_for_interruption()
             state.todos_ts = await self._notifier.post_or_update_todos(
                 client, turn.key, todos, state.todos_ts
@@ -688,16 +1060,28 @@ class SlackOmnigentService:
 
         item_text = extract_assistant_text(event)
         if item_text:
+            # ``response.output_item.done`` for an assistant message: it committed.
+            # For an id-less harness (claude-sdk) that is the only signal the
+            # message ended, so the next delta gets a break instead of running on.
+            reply.mark_message_end()
             reply.set_final(item_text)
 
         event_error = extract_error_text(event)
         if event_error:
-            state.error_text = event_error
+            # In-band server error (response.error / turn.failed). Its message can
+            # embed a stack trace / internal path, so log it and show the generic
+            # failure — do NOT echo it to the channel.
+            self._logger.warning(
+                "Omnigent in-band turn error thread=%s: %s", turn.key.display(), event_error
+            )
+            state.errored = True
 
-    async def handle_elicitation_action(self, *, elicitation_id: str, verdict: Verdict) -> bool:
+    async def handle_elicitation_action(
+        self, *, session_id: str, elicitation_id: str, verdict: Verdict
+    ) -> bool:
         """Deliver a button/form verdict (block-action handler entry point)."""
         return await self._elicitation.handle_action(
-            elicitation_id=elicitation_id, verdict=verdict
+            session_id=session_id, elicitation_id=elicitation_id, verdict=verdict
         )
 
     async def reject_non_owner_click(
@@ -738,8 +1122,15 @@ class SlackOmnigentService:
         return True, bot_user_id
 
     async def _claim_event(self, body: dict[str, Any], event: dict[str, Any]) -> bool:
-        event_id = body.get("event_id") or event.get("client_msg_id")
-        return await self._store.claim_event(str(event_id) if event_id else None)
+        return await self._store.claim_event(_event_id(body, event))
+
+    async def _unclaim_event(self, body: dict[str, Any], event: dict[str, Any]) -> None:
+        """Release the event's dedup claim (best-effort) so a failed handle retries."""
+        try:
+            await self._store.unclaim_event(_event_id(body, event))
+        except Exception:
+            # Never mask the original failure with an unclaim error.
+            self._logger.warning("Failed to unclaim Slack event after handler error")
 
     def _resolve_bot_user_id(self, context: dict[str, Any] | None) -> str | None:
         bot_user_id = None if context is None else context.get("bot_user_id")
@@ -759,20 +1150,17 @@ class SlackOmnigentService:
         return bool(bot_user_id and user_id == bot_user_id)
 
 
-def _is_direct_message(event: dict[str, Any]) -> bool:
-    # Slack marks 1:1 DMs with channel_type "im"; channel ids also start with
-    # "D". Either signal means the message reached the bot directly rather than
-    # via a channel, so no @-mention is needed to engage.
-    if event.get("channel_type") == "im":
-        return True
-    return str(event.get("channel") or "").startswith("D")
-
-
 def _team_id(body: dict[str, Any], event: dict[str, Any]) -> str:
     team_id = body.get("team_id") or event.get("team")
     if not team_id:
         raise ValueError("Slack event is missing team_id")
     return str(team_id)
+
+
+def _event_id(body: dict[str, Any], event: dict[str, Any]) -> str | None:
+    """The dedup key for a Slack event (``event_id``, else ``client_msg_id``)."""
+    event_id = body.get("event_id") or event.get("client_msg_id")
+    return str(event_id) if event_id else None
 
 
 async def _session_title(

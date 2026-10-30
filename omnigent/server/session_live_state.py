@@ -40,13 +40,15 @@ from __future__ import annotations
 import contextvars
 import logging
 import time
-from concurrent.futures import ThreadPoolExecutor
-from typing import TYPE_CHECKING
+from concurrent.futures import Future, ThreadPoolExecutor
+from typing import TYPE_CHECKING, Any
 
 from omnigent.db.enum_codecs import SESSION_LIVE_STATUS
+from omnigent.db.workspace_cache import WorkspaceScopedCache
 
 if TYPE_CHECKING:
     from omnigent.stores import ConversationStore
+    from omnigent.stores.scheduled_task_store import ScheduledTaskStore
 
 _logger = logging.getLogger(__name__)
 
@@ -58,35 +60,61 @@ _logger = logging.getLogger(__name__)
 _KNOWN_LIVE_STATUSES: frozenset[str] = frozenset(SESSION_LIVE_STATUS)
 
 _store: ConversationStore | None = None
+# Scheduled-task store for the event-driven run-completion hook. Wired
+# alongside ``_store`` by :func:`configure`; ``None`` disables the hook (the
+# runner process and unit tests that never configure it are unaffected).
+_scheduled_task_store: ScheduledTaskStore | None = None
 # Single worker => writes apply in submission order (see module docstring).
 _executor: ThreadPoolExecutor | None = None
 # Last status seen per session, for dedupe — the value whose write was
 # enqueued, or (for an unencodable status) the value whose warning was
 # already logged, so repeats of either are suppressed. Unbounded like the
 # in-memory caches these writes mirror; entries live for the process.
-_last_status: dict[str, str] = {}
+_last_status: WorkspaceScopedCache[str, str] = WorkspaceScopedCache()
 # Last count persisted per session, for dedupe.
-_last_pending: dict[str, int] = {}
+_last_pending: WorkspaceScopedCache[str, int] = WorkspaceScopedCache()
+# This process's own last touch_runner_liveness() stamp per runner id.
+# Never erased by clear_runner_liveness — only configure() resets it.
+# custom-lint: disable-next=workspace-scoped-cache -- keyed by globally-unique runner_id
+_last_liveness_stamp: dict[str, int] = {}
 
 
-def configure(store: ConversationStore | None) -> None:
+def configure(
+    store: ConversationStore | None,
+    scheduled_task_store: ScheduledTaskStore | None = None,
+) -> None:
     """
-    Wire (or clear) the conversation store live-state writes go to.
+    Wire (or clear) the stores live-state writes go to.
 
     :param store: The server's conversation store, or ``None`` to
         disable persistence (tests / non-server processes).
+    :param scheduled_task_store: The server's scheduled-task store, enabling
+        the event-driven run-completion hook
+        (:func:`persist_scheduled_run_completion`); ``None`` disables it.
     """
-    global _store
+    global _store, _scheduled_task_store
     _store = store
+    _scheduled_task_store = scheduled_task_store
     _last_status.clear()
     _last_pending.clear()
+    _last_liveness_stamp.clear()
 
 
-def _submit(description: str, fn, *args, on_failure=None) -> None:  # type: ignore[no-untyped-def]
+def conversation_store() -> ConversationStore | None:
     """
-    Run one store write on the ordered background worker.
+    Return the conversation store wired by :func:`configure`.
 
-    The write runs inside a snapshot of the *caller's* ``contextvars``
+    :returns: The server's conversation store, or ``None`` when live-state
+        persistence is disabled (tests / non-server processes).
+    """
+    return _store
+
+
+def submit(description: str, fn, *args, on_failure=None) -> Future[Any]:  # type: ignore[no-untyped-def]
+    """
+    Run one store-backed task on the ordered background worker.
+
+    The task runs inside a snapshot of the *caller's* ``contextvars``
     (``copy_context().run``). The store filters every query on
     ``current_workspace_id()``, a ``ContextVar`` the multi-tenant request
     middleware binds per request via ``workspace_scope``; a bare
@@ -103,6 +131,7 @@ def _submit(description: str, fn, *args, on_failure=None) -> None:  # type: igno
         thread) when the write raises. Used to evict a dedupe entry so a
         dropped write's value can be re-attempted by the next identical
         publish instead of being swallowed.
+    :returns: Future containing the result, or ``None`` after a logged write failure.
     """
     global _executor
     if _executor is None:
@@ -110,15 +139,15 @@ def _submit(description: str, fn, *args, on_failure=None) -> None:  # type: igno
 
     ctx = contextvars.copy_context()
 
-    def _run() -> None:
+    def _run() -> Any:
         try:
-            fn(*args)
-        except Exception:  # noqa: BLE001 — best-effort display state
+            return fn(*args)
+        except Exception:  # best-effort display state
             _logger.warning("session live-state write failed (%s)", description, exc_info=True)
             if on_failure is not None:
                 on_failure()
 
-    _executor.submit(ctx.run, _run)
+    return _executor.submit(ctx.run, _run)
 
 
 def persist_live_status(session_id: str, status: str) -> None:
@@ -161,7 +190,73 @@ def persist_live_status(session_id: str, status: str) -> None:
         if _last_status.get(session_id) == status:
             _last_status.pop(session_id, None)
 
-    _submit("live_status", _store.set_session_live_status, session_id, status, on_failure=_evict)
+    submit("live_status", _store.set_session_live_status, session_id, status, on_failure=_evict)
+
+
+def forget_live_status(session_id: str) -> None:
+    """Drop this process's dedupe state for a session handed to another replica."""
+    _last_status.pop(session_id, None)
+
+
+def persist_scheduled_run_completion(
+    conversation_id: str,
+    run_status: str,
+    *,
+    error_code: str | None = None,
+    error: str | None = None,
+) -> None:
+    """Transition a scheduled-task run to terminal when its turn ends.
+
+    The event-driven completion mechanism: called from ``_publish_status``
+    wherever a session reaches a durable terminal edge (``idle`` = the turn
+    completed, ``failed`` = it errored/disconnected). Most conversations are
+    not scheduled-task fires, so the reverse lookup returns ``None`` and this
+    is a cheap no-op; only a fired conversation with a still-``running`` run
+    gets transitioned.
+
+    Runs on the SAME ordered single-worker executor as
+    :func:`persist_live_status`, inside a copy of the caller's ``contextvars``
+    (see :func:`_submit`). This is load-bearing: the store filters every query
+    on ``current_workspace_id()``, and the reverse lookup + ``update_run`` must
+    resolve to the fired run's workspace — the relay call site's
+    ``workspace_scope`` reaches the worker thread exactly as it does for the
+    ``live_status`` mirror. A bare executor would run at workspace 0 and match
+    no rows on a multi-tenant replica.
+
+    Idempotent by construction: ``update_run`` is conditional on
+    ``WHERE status = running``, so a run already terminal (a fire-time
+    ``skipped``/``failed``, or the startup/lazy backstop) is never clobbered
+    and a terminal edge seen twice transitions at most once. Best-effort like
+    the other writes here — a failure logs and is dropped; the backstop
+    (startup sweep / lazy-on-read) is the durability guarantee for the rare
+    dropped-write or restart-in-flight case.
+
+    :param conversation_id: The fired conversation whose turn just ended.
+    :param run_status: Terminal run status to set — ``"succeeded"`` (turn
+        completed) or ``"failed"`` (turn errored/cancelled/disconnected).
+    :param error_code: Short failure classification when ``run_status`` is
+        ``"failed"`` (e.g. the conversation's ``last_task_error_code``).
+    :param error: Optional human-readable failure detail for ``"failed"``.
+    """
+    store = _scheduled_task_store
+    if store is None:
+        return
+
+    def _transition() -> None:
+        run = store.get_running_run_by_conversation(conversation_id)
+        if run is None:
+            # Not a scheduled fire, or its run is already terminal — nothing to
+            # do. This is the common case (interactive sessions).
+            return
+        store.update_run(
+            run.id,
+            status=run_status,
+            finished_at=int(time.time()),
+            error=error,
+            error_code=error_code,
+        )
+
+    submit("scheduled_run_completion", _transition)
 
 
 def persist_pending_count(conversation_id: str, count: int) -> None:
@@ -184,7 +279,7 @@ def persist_pending_count(conversation_id: str, count: int) -> None:
         if _last_pending.get(conversation_id) == count:
             _last_pending.pop(conversation_id, None)
 
-    _submit(
+    submit(
         "pending_count",
         _store.set_pending_elicitation_count,
         conversation_id,
@@ -206,11 +301,34 @@ def touch_runner_liveness(runner_ids: list[str]) -> None:
     the owning workspace on a multi-tenant replica. It mirrors how the
     host tunnel refreshes ``host_store.heartbeat`` from its ping loop.
 
+    Also records the stamp in :func:`last_liveness_stamp`, so a later
+    disconnect on this same replica can tell its own writes apart from a
+    fresher one another replica made after the runner re-tunnelled there.
+
     :param runner_ids: Runner ids with a live tunnel. Empty = no-op.
     """
     if _store is None or not runner_ids:
         return
-    _submit("runner_liveness", _store.touch_runner_liveness, list(runner_ids), int(time.time()))
+    now = int(time.time())
+    for runner_id in runner_ids:
+        _last_liveness_stamp[runner_id] = now
+    submit("runner_liveness", _store.touch_runner_liveness, list(runner_ids), now)
+
+
+def last_liveness_stamp(runner_id: str) -> int | None:
+    """
+    Return the last ``runner_last_seen`` value THIS process itself stamped.
+
+    Lets a disconnect handler distinguish a stamp another replica wrote
+    after the runner re-tunnelled there from one this replica wrote
+    itself, without racing the best-effort write's own executor.
+
+    :param runner_id: Runner id to look up.
+    :returns: The epoch-second value from this process's most recent
+        :func:`touch_runner_liveness` call naming *runner_id*, or
+        ``None`` if it never stamped one.
+    """
+    return _last_liveness_stamp.get(runner_id)
 
 
 def clear_runner_liveness(runner_id: str) -> None:
@@ -219,10 +337,18 @@ def clear_runner_liveness(runner_id: str) -> None:
 
     Flips the sidebar offline immediately instead of waiting out the
     freshness TTL. An ungraceful death (host / replica crash) never
-    reaches this — the TTL self-corrects it.
+    reaches this — the TTL self-corrects it. Passes this process's own
+    last stamp as ``not_after``, so the clear can never erase a fresher
+    stamp another replica already wrote for a runner that re-tunnelled
+    there before this disconnect was processed.
 
     :param runner_id: The disconnected runner's id.
     """
     if _store is None:
         return
-    _submit("runner_liveness_clear", _store.clear_runner_liveness, runner_id)
+    submit(
+        "runner_liveness_clear",
+        _store.clear_runner_liveness,
+        runner_id,
+        last_liveness_stamp(runner_id),
+    )

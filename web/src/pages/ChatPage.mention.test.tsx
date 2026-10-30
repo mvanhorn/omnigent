@@ -1,6 +1,14 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import type * as UseWorkspaceChangedFilesModule from "@/hooks/useWorkspaceChangedFiles";
+import type * as UseSessionModule from "@/hooks/useSession";
+import type * as UseHostsModule from "@/hooks/useHosts";
+import type * as RunnerHealthProviderModule from "@/hooks/RunnerHealthProvider";
+import type * as AgentLabelsModule from "@/lib/agentLabels";
+import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
+import type * as UseHarnessInventoryModule from "@/hooks/useHarnessInventory";
+
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { ReactElement } from "react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { useChatStore } from "@/store/chatStore";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
@@ -34,7 +42,7 @@ function resetWorkspaceMock() {
   ws.dirLoading = false;
 }
 vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("@/hooks/useWorkspaceChangedFiles")>();
+  const actual = await importOriginal<typeof UseWorkspaceChangedFilesModule>();
   return {
     ...actual,
     useWorkspaceAllFiles: () => ({
@@ -47,23 +55,43 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => {
     }),
   };
 });
+
+// ComposerStatusLine's PR link reads GitHub info via a TanStack query; stub it
+// (default: no PR) so bare Composer renders don't need a QueryClientProvider.
+vi.mock("@/hooks/usePullRequests", () => ({
+  usePullRequestInfo: () => ({ data: undefined }),
+}));
+vi.mock("@/hooks/useComposerGitStatus", () => ({
+  useComposerGitStatus: () => ({ branchState: "unknown", prCount: 0 }),
+}));
+vi.mock("@/hooks/useSkills", () => ({
+  useSkills: () => ({ skills: [], skillsStatus: "ready", refetch: vi.fn() }),
+}));
+vi.mock("@/hooks/useHarnessInventory", async (importOriginal) => ({
+  ...(await importOriginal<typeof UseHarnessInventoryModule>()),
+  useHostMcpServers: () => ({ data: [], isLoading: false, isError: false }),
+}));
+vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
+  ...(await importOriginal<typeof UseChildSessionsModule>()),
+  useChildSessions: () => ({ children: [] }),
+}));
 // HostBadge now renders in the composer's status-line tray and reads the
 // session's host binding via TanStack Query. Stub the hooks so it self-hides
 // (no host bound) without needing a QueryClient provider around these renders.
 vi.mock("@/hooks/useSession", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("@/hooks/useSession")>()),
+  ...(await importOriginal<typeof UseSessionModule>()),
   useSession: () => ({ session: { hostId: null }, isLoading: false, error: null }),
 }));
 vi.mock("@/hooks/useHosts", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("@/hooks/useHosts")>()),
+  ...(await importOriginal<typeof UseHostsModule>()),
   useHosts: () => ({ data: [] }),
 }));
 vi.mock("@/hooks/RunnerHealthProvider", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("@/hooks/RunnerHealthProvider")>()),
+  ...(await importOriginal<typeof RunnerHealthProviderModule>()),
   useSessionHostOnline: () => undefined,
 }));
 vi.mock("@/lib/agentLabels", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("@/lib/agentLabels")>()),
+  ...(await importOriginal<typeof AgentLabelsModule>()),
   useBrainHarnessLabels: () => ({
     "claude-sdk": "Claude SDK",
     codex: "Codex",
@@ -82,6 +110,7 @@ function composerProps(overrides: Partial<Parameters<typeof Composer>[0]> = {}) 
     isWorking: false,
     disabled: false,
     onSend: vi.fn(),
+    onNewSession: vi.fn(),
     onStop: vi.fn(),
     agents: undefined,
     agentsLoading: false,
@@ -89,9 +118,6 @@ function composerProps(overrides: Partial<Parameters<typeof Composer>[0]> = {}) 
     onSelectAgent: vi.fn(),
     permissionLevel: null,
     readOnlyReason: null,
-    replyQuotes: [],
-    onRemoveQuote: vi.fn(),
-    onClearAllQuotes: vi.fn(),
     effortLevels: ["low", "medium", "high"] as const,
     showEffort: true,
     showModels: false,
@@ -220,6 +246,29 @@ describe("Composer @-file-mention browser (native sessions)", () => {
     type("@");
     expect(screen.getByTitle("Open src")).toBeInTheDocument();
     expect(screen.getByTitle("Attach readme.md")).toBeInTheDocument();
+  });
+
+  it("gives Shift+Tab to the open menu before the permission-mode shortcut", async () => {
+    const { setClaudePermissionMode } = useChatStore.getState();
+    // Zustand copies the spy into later states, so put the real setter back.
+    onTestFinished(() =>
+      useChatStore.setState({ setClaudePermissionMode, claudePermissionMode: "" }),
+    );
+    useChatStore.setState({ claudePermissionMode: "default" });
+    const setMode = vi
+      .spyOn(useChatStore.getState(), "setClaudePermissionMode")
+      .mockResolvedValue(undefined);
+    renderWithTooltips(<Composer {...composerProps({ showClaudePermissionMode: true })} />);
+    type("@");
+    expect(screen.getByTitle("Attach readme.md")).toBeInTheDocument();
+
+    fireEvent.keyDown(textarea(), { key: "Tab", shiftKey: true });
+    expect(screen.getByText("@src/")).toBeInTheDocument();
+    expect(setMode).not.toHaveBeenCalled();
+
+    // Attaching a folder closes the menu, so the next press cycles the mode.
+    fireEvent.keyDown(textarea(), { key: "Tab", shiftKey: true });
+    await waitFor(() => expect(setMode).toHaveBeenCalledWith("auto"));
   });
 
   it("opens a folder to reveal nested files, then delivers the chosen file", () => {

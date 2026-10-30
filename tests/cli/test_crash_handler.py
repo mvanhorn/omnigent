@@ -103,12 +103,34 @@ def test_command_line_redacts_tokens_in_argv(
 def test_save_report_writes_and_rotates(data_dir: Path) -> None:
     ch.install_crash_handler("omnigent", "omnigent-ai/omnigent", keep_reports=2)
     paths = [ch._save_report(f"report {i}\n") for i in range(5)]
-    assert all(p.exists() for p in paths)
+    # The newest report always survives its own rotation pass. Earlier paths
+    # may legitimately be gone: rotation prunes between saves, which also frees
+    # those names for reuse — so this deliberately does not assert 5 distinct
+    # paths (see test_save_report_keeps_every_same_second_report, which pins
+    # the no-overwrite guarantee with rotation held wide).
+    assert paths[-1].exists()
     # Only the newest 2 remain on disk.
     remaining = sorted((data_dir / "crashes").glob("crash-*.md"))
     assert len(remaining) == 2
     # Permissions are tight.
     assert all((p.stat().st_mode & 0o077) == 0 for p in remaining)
+
+
+def test_save_report_keeps_every_same_second_report(data_dir: Path) -> None:
+    """Repeated crashes inside one second/process must not overwrite each other.
+
+    The regression: the same-second fallback disambiguated by pid alone, so a
+    process crashing more than twice per second reused one filename and every
+    report but the last was silently destroyed. Rotation is held wide here so
+    only overwriting could lose a report.
+    """
+    ch.install_crash_handler("omnigent", "omnigent-ai/omnigent", keep_reports=10)
+    paths = [ch._save_report(f"report {i}\n") for i in range(5)]
+
+    assert len(set(paths)) == 5
+    assert {p.read_text(encoding="utf-8").strip() for p in paths} == {
+        f"report {i}" for i in range(5)
+    }
 
 
 def test_save_report_collision_disambiguates(data_dir: Path) -> None:
@@ -228,7 +250,9 @@ def test_traceback_shows_exception_message_lines(data_dir: Path) -> None:
     assert 'in "<unicode string>"' in out
 
 
-def test_first_party_sdk_shown_even_in_site_packages(data_dir: Path, tmp_path: Path) -> None:
+def test_first_party_sdk_shown_even_in_site_packages(
+    data_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """A core SDK package installed into site-packages stays visible.
 
     In a shipped wheel the SDKs (``omnigent_client``, ``omnigent_ui_sdk``)
@@ -239,8 +263,11 @@ def test_first_party_sdk_shown_even_in_site_packages(data_dir: Path, tmp_path: P
     """
     import importlib.util
 
-    sp = crash_ui._site_packages_dir()
-    assert sp, "test requires a venv site-packages on sys.path"
+    # Keep the installed environment read-only, as it is in the test sandbox.
+    sp = tmp_path / "site-packages"
+    sp.mkdir()
+    monkeypatch.syspath_prepend(str(sp))
+    assert crash_ui._site_packages_dir() == str(sp)
     fake = os.path.join(sp, "omnigent_client")
     os.makedirs(fake, exist_ok=True)
     probe = os.path.join(fake, "_probe.py")
@@ -254,14 +281,8 @@ def test_first_party_sdk_shown_even_in_site_packages(data_dir: Path, tmp_path: P
     except Exception as e:
         exc, tb = e, e.__traceback__
     # cwd outside site-packages, as in a real install.
-    import os as _os
-
-    old = _os.getcwd()
-    _os.chdir(str(tmp_path))
-    try:
-        out = crash_ui.format_traceback(exc, tb, colored=False, unicode_ok=True)
-    finally:
-        _os.chdir(old)
+    monkeypatch.chdir(tmp_path)
+    out = crash_ui.format_traceback(exc, tb, colored=False, unicode_ok=True)
     assert "omnigent_client/_probe.py" in out  # shown, not collapsed
     assert "frames hidden in omnigent_client" not in out
     assert "sdk probe" in out

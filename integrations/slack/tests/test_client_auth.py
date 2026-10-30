@@ -3,8 +3,14 @@ from __future__ import annotations
 import asyncio
 
 import httpx
+import pytest
 import respx
-from omnigent_slack.omnigent import ClientAuth, OmnigentClient, OmnigentClientPool
+from omnigent_slack.omnigent import (
+    AuthRequiredError,
+    ClientAuth,
+    OmnigentClient,
+    OmnigentClientPool,
+)
 
 _BASE = "http://omnigent.test"
 
@@ -47,6 +53,68 @@ async def test_refresh_on_401_then_retry() -> None:
         await client.aclose()
     assert calls == ["Bearer tok-1", "Bearer tok-2"]
     assert auth.access_token == "tok-2"
+
+
+@respx.mock
+async def test_refresh_on_proxy_redirect_then_retry() -> None:
+    # A Databricks-App proxy returns a 3xx→login (not 401) for an expired token.
+    # Refresh must still fire on that auth wall, else tokens never rotate and the
+    # session dies at the ~1h access-token expiry.
+    calls: list[str | None] = []
+
+    def _record(request: httpx.Request) -> httpx.Response:
+        calls.append(request.headers.get("Authorization"))
+        if len(calls) == 1:
+            return httpx.Response(
+                302, headers={"location": "https://ws.example.com/oidc/v1/authorize"}
+            )
+        return httpx.Response(200, json={"status": "ok"})
+
+    respx.get(_BASE + "/health").mock(side_effect=_record)
+
+    async def _refresh() -> str | None:
+        return "tok-2"
+
+    auth = ClientAuth("tok-1", _refresh)
+    client = OmnigentClient(_BASE, auth=auth)
+    try:
+        await client.check_health()
+    finally:
+        await client.aclose()
+    assert calls == ["Bearer tok-1", "Bearer tok-2"]
+    assert auth.access_token == "tok-2"
+
+
+@respx.mock
+async def test_benign_redirect_does_not_trigger_refresh() -> None:
+    # A legitimate (non-auth) 3xx — e.g. a canonical/trailing-slash redirect —
+    # must NOT be treated as an auth wall: no refresh (which would burn a
+    # single-use rotating token) and no re-request of a possibly non-idempotent
+    # call. The response is returned as-is.
+    calls: list[str | None] = []
+    refreshed = False
+
+    def _record(request: httpx.Request) -> httpx.Response:
+        calls.append(request.headers.get("Authorization"))
+        return httpx.Response(307, headers={"location": "https://omnigent.test/v1/agents/"})
+
+    respx.get(_BASE + "/health").mock(side_effect=_record)
+
+    async def _refresh() -> str | None:
+        nonlocal refreshed
+        refreshed = True
+        return "tok-2"
+
+    auth = ClientAuth("tok-1", _refresh)
+    client = OmnigentClient(_BASE, auth=auth)
+    try:
+        resp = await client._request("GET", "/health")
+    finally:
+        await client.aclose()
+    assert resp.status_code == 307
+    assert calls == ["Bearer tok-1"]  # requested once, not retried
+    assert refreshed is False  # no token burned
+    assert auth.access_token == "tok-1"
 
 
 async def test_concurrent_refresh_rotates_once() -> None:
@@ -117,6 +185,58 @@ async def test_invalidate_rebuilds_client_with_new_token() -> None:
         assert after is not before
         assert after._auth is not None
         assert after._auth.access_token == "tok-1"
+    finally:
+        await pool.aclose_all()
+
+
+@pytest.mark.parametrize("user_id", ["", "U1"])
+@respx.mock(assert_all_called=False)
+async def test_pool_requires_user_token_even_when_server_accepts_anonymous(
+    user_id: str,
+    respx_mock: respx.MockRouter,
+) -> None:
+    anonymous = respx_mock.route().mock(return_value=httpx.Response(200, json={"data": []}))
+
+    async def tokenless_user(server_url: str, resolved_user_id: str) -> None:
+        assert server_url == _BASE
+        assert resolved_user_id == user_id
+        return
+
+    pool = OmnigentClientPool(auth_resolver=tokenless_user if user_id else None)
+    try:
+        client = await pool.get(_BASE, user_id)
+        with pytest.raises(AuthRequiredError):
+            await client.list_agents()
+        with pytest.raises(AuthRequiredError):
+            async with client.stream_session_events("session-1"):
+                pytest.fail("Unauthenticated stream must not open")
+        assert not anonymous.called
+    finally:
+        await pool.aclose_all()
+
+
+@respx.mock(assert_all_called=False)
+async def test_cached_pool_client_fails_closed_after_token_is_cleared(
+    respx_mock: respx.MockRouter,
+) -> None:
+    auth = ClientAuth("token", _no_refresh)
+
+    async def resolver(server_url: str, user_id: str) -> ClientAuth:
+        return auth
+
+    route = respx_mock.get(_BASE + "/v1/agents").respond(200, json={"data": []})
+    pool = OmnigentClientPool(auth_resolver=resolver)
+    try:
+        client = await pool.get(_BASE, "U1")
+        await client.list_agents()
+        auth.access_token = None
+        with pytest.raises(AuthRequiredError):
+            await client.list_agents()
+        with pytest.raises(AuthRequiredError):
+            async with client.stream_session_events("session-1"):
+                pytest.fail("A cleared cached token must not open a stream")
+        assert route.call_count == 1
+        assert respx_mock.calls.call_count == 1
     finally:
         await pool.aclose_all()
 

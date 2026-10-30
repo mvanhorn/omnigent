@@ -187,6 +187,7 @@ def _mint_loopback_cli_token(
     base_url: str,
     cookie_secret: bytes,
     session_ttl_hours: int,
+    account_generation: str | None = None,
 ) -> bool:
     """Write a fresh CLI session token for a loopback server spawn.
 
@@ -223,6 +224,7 @@ def _mint_loopback_cli_token(
             cookie_secret=cookie_secret,
             ttl_hours=session_ttl_hours,
             provider="accounts",
+            account_generation=account_generation,
         )
         cli_auth.store_token(
             server_url=base_url,
@@ -258,17 +260,17 @@ def bootstrap_admin(
       creates with that password. Skips the auto-handoff entirely
       (the operator already knows the credential and wants the
       standard typed-login flow).
-    - ``admin`` missing, no pre-seed → mints a fresh random
-      password, writes it to stderr + the credentials file,
-      creates the user. ON LOOPBACK base URL ONLY: also mints
-      a magic-redeem URL + a CLI session token so the browser
-      and TUI sign in without typing.
+    - ``admin`` missing, no pre-seed → creates nothing and reports
+      ``needs_setup=True`` so the operator claims the first admin
+      through the web Create-admin form (``POST /auth/setup``) or a
+      terminal prompt. No password is ever auto-generated. On a
+      loopback base URL, ``open_url`` is set so the lifespan opens
+      the browser to that form; otherwise the "no admin yet" URL is
+      printed to stderr.
 
-    Ordering: the user row is persisted BEFORE the handoff tokens
-    so a token can never reference a non-existent user. If row
-    creation fails, no tokens are minted and the credentials
-    file's password is orphaned — recoverable by deleting the
-    file and rebooting.
+    Ordering (pre-seed path only): the user row is persisted BEFORE
+    any loopback handoff tokens so a token can never reference a
+    non-existent user.
 
     :param account_store: The accounts-specific store backing user
         identity + tokens. Mutually exclusive with PermissionStore
@@ -319,12 +321,14 @@ def bootstrap_admin(
         refreshed = False
         if base_url is not None and cookie_secret is not None and _is_loopback_base_url(base_url):
             local_admin = _local_admin_username(account_store)
-            if local_admin is not None:
+            account = account_store.get_user(local_admin) if local_admin is not None else None
+            if account is not None:
                 refreshed = _mint_loopback_cli_token(
-                    local_admin,
+                    account.id,
                     base_url=base_url,
                     cookie_secret=cookie_secret,
                     session_ttl_hours=session_ttl_hours,
+                    account_generation=account.account_generation,
                 )
         return BootstrapResult(
             fresh_boot=False, needs_setup=False, open_url=None, tui_token_written=refreshed
@@ -361,7 +365,7 @@ def bootstrap_admin(
     # idempotency path. Both supplied the same INIT password, so there's
     # no asymmetry.
     try:
-        account_store.create_user_with_password(
+        account = account_store.create_user_with_password(
             admin_username,
             hash_password(init_admin_password),
             is_admin=True,
@@ -382,6 +386,7 @@ def bootstrap_admin(
             base_url=base_url,
             cookie_secret=cookie_secret,
             session_ttl_hours=session_ttl_hours,
+            account_generation=account.account_generation,
         )
 
     return BootstrapResult(
