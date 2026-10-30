@@ -10,16 +10,22 @@
 //   Existing comments highlight the lines they span. Clicking inside a
 //   highlighted range navigates to that comment in CommentsPanel.
 
+import { useFileViewer, type FilePosition } from "./FileViewerContext";
+import { isFilePositionPending } from "./filePositionState";
 import { createPortal } from "react-dom";
+import { ADD_COMMENT_BUTTON_CLASS_NAME } from "./addCommentButtonStyles";
 import {
+  createContext,
   isValidElement,
   lazy,
   Suspense,
   useCallback,
+  useContext,
   useEffect,
   useMemo,
   useRef,
   useState,
+  type ComponentPropsWithoutRef,
   type ReactNode,
   type RefObject,
   type UIEvent,
@@ -36,14 +42,17 @@ import { useChatStore } from "@/store/chatStore";
 import { nativeCodingAgentForHarness } from "@/lib/nativeCodingAgents";
 import type { BundledLanguage, ThemedToken } from "shiki";
 import { highlightCode } from "@/components/ai-elements/code-block";
+import { normalizeExplicitMathDelimiters } from "@/components/ai-elements/mathMarkdown";
 import ReactMarkdown, { type Components, type Options } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import remarkEmoji from "remark-emoji";
 import rehypeRaw from "rehype-raw";
 import rehypeSanitize, { defaultSchema } from "rehype-sanitize";
 import { rehypeGithubAlerts } from "rehype-github-alerts";
-import { mermaid } from "@streamdown/mermaid";
-import { Streamdown } from "streamdown";
+import rehypeSlug from "rehype-slug";
+import { createMathPlugin } from "@streamdown/math";
+import { ExternalPreviewLink } from "./ExternalPreviewLink";
+import { MermaidPreview } from "./MermaidPreview";
 import type { Comment } from "@/hooks/useComments";
 import {
   type FileContentResponse,
@@ -53,6 +62,7 @@ import {
 import { useCanEdit } from "@/hooks/usePermissions";
 import { cn } from "@/lib/utils";
 import { MarkdownRichTextViewer } from "./MarkdownRichTextViewer";
+import { isWorkspaceRelativeSrc, resolveWorkspacePath } from "./TipTapWorkspaceImage";
 import {
   type ActiveSelection,
   type SaveStatus,
@@ -71,13 +81,16 @@ import { useScrollRestore } from "./useScrollRestore";
 import { PreviewSearchBar } from "./PreviewSearchBar";
 import { renderLineTokens } from "./codeViewerRendering";
 import { HtmlCommentViewer } from "./HtmlCommentViewer";
+import { PreviewCommentBanner } from "./PreviewCommentBanner";
 import { TruncatedBanner } from "./TruncatedBanner";
 import { useLightbox } from "@/components/ImageLightbox";
 import { getEmbedRoot } from "@/lib/host";
+import { hasCommandModifier } from "@/lib/hotkeys";
+import { MarkdownTableOfContents } from "./MarkdownTableOfContents";
+import { VideoPlayer } from "@/components/VideoPlayer";
+import { isVideoFile } from "@/lib/video";
 
-// Monaco is heavy (~MBs + worker); load it only when a non-markdown file is
-// actually viewed, so the initial bundle and markdown/preview paths don't pay
-// for it.
+// Lazy-load Monaco so small Markdown and preview surfaces avoid its bundle.
 const MonacoCodeEditor = lazy(() =>
   import("./MonacoCodeEditor").then((m) => ({ default: m.MonacoCodeEditor })),
 );
@@ -97,11 +110,18 @@ const ModelViewer = lazy(() => import("./ModelViewer").then((m) => ({ default: m
 
 // Width of the line-number gutter — must match the `w-12` Tailwind class on the gutter div.
 const GUTTER_WIDTH = 48;
+const EMPTY_COMMENTS: Comment[] = [];
+
+// Same TeX math config as chat (see streamdown-security.ts): only `$$…$$` opens
+// math so a lone `$` stays prose. Wraps remark-math + rehype-katex, whose plugin
+// tuples slot straight into react-markdown, so the preview renders formulas the
+// way the chat surface already does.
+const MATH_PLUGIN = createMathPlugin({ singleDollarTextMath: false });
 
 // GFM covers tables, task lists, strikethrough, and autolinks; remark-emoji
 // renders GitHub-style `:shortcode:` emoji as their unicode glyphs so docs read
-// the same here as on GitHub.
-const MARKDOWN_REMARK_PLUGINS = [remarkGfm, remarkEmoji];
+// the same here as on GitHub. remark-math parses `$$…$$` into math nodes.
+const MARKDOWN_REMARK_PLUGINS = [remarkGfm, remarkEmoji, MATH_PLUGIN.remarkPlugin];
 
 // rehype-github-alerts turns `> [!NOTE]` blockquotes into GitHub's
 // `<div class="markdown-alert markdown-alert-note">…` callout markup (GFM
@@ -115,13 +135,19 @@ const ALERT_TITLE_CLASS = /^markdown-alert-title$/;
 // on the alert wrapper div (markdown-alert*) and its title p (markdown-alert-
 // title) only for those exact tokens. Everything else — <script>, event
 // handlers, javascript: URLs, arbitrary classes — is still stripped, so raw
-// HTML in a .md file stays safe to render inline.
+// HTML in a .md file stays safe to render inline. Keep hast-util-sanitize's
+// default `clobberPrefix: "user-content-"`: heading IDs derive from untrusted
+// markdown (rehype-slug), and the prefix keeps them from clobbering named DOM
+// access or app-owned ids. The TOC reads `el.id` off the rendered DOM, so it
+// works regardless of the prefix.
+// Allow common img attributes (alt, width, height, align, valign) that GitHub supports.
 const MARKDOWN_SANITIZE_SCHEMA = {
   ...defaultSchema,
   attributes: {
     ...defaultSchema.attributes,
     div: [...(defaultSchema.attributes?.div ?? []), ["className", ALERT_CLASS]],
     p: [...(defaultSchema.attributes?.p ?? []), ["className", ALERT_TITLE_CLASS]],
+    img: [...(defaultSchema.attributes?.img ?? []), "alt", "width", "height", "align", "valign"],
   },
 };
 
@@ -130,25 +156,19 @@ const MARKDOWN_SANITIZE_SCHEMA = {
 // drops by default, showing the escaped tags as literal text. rehype-raw parses
 // that HTML; rehype-sanitize then strips anything unsafe (<script>, event
 // handlers, javascript: URLs) so this stays safe to render inline without an
-// iframe. Order matters: alerts transform before sanitize, and sanitize runs
-// last, after raw parsing and GFM.
+// iframe. Order matters: alerts transform before sanitize, slug adds IDs to
+// headings, and sanitize runs after raw parsing and GFM — only KaTeX comes
+// later, rendering math from the already-sanitized tree.
 const MARKDOWN_REHYPE_PLUGINS: Options["rehypePlugins"] = [
   rehypeRaw,
+  rehypeSlug,
   rehypeGithubAlerts,
   [rehypeSanitize, MARKDOWN_SANITIZE_SCHEMA],
+  // After sanitize: sanitize neutralises the untrusted markdown/HTML, leaving the
+  // `language-math` code nodes as plain text; KaTeX then renders that trusted
+  // output. Running KaTeX before sanitize would strip its MathML/spans as unknown.
+  MATH_PLUGIN.rehypePlugin,
 ];
-
-const MERMAID_STREAMDOWN_PLUGINS = { mermaid };
-
-function MermaidPreview({ source }: { source: string }) {
-  return (
-    <div data-testid="mermaid-preview" className="not-prose my-4 overflow-auto">
-      <Streamdown plugins={MERMAID_STREAMDOWN_PLUGINS}>
-        {`\`\`\`mermaid\n${source.replace(/\n$/, "")}\n\`\`\``}
-      </Streamdown>
-    </div>
-  );
-}
 
 // Tailwind Preflight applies `img { height: auto }`, which overrides the HTML
 // `width`/`height` *attributes* (presentational hints lose to any author CSS).
@@ -156,12 +176,76 @@ function MermaidPreview({ source }: { source: string }) {
 // which does win the cascade — for the one image being rendered. This runs
 // after sanitize (React components render the already-sanitized tree), so it
 // adds no attack surface. Only literal integer pixel values are forwarded.
+// Path of the previewed file, so a relative link resolves against its directory.
+const MarkdownPreviewPathContext = createContext<string | null>(null);
+
+/**
+ * Anchor for the Markdown preview. A link to another workspace file (`notes.md`,
+ * `../docs/`) opens in the FileViewer: as a plain anchor the browser resolves it
+ * against the app URL (`/c/<id>` → `/c/notes.md`) and loads a session that
+ * doesn't exist. URLs and `mailto:` links open outside the app window (see
+ * ExternalPreviewLink); in-page `#` links keep their href.
+ */
+function MarkdownPreviewLink({
+  href,
+  children,
+  node: _node,
+  ...props
+}: ComponentPropsWithoutRef<"a"> & { node?: unknown }) {
+  const openFile = useFileViewer();
+  const filePath = useContext(MarkdownPreviewPathContext);
+  if (href && !isWorkspaceRelativeSrc(href)) {
+    return (
+      <ExternalPreviewLink href={href} {...props}>
+        {children}
+      </ExternalPreviewLink>
+    );
+  }
+  if (!href || href.startsWith("#")) {
+    return (
+      <a href={href} {...props}>
+        {children}
+      </a>
+    );
+  }
+  const target = filePath === null ? "" : resolveWorkspacePath(filePath, href);
+  if (!openFile || !target) {
+    return (
+      <span className={props.className} title={href}>
+        {children}
+      </span>
+    );
+  }
+  // No href, so a modified or middle click can't open the bogus app URL either.
+  return (
+    <a
+      {...props}
+      role="button"
+      tabIndex={0}
+      title={props.title ?? href}
+      className={cn("cursor-pointer", props.className)}
+      onClick={() => openFile(target)}
+      onKeyDown={(e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          openFile(target);
+        }
+      }}
+    >
+      {children}
+    </a>
+  );
+}
+
 const MARKDOWN_COMPONENTS: Components = {
+  a: MarkdownPreviewLink,
   pre({ children, ...props }) {
     const child = isValidElement(children) ? children : null;
     if (
       isValidElement<{ className?: string; children?: ReactNode }>(child) &&
-      child.props.className?.split(/\s+/).includes("language-mermaid")
+      // Match case-insensitively so a cased fence (```Mermaid) renders a diagram
+      // in the read-only preview too, matching the editor's detection.
+      child.props.className?.split(/\s+/).some((c) => c.toLowerCase() === "language-mermaid")
     ) {
       return <MermaidPreview source={String(child.props.children ?? "")} />;
     }
@@ -181,27 +265,52 @@ const MARKDOWN_COMPONENTS: Components = {
 
 function MarkdownPreview({
   content,
+  path,
   rootRef,
   onScroll,
+  tocOpen,
+  onTocOpenChange,
 }: {
   content: string;
+  /** Workspace path of the previewed file, e.g. ``"docs/README.md"``. */
+  path: string | null;
   rootRef?: RefObject<HTMLDivElement | null>;
   onScroll?: (event: UIEvent<HTMLElement>) => void;
+  tocOpen: boolean;
+  onTocOpenChange: (open: boolean) => void;
 }) {
+  // Rewrite explicit TeX delimiters (`\(…\)`, `\[…\]`) to `$$…$$` before
+  // rendering, the same as chat, so agent-authored formulas render here too;
+  // remark-math only honours `$` delimiters. Safe outside code/existing math.
+  const rendered = useMemo(() => normalizeExplicitMathDelimiters(content), [content]);
   return (
-    <div
-      ref={rootRef}
-      data-preview-scroll
-      onScroll={onScroll}
-      className="markdown-preview px-6 py-4 overflow-auto h-full prose dark:prose-invert prose-sm max-w-none"
-    >
-      <ReactMarkdown
-        remarkPlugins={MARKDOWN_REMARK_PLUGINS}
-        rehypePlugins={MARKDOWN_REHYPE_PLUGINS}
-        components={MARKDOWN_COMPONENTS}
+    <div className="flex h-full">
+      <div
+        ref={rootRef}
+        data-preview-scroll
+        onScroll={onScroll}
+        className="markdown-preview flex-1 px-6 py-4 overflow-auto prose dark:prose-invert prose-sm max-w-none"
       >
-        {content}
-      </ReactMarkdown>
+        <MarkdownPreviewPathContext.Provider value={path}>
+          <ReactMarkdown
+            remarkPlugins={MARKDOWN_REMARK_PLUGINS}
+            rehypePlugins={MARKDOWN_REHYPE_PLUGINS}
+            components={MARKDOWN_COMPONENTS}
+          >
+            {rendered}
+          </ReactMarkdown>
+        </MarkdownPreviewPathContext.Provider>
+      </div>
+      {tocOpen && (
+        <aside className="w-64 shrink-0">
+          <MarkdownTableOfContents
+            content={content}
+            containerRef={rootRef}
+            open={tocOpen}
+            onClose={() => onTocOpenChange(false)}
+          />
+        </aside>
+      )}
     </div>
   );
 }
@@ -212,6 +321,7 @@ function MarkdownPreview({
 // recompute when the rendered document changes.
 function PreviewWithSearch({
   content,
+  path,
   isNotebook,
   truncated,
   searchOpen,
@@ -219,8 +329,13 @@ function PreviewWithSearch({
   searchInputRef,
   scrollKey,
   scrollReady,
+  tocOpen,
+  onTocOpenChange,
+  commentHint,
 }: {
   content: string;
+  /** Workspace path of the previewed file, for resolving relative links. */
+  path: string | null;
   isNotebook: boolean;
   truncated: boolean;
   searchOpen: boolean;
@@ -230,6 +345,14 @@ function PreviewWithSearch({
   scrollKey: string | null;
   /** True once the file content backing the preview is present. */
   scrollReady: boolean;
+  tocOpen: boolean;
+  onTocOpenChange: (open: boolean) => void;
+  /**
+   * When present, shows a banner pointing users at the editor for commenting
+   * (the rendered preview can't anchor text-selection comments). Omitted for
+   * notebooks, which have no comment surface.
+   */
+  commentHint?: { conversationId: string; onSwitchToEdit: () => void };
 }) {
   const previewRef = useRef<HTMLDivElement>(null);
   // The preview div (not the FileViewer content area) is the real scroller
@@ -247,7 +370,14 @@ function PreviewWithSearch({
   const preview = isNotebook ? (
     <NotebookPreview content={content} rootRef={previewRef} onScroll={handleScroll} />
   ) : (
-    <MarkdownPreview content={content} rootRef={previewRef} onScroll={handleScroll} />
+    <MarkdownPreview
+      content={content}
+      path={path}
+      rootRef={previewRef}
+      onScroll={handleScroll}
+      tocOpen={tocOpen}
+      onTocOpenChange={onTocOpenChange}
+    />
   );
   // The find bar sits above the preview; a truncated preview also shows the
   // banner. The bar renders nothing when closed, so layout is unchanged then.
@@ -255,6 +385,14 @@ function PreviewWithSearch({
     <div className="flex h-full flex-col">
       {bar}
       {truncated && <TruncatedBanner />}
+      {/* A truncated file can't be edited (or commented on) in the editor
+          either, so the hint would send the user to a dead end — suppress it. */}
+      {commentHint && !truncated && (
+        <PreviewCommentBanner
+          conversationId={commentHint.conversationId}
+          onSwitchToEdit={commentHint.onSwitchToEdit}
+        />
+      )}
       <div className="min-h-0 flex-1">{preview}</div>
     </div>
   );
@@ -336,10 +474,13 @@ function ImageViewer({ data, path }: { data: FileContentResponse; path: string }
 // ---------------------------------------------------------------------------
 
 export interface CodeViewerProps {
+  position?: FilePosition;
   conversationId: string;
   path: string;
   fileQuery: ReturnType<typeof useFileContent>;
   comments: Comment[];
+  /** Addressed comments are available for temporarily revealing a selected anchor. */
+  addressedComments?: Comment[];
   /** Highlights the selection range in the code. */
   activeSelection: ActiveSelection | null;
   /**
@@ -351,10 +492,21 @@ export interface CodeViewerProps {
     sel: { start_index: number; end_index: number; anchor_content: string } | null,
   ) => void;
   panelOpen: boolean;
+  /** Stop media in a hidden rail without unmounting unsaved editor state. */
+  mediaActive?: boolean;
   searchOpen: boolean;
   setSearchOpen: (open: boolean) => void;
+  /**
+   * Bumped by FileViewer on each Cmd+F. Forwarded to the Monaco editor so a
+   * press with the find widget already open refocuses its input.
+   */
+  searchFocusNonce?: number;
   searchInputRef: RefObject<HTMLInputElement | null>;
   viewMode: "editor" | "preview" | "source" | "diff";
+  /** FileViewer keeps this choice stable across autosaves for the current file. */
+  markdownSourceFallback: boolean;
+  /** Soft-wrap long lines in the Monaco editor; the Shiki source view always wraps. */
+  wrapLines?: boolean;
   onDirtyChange?: (isDirty: boolean) => void;
   /**
    * Forwarded to the Monaco editor only — it reports its auto-save lifecycle so
@@ -364,25 +516,49 @@ export interface CodeViewerProps {
   onSaveStatusChange?: (status: SaveStatus) => void;
   /** Forwarded to MarkdownRichTextViewer → MarkdownCommentPlugin. */
   pendingBodyRef?: RefObject<string>;
+  /** Whether the TOC panel is open (for markdown preview). */
+  tocOpen?: boolean;
+  /** Callback to toggle TOC panel. */
+  onTocToggle?: () => void;
+  /**
+   * Switches a markdown file to the rich-text editor. When set, the rendered
+   * preview shows a banner pointing users there for commenting (the preview
+   * itself can't anchor text-selection comments).
+   */
+  onRequestEditMode?: () => void;
 }
 
 export function CodeViewer({
+  position,
   conversationId,
   path,
   fileQuery,
   comments,
+  addressedComments = EMPTY_COMMENTS,
   activeSelection,
   onSetActiveSelection,
   panelOpen,
+  mediaActive = panelOpen,
   searchOpen,
   setSearchOpen,
+  searchFocusNonce,
   searchInputRef,
   viewMode,
+  markdownSourceFallback,
+  wrapLines = false,
   onDirtyChange,
   onSaveStatusChange,
   pendingBodyRef,
+  tocOpen = false,
+  onTocToggle,
+  onRequestEditMode,
 }: CodeViewerProps) {
   const canEdit = useCanEdit(conversationId);
+  const activeCommentId = activeSelection?.comment_id;
+  const previewComments = useMemo(
+    () => [...comments, ...addressedComments.filter((c) => c.id === activeCommentId)],
+    [comments, addressedComments, activeCommentId],
+  );
 
   const [tokenLines, setTokenLines] = useState<ThemedToken[][] | null>(null);
 
@@ -425,11 +601,47 @@ export function CodeViewer({
   // must drop to read-only when this is set.
   const truncated = fileQuery.data?.truncated ?? false;
   const lang = detectLang(path);
-  // Non-markdown files render in Monaco (read-only or editable by permission);
-  // markdown keeps TipTap (editor) / Shiki (source) and HTML keeps its preview.
-  const showMonaco = lang !== "markdown" && viewMode !== "preview";
-  // Only the Shiki DOM path needs the per-line split; skip it in Monaco mode.
-  const rawLines = useMemo(() => (showMonaco ? [] : content.split("\n")), [content, showMonaco]);
+  // Large Markdown shares the virtualized code editor and its save/permission rules.
+  const showMonaco = markdownSourceFallback || (lang !== "markdown" && viewMode !== "preview");
+  // HTML, markdown, and notebook previews render through their own surfaces and
+  // never read the Shiki tokens, so skipping them avoids a wasted full-file pass.
+  const isHtmlPreview = viewMode === "preview" && lang === "html";
+  const isMarkdownOrNotebookPreview =
+    viewMode === "preview" &&
+    ((lang === "markdown" && !markdownSourceFallback) || isNotebookPath(path));
+  const isRenderedPreview = isHtmlPreview || isMarkdownOrNotebookPreview;
+  // Only the Shiki DOM path needs the per-line split; skip it for Monaco and
+  // rendered previews, which never render these lines.
+  const rawLines = useMemo(
+    () => (showMonaco || isRenderedPreview ? [] : content.split("\n")),
+    [content, showMonaco, isRenderedPreview],
+  );
+
+  // The cited line (or range) highlighted in the Shiki view, clamped to the file.
+  const citedLines = position
+    ? {
+        start: Math.min(Math.max(1, position.line), rawLines.length),
+        end: Math.min(Math.max(position.line, position.endLine ?? position.line), rawLines.length),
+      }
+    : null;
+
+  const revealedPositionRef = useRef<FilePosition | undefined>(undefined);
+  useEffect(() => {
+    if (
+      !position ||
+      !isFilePositionPending(position) ||
+      showMonaco ||
+      viewMode !== "source" ||
+      fileQuery.data === undefined
+    )
+      return;
+    if (revealedPositionRef.current === position) return;
+    const index = Math.min(Math.max(1, position.line), rawLines.length) - 1;
+    const line = matchLineRefs.current.get(index);
+    if (!line) return;
+    line.scrollIntoView({ block: "center" });
+    revealedPositionRef.current = position;
+  }, [position, showMonaco, viewMode, fileQuery.data, rawLines]);
 
   // "Attach to agent" delivers a "[Attached: path:start-end]" marker the
   // composer reads — only the native coding-agent harnesses act on it, so
@@ -444,6 +656,12 @@ export function CodeViewer({
   useEffect(() => {
     if (showMonaco) return; // Monaco does its own highlighting.
     if (viewMode === "editor" && lang === "markdown") return;
+    if (isRenderedPreview) {
+      // Drop stale tokens so a later switch to source view can't briefly render
+      // the previous file's highlighted text.
+      setTokenLines(null);
+      return;
+    }
     let cancelled = false;
     setTokenLines(null);
     if (!content) return;
@@ -454,7 +672,7 @@ export function CodeViewer({
     return () => {
       cancelled = true;
     };
-  }, [content, lang, viewMode, showMonaco]);
+  }, [content, lang, viewMode, showMonaco, isRenderedPreview]);
 
   // Scroll to the line containing the active selection when it changes
   // (e.g. user clicked a comment in the panel).
@@ -482,7 +700,7 @@ export function CodeViewer({
     matchLineRefs.current.get(idx)?.scrollIntoView({ block: "center", behavior: "smooth" });
   }, [searchQuery, currentMatchIdx]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const isMarkdownEditor = viewMode === "editor" && lang === "markdown";
+  const isMarkdownEditor = viewMode === "editor" && lang === "markdown" && !markdownSourceFallback;
 
   // Markdown editor mode has its own find bar (MarkdownSearchBar), driven by the
   // shared `searchOpen` toggle. Cmd+F opens it and Escape closes it; the bar
@@ -491,7 +709,7 @@ export function CodeViewer({
   useEffect(() => {
     if (!panelOpen || !isMarkdownEditor) return;
     const handler = (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && e.key === "f") {
+      if (hasCommandModifier(e) && e.key === "f") {
         e.preventDefault();
         setSearchOpen(true);
         setTimeout(() => searchInputRef.current?.focus(), 0);
@@ -510,7 +728,7 @@ export function CodeViewer({
     // above with its own find bar).
     if (!panelOpen || isMarkdownEditor || showMonaco) return;
     const handler = (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && e.key === "f") {
+      if (hasCommandModifier(e) && e.key === "f") {
         e.preventDefault();
         setSearchOpen(true);
         setTimeout(() => searchInputRef.current?.focus(), 0);
@@ -656,6 +874,18 @@ export function CodeViewer({
     };
   }, [content]);
 
+  if (isVideoFile(path, fileQuery.data?.content_type)) {
+    if (!mediaActive) return null;
+    return (
+      <div className="flex h-full items-center justify-center overflow-auto p-4">
+        <VideoPlayer
+          conversationId={conversationId}
+          path={path}
+          title={path.split("/").pop() ?? path}
+        />
+      </div>
+    );
+  }
   if (fileQuery.isLoading) {
     return (
       <div className="flex items-center justify-center p-8 text-muted-foreground text-ui">
@@ -663,7 +893,8 @@ export function CodeViewer({
       </div>
     );
   }
-  if (fileQuery.isError) {
+  // A failed refresh keeps the loaded content (and any unsaved edits) on screen.
+  if (fileQuery.isLoadingError) {
     return (
       <div className="p-8 text-destructive text-ui">
         Error loading file:{" "}
@@ -686,7 +917,7 @@ export function CodeViewer({
         <PdfViewer
           data={fileQuery.data}
           conversationId={conversationId}
-          comments={comments}
+          comments={previewComments}
           activeSelection={activeSelection}
           onSetActiveSelection={onSetActiveSelection}
         />
@@ -714,13 +945,15 @@ export function CodeViewer({
     );
   }
 
-  if (viewMode === "editor" && lang === "markdown") {
+  if (isMarkdownEditor) {
     return (
       <MarkdownRichTextViewer
         content={content}
         conversationId={conversationId}
         path={path}
-        isSettled={fileQuery.isSuccess}
+        // Cached content counts: a failed refresh must not leave the previous
+        // file's editor mounted (and saving) under this path.
+        isSettled={fileQuery.data !== undefined}
         truncated={truncated}
         onDirtyChange={onDirtyChange}
         comments={comments}
@@ -737,30 +970,41 @@ export function CodeViewer({
   // HTML preview gets its own comment-enabled viewer (selection capture +
   // highlights relayed over a bridge into the still-sandboxed iframe), so it
   // owns the truncated banner internally.
-  if (viewMode === "preview" && lang === "html") {
+  if (isHtmlPreview) {
     return (
       <HtmlCommentViewer
+        // A different file, or the same path in another conversation, starts at 100% zoom.
+        key={`${conversationId}:${path}`}
         conversationId={conversationId}
         content={content}
         truncated={truncated}
-        comments={comments}
+        comments={previewComments}
         activeSelection={activeSelection}
         onSetActiveSelection={onSetActiveSelection}
       />
     );
   }
 
-  if (viewMode === "preview" && (lang === "markdown" || isNotebookPath(path))) {
+  if (isMarkdownOrNotebookPreview) {
+    const isNotebook = isNotebookPath(path);
     return (
       <PreviewWithSearch
         content={content}
-        isNotebook={isNotebookPath(path)}
+        path={path}
+        isNotebook={isNotebook}
         truncated={truncated}
         searchOpen={searchOpen}
         onSearchHandled={handleSearchHandled}
         searchInputRef={searchInputRef}
         scrollKey={conversationId && path ? `viewer-preview:${conversationId}:${path}` : null}
         scrollReady={fileQuery.data !== undefined}
+        tocOpen={tocOpen}
+        onTocOpenChange={(open) => !open && onTocToggle?.()}
+        commentHint={
+          !isNotebook && onRequestEditMode
+            ? { conversationId, onSwitchToEdit: onRequestEditMode }
+            : undefined
+        }
       />
     );
   }
@@ -775,14 +1019,18 @@ export function CodeViewer({
         }
       >
         <MonacoCodeEditor
+          position={position}
           content={content}
           conversationId={conversationId}
           path={path}
-          isSettled={fileQuery.isSuccess}
+          isSettled={fileQuery.data !== undefined}
           truncated={truncated}
+          largeMarkdown={markdownSourceFallback}
+          wrapLines={wrapLines}
           onDirtyChange={onDirtyChange}
           onSaveStatusChange={onSaveStatusChange}
           searchOpen={searchOpen}
+          searchFocusNonce={searchFocusNonce}
           onSearchHandled={handleSearchHandled}
           comments={comments}
           activeSelection={activeSelection}
@@ -932,7 +1180,11 @@ export function CodeViewer({
                 if (el) matchLineRefs.current.set(idx, el);
                 else matchLineRefs.current.delete(idx);
               }}
-              className={cn(isCurrentMatch && "bg-yellow-200/40 dark:bg-yellow-700/30")}
+              className={cn(
+                (isCurrentMatch ||
+                  (citedLines && lineNum >= citedLines.start && lineNum <= citedLines.end)) &&
+                  "bg-yellow-200/40 dark:bg-yellow-700/30",
+              )}
             >
               <div className="flex items-stretch">
                 {/* Gutter — line number; MessageCircleIcon when a comment starts here */}
@@ -1035,7 +1287,7 @@ export function CodeViewer({
             <button
               data-add-comment-btn
               type="button"
-              className="flex items-center gap-1.5 rounded-md border border-border bg-popover backdrop-blur-xl backdrop-saturate-150 px-2.5 py-1 text-sm font-medium text-foreground shadow-md hover:bg-secondary transition-colors"
+              className={ADD_COMMENT_BUTTON_CLASS_NAME}
               onClick={() => {
                 onSetActiveSelection({
                   start_index: selectionAnchor.start_index,
@@ -1053,7 +1305,7 @@ export function CodeViewer({
               <button
                 data-attach-agent-btn
                 type="button"
-                className="flex items-center gap-1.5 rounded-md border border-border bg-popover backdrop-blur-xl backdrop-saturate-150 px-2.5 py-1 text-sm font-medium text-foreground shadow-md hover:bg-secondary transition-colors"
+                className={ADD_COMMENT_BUTTON_CLASS_NAME}
                 onClick={() => {
                   // Convert the selection's char offsets to a 1-based inclusive
                   // line span. ``end_index`` is exclusive, so step back one char

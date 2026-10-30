@@ -69,6 +69,7 @@ from .executor import (
     TurnCancelled,
     TurnComplete,
     classify_tool_result,
+    describe_exception,
 )
 
 logger = logging.getLogger(__name__)
@@ -122,9 +123,8 @@ def _ensure_antigravity_sdk() -> ModuleType:
         app-boot crash.
     """
     try:
-        # importlib keeps the ``-> ModuleType`` return type clean regardless of
-        # whether the optional extra is installed at mypy time (a static import
-        # would resolve to ``Any`` and trip ``warn_return_any``).
+        # importlib keeps the ``-> ModuleType`` boundary explicit while leaving
+        # this optional integration lazy until the first turn.
         return importlib.import_module("google.antigravity")
     except ImportError as exc:
         from omnigent.onboarding.antigravity_auth import ANTIGRAVITY_EXTRA
@@ -498,7 +498,7 @@ class AntigravityExecutor(Executor):
                 tools=tools,
             )
         except ImportError as exc:
-            yield ExecutorError(message=str(exc), retryable=False)
+            yield ExecutorError(message=describe_exception(exc), retryable=False)
             return
         except Exception as exc:
             logger.exception("Antigravity agent construction failed")
@@ -1089,12 +1089,12 @@ class AntigravityExecutor(Executor):
         if closer is not None:
             try:
                 await closer(None, None, None)
-            except Exception:  # noqa: BLE001 — agent teardown is best-effort
+            except Exception:  # agent teardown is best-effort
                 logger.debug("Antigravity agent close failed", exc_info=True)
             return
         aclose = getattr(agent, "aclose", None)
         if aclose is not None:
             try:
                 await aclose()
-            except Exception:  # noqa: BLE001 — agent teardown is best-effort
+            except Exception:  # agent teardown is best-effort
                 logger.debug("Antigravity agent aclose failed", exc_info=True)

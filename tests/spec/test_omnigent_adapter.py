@@ -1106,6 +1106,49 @@ def test_os_env_round_trips_through_translator() -> None:
     assert forward.os_env is original_os_env
 
 
+def test_inline_agent_tool_preserves_launch_settings_across_translation(
+    tmp_path: Path,
+) -> None:
+    """Sub-agent history and session limits survive the real YAML load path."""
+    from omnigent.inner.tools import AgentTool
+    from omnigent.spec.omnigent import agent_spec_to_agent_def
+
+    yaml_path = tmp_path / "agent.yaml"
+    yaml_path.write_text(
+        yaml.dump(
+            {
+                "name": "history_repro",
+                "prompt": "Validate agent-tool history settings.",
+                "executor": {
+                    "harness": "claude-sdk",
+                    "model": "databricks-claude-sonnet-4-6",
+                },
+                "tools": {
+                    "reviewer": {
+                        "type": "agent",
+                        "prompt": "Review the current changes.",
+                        "executor": {
+                            "harness": "claude-sdk",
+                            "model": "databricks-claude-sonnet-4-6",
+                        },
+                        "pass_history": True,
+                        "pass_histories": ["research"],
+                        "max_sessions": 2,
+                    },
+                },
+            },
+        ),
+    )
+
+    spec = load(yaml_path)
+    reviewer = agent_spec_to_agent_def(spec).tools["reviewer"]
+
+    assert isinstance(reviewer, AgentTool)
+    assert reviewer.pass_history is True
+    assert reviewer.pass_histories == ["research"]
+    assert reviewer.max_sessions == 2
+
+
 def test_inline_agent_tool_inherit_resolves_to_parent_os_env() -> None:
     """
     An inline :class:`AgentTool` that declares
@@ -2181,6 +2224,27 @@ def test_use_responses_absent_omits_key_from_executor_config() -> None:
     assert "use_responses" not in spec.executor.config
 
 
+def test_reasoning_item_id_policy_propagates_to_executor_config() -> None:
+    agent_def, raw_yaml = _build_agent_def_with_raw_yaml()
+    raw_yaml["executor"] = {
+        "model": "databricks-gpt-5-4-mini",
+        "harness": "openai-agents",
+        "reasoning_item_id_policy": "preserve",
+    }
+    spec = agent_def_to_agent_spec(agent_def, raw_yaml=raw_yaml)
+    assert spec.executor.config["reasoning_item_id_policy"] == "preserve"
+
+
+def test_reasoning_item_id_policy_absent_omits_key_from_executor_config() -> None:
+    agent_def, raw_yaml = _build_agent_def_with_raw_yaml()
+    raw_yaml["executor"] = {
+        "model": "databricks-gpt-5-4-mini",
+        "harness": "openai-agents",
+    }
+    spec = agent_def_to_agent_spec(agent_def, raw_yaml=raw_yaml)
+    assert "reasoning_item_id_policy" not in spec.executor.config
+
+
 def test_malformed_acp_agent_propagates_for_runtime_validation() -> None:
     agent_def, raw_yaml = _build_agent_def_with_raw_yaml()
     raw_yaml["executor"] = {
@@ -2526,3 +2590,59 @@ def test_compat_yaml_executor_api_key_auth_is_not_dropped(tmp_path: Path) -> Non
 
     assert isinstance(spec.executor.auth, ApiKeyAuth)
     assert spec.executor.auth.api_key == "sk-test-key"
+
+
+def _write_single_file_yaml(tmp_path: Path, extra: dict[str, Any]) -> Path:
+    """Write a minimal single-file omnigent YAML plus *extra* top-level keys."""
+    yaml_path = tmp_path / "agent.yaml"
+    yaml_path.write_text(
+        yaml.dump(
+            {
+                "name": "trimmed",
+                "prompt": "You are a test agent.",
+                "executor": {"model": "openai/gpt-5", "harness": "claude-sdk"},
+                **extra,
+            }
+        )
+    )
+    return yaml_path
+
+
+def test_compat_yaml_tool_groups_is_not_dropped(tmp_path: Path) -> None:
+    """
+    ``tool_groups:`` in a single-file YAML reaches the spec. The omnigent
+    loader ignores unknown top-level keys, so without the raw-YAML read the
+    block would be silently discarded and every group left registered.
+    """
+    from omnigent.spec._omnigent_compat import load_omnigent_yaml
+
+    yaml_path = _write_single_file_yaml(
+        tmp_path, {"tool_groups": {"browser": False, "comments": False}}
+    )
+
+    spec = load_omnigent_yaml(yaml_path)
+
+    assert spec.tool_groups.browser is False
+    assert spec.tool_groups.comments is False
+    assert spec.tool_groups.scheduled_tasks is True
+
+
+def test_compat_yaml_tool_groups_typo_fails_the_load(tmp_path: Path) -> None:
+    """A misspelled group fails through ``load()`` exactly as it does for a bundle."""
+    yaml_path = _write_single_file_yaml(tmp_path, {"tool_groups": {"scheduled-tasks": False}})
+
+    with pytest.raises(OmnigentError, match=r"unknown group\(s\) \['scheduled-tasks'\]"):
+        load(yaml_path)
+
+
+def test_compat_yaml_tool_groups_discovery_needs_spawn_off(tmp_path: Path) -> None:
+    """The adapter checks ``agent_discovery`` against the YAML's own ``spawn:``."""
+    from omnigent.spec._omnigent_compat import load_omnigent_yaml
+
+    yaml_path = _write_single_file_yaml(
+        tmp_path,
+        {"spawn": True, "tool_groups": {"agent_discovery": False, "scheduled_tasks": False}},
+    )
+
+    with pytest.raises(OmnigentError, match="spawn: true"):
+        load_omnigent_yaml(yaml_path)

@@ -26,7 +26,7 @@ import re
 from typing import Any
 
 
-def _redact_url(url: str | None) -> str | None:
+def redact_url(url: str | None) -> str | None:
     """Strip userinfo and query/fragment from a URL so it's safe to print.
 
     A ``--server`` value could carry embedded basic-auth (``https://user:pass@h``)
@@ -92,7 +92,7 @@ def _fetch_server_info(server_url: str, *, timeout: float) -> dict[str, Any] | N
         base = server_url.rstrip("/")
         resp = httpx.get(
             f"{base}/v1/info",
-            headers=_remote_headers(server_url=base),
+            headers=_remote_headers(server_url=base, host_id=None),
             timeout=timeout,
             trust_env=False,
         )
@@ -167,7 +167,7 @@ def collect_snapshot(*, server_url: str | None = None, timeout: float = 5.0) -> 
     return {
         "cli_version": _local_version(),
         "server_version": server_version,
-        "server_url": _redact_url(server_url),
+        "server_url": redact_url(server_url),
         "auth_source": auth_source,
         "auth_source_origin": auth_source_origin,
         "os": platform.platform(),

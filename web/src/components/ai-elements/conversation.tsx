@@ -5,7 +5,7 @@ import { cn } from "@/lib/utils";
 import type { UIMessage } from "ai";
 import { ArrowDownIcon, DownloadIcon } from "lucide-react";
 import type { ComponentProps, ReactNode } from "react";
-import { createContext, useCallback, useMemo } from "react";
+import { createContext, useCallback, useLayoutEffect, useMemo } from "react";
 import { StickToBottom, useStickToBottomContext } from "use-stick-to-bottom";
 
 export type ConversationProps = ComponentProps<typeof StickToBottom>;
@@ -17,6 +17,22 @@ export interface ConversationScrollLock {
 }
 
 export const ConversationScrollLockContext = createContext<ConversationScrollLock | null>(null);
+
+// Module handle so non-React scroll helpers (deep links, activity rail,
+// Cmd+Alt nav) can release the bottom-lock without Conversation context.
+let activeScrollLock: ConversationScrollLock | null = null;
+
+/**
+ * Release StickToBottom's bottom-lock so a programmatic scroll is not
+ * overridden by the next content-resize ``scrollToBottom``. Same recipe as
+ * JumpToTopButton / the "Worked for" fold snap. No-op outside a conversation.
+ */
+export function releaseConversationScrollLock(): void {
+  if (!activeScrollLock) return;
+  activeScrollLock.stopScroll();
+  activeScrollLock.state.isAtBottom = false;
+  activeScrollLock.state.escapedFromLock = true;
+}
 
 /**
  * Exposes the bottom-lock controls to deep descendants without the
@@ -34,6 +50,14 @@ const ScrollLockBridge = ({ children }: { children: ReactNode }) => {
     () => ({ stopScroll: ctx.stopScroll, state: ctx.state }),
     [ctx.stopScroll, ctx.state],
   );
+  // Layout so the module handle is live before sibling/parent useEffects
+  // (message deep links) try to scroll away from the bottom.
+  useLayoutEffect(() => {
+    activeScrollLock = value;
+    return () => {
+      if (activeScrollLock === value) activeScrollLock = null;
+    };
+  }, [value]);
   return (
     <ConversationScrollLockContext.Provider value={value}>
       {children}
@@ -108,10 +132,7 @@ export const ConversationScrollButton = ({
     !isAtBottom && (
       <Button
         className={cn(
-          // Offset by the composer's growth (0 elsewhere): a grown composer
-          // overlaps the bottom of this scroll area, and the button has to
-          // stay above its card.
-          "absolute bottom-[calc(1rem+var(--composer-growth,0px))] left-[50%] translate-x-[-50%] rounded-full",
+          "absolute bottom-4 left-[50%] translate-x-[-50%] rounded-full",
           // Keep the fill OPAQUE on hover. The outline variant's hover (bg-muted)
           // is a translucent black wash (--muted is #0000000f), so over the chat
           // content behind it the button reads as transparent on hover. Hover
@@ -121,7 +142,7 @@ export const ConversationScrollButton = ({
           className,
         )}
         onClick={handleScrollToBottom}
-        size="icon"
+        size="icon-sm"
         type="button"
         variant="outline"
         {...props}

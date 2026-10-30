@@ -93,6 +93,44 @@ class SysScheduledTaskCreateTool(Tool):
                             "type": "string",
                             "description": "Optional per-run reasoning-effort hint, e.g. 'high'.",
                         },
+                        "permission_mode": {
+                            "type": "string",
+                            "description": (
+                                "Optional permission mode for native coding agents that "
+                                "support one (Claude Code): 'default', 'auto', "
+                                "'acceptEdits', 'plan', 'dontAsk', or 'bypassPermissions'. "
+                                "Runs are unattended, so a prompting mode ('default'/'plan') "
+                                "stalls waiting for approval — prefer an auto-running mode. "
+                                "Omit for the agent default."
+                            ),
+                        },
+                        "max_cost_usd": {
+                            "type": "number",
+                            "description": (
+                                "Optional per-firing cost budget in USD. When set, each "
+                                "fired session is capped at this spend — all models are "
+                                "blocked once the limit is reached. Omit for no cap."
+                            ),
+                        },
+                        "session_mode": {
+                            "type": "string",
+                            "enum": ["new", "continue"],
+                            "description": (
+                                "Optional. 'new' (default) starts a new session for every "
+                                "run. 'continue' sends every run's prompt into one session, "
+                                "keeping its context: session_id when given, otherwise the "
+                                "session the first run creates."
+                            ),
+                        },
+                        "session_id": {
+                            "type": "string",
+                            "description": (
+                                "Optional, with session_mode 'continue'. An existing "
+                                "top-level session the owner owns, e.g. the current session, "
+                                "to send every run's prompt into. agent_id must be that "
+                                "session's agent."
+                            ),
+                        },
                         "workspace": {
                             "type": "string",
                             "description": (
@@ -107,7 +145,33 @@ class SysScheduledTaskCreateTool(Tool):
                                 "Optional PIN of a connected host to run on, from the "
                                 "current workspace's host list. Omit to run on the owner's "
                                 "online host at fire time; a failed run is recorded if none "
-                                "is online."
+                                "is online. Existing managed sandbox hosts cannot be pinned."
+                            ),
+                        },
+                        "execution_target": {
+                            "type": "string",
+                            "enum": ["connected_host", "managed_sandbox"],
+                            "description": (
+                                "Where each firing runs. 'connected_host' (default) uses a "
+                                "pinned/resolved connected host. 'managed_sandbox' provisions "
+                                "a fresh server-managed sandbox per firing, using the server's "
+                                "sandbox lifecycle settings. Do not set host_id or workspace "
+                                "with it. Requires managed sandboxes configured on the server."
+                            ),
+                        },
+                        "project_name": {
+                            "type": "string",
+                            "description": (
+                                "Optional project to file every fired session into, by "
+                                "name: your existing project with this name, or a new one "
+                                "if you have none. Do not set project_id with it."
+                            ),
+                        },
+                        "project_id": {
+                            "type": "string",
+                            "description": (
+                                "Optional existing project id to file every fired session "
+                                "into. Do not set project_name with it."
                             ),
                         },
                     },
@@ -161,8 +225,10 @@ class SysScheduledTaskUpdateTool(Tool):
         """:returns: Human-readable description of the tool."""
         return (
             "Update a scheduled task's mutable fields. Only the fields you pass "
-            "change; omit the rest. Pass state='paused' to stop it firing "
-            "without deleting it, or state='active' to resume."
+            "change; omit the rest. Pass agent_id to switch which agent/harness "
+            "it runs. Pass state='paused' to stop it firing without deleting it, "
+            "or state='active' to resume. A 'completed' task has no remaining "
+            "occurrences; change its rrule to schedule it again."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -182,11 +248,51 @@ class SysScheduledTaskUpdateTool(Tool):
                         "name": {"type": "string", "description": "New task name."},
                         "prompt": {"type": "string", "description": "New prompt."},
                         "rrule": {"type": "string", "description": _RRULE_DESC},
+                        "agent_id": {
+                            "type": "string",
+                            "description": (
+                                "Rebind the task to a different agent, switching the "
+                                "harness its future firings run (e.g. Cursor to Pi) — "
+                                "from sys_agent_list. Past runs keep the agent they "
+                                "ran. Model, effort, and permission mode do not carry "
+                                "across a switch: resend any you want set."
+                            ),
+                        },
                         "timezone": {"type": "string", "description": "New IANA timezone."},
                         "model_override": {"type": "string", "description": "New model override."},
                         "reasoning_effort": {
                             "type": "string",
                             "description": "New reasoning-effort hint.",
+                        },
+                        "permission_mode": {
+                            "type": "string",
+                            "description": (
+                                "New permission mode for native coding agents (Claude "
+                                "Code): 'default', 'auto', 'acceptEdits', 'plan', "
+                                "'dontAsk', or 'bypassPermissions'."
+                            ),
+                        },
+                        "max_cost_usd": {
+                            "type": "number",
+                            "description": (
+                                "New per-firing cost budget in USD. Null clears the cap."
+                            ),
+                        },
+                        "session_mode": {
+                            "type": "string",
+                            "enum": ["new", "continue"],
+                            "description": (
+                                "'new' starts a new session for every run; 'continue' sends "
+                                "every run's prompt into one session."
+                            ),
+                        },
+                        "session_id": {
+                            "type": ["string", "null"],
+                            "description": (
+                                "With session_mode 'continue': the existing session to "
+                                "continue, or null so the next run starts a new session "
+                                "that later runs continue."
+                            ),
                         },
                         "workspace": {
                             "type": "string",
@@ -196,9 +302,32 @@ class SysScheduledTaskUpdateTool(Tool):
                             "type": "string",
                             "description": "New connected host to run on.",
                         },
+                        "execution_target": {
+                            "type": "string",
+                            "enum": ["connected_host", "managed_sandbox"],
+                            "description": (
+                                "Switch where firings run. 'managed_sandbox' provisions a "
+                                "fresh server-managed sandbox per firing (clears any pinned "
+                                "host; do not also set host_id or workspace)."
+                            ),
+                        },
                         "state": {
                             "type": "string",
                             "description": "'active' or 'paused'.",
+                        },
+                        "project_name": {
+                            "type": "string",
+                            "description": (
+                                "File future fired sessions into this project, by name: "
+                                "your existing project with this name, or a new one."
+                            ),
+                        },
+                        "project_id": {
+                            "type": ["string", "null"],
+                            "description": (
+                                "File future fired sessions into this existing project id. "
+                                "Null stops filing them into a project."
+                            ),
                         },
                     },
                     "required": ["scheduled_task_id"],

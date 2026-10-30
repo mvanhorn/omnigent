@@ -1,17 +1,17 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { ALT_KEY, ARIA_MOD_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
+import { DropdownMenu, DropdownMenuContent } from "@/components/ui/dropdown-menu";
 import { TooltipProvider } from "@/components/ui/tooltip";
-import { ViewModeToggle } from "./ViewModeToggle";
+import { ViewModeMenuItems, ViewModeToggle } from "./ViewModeToggle";
 import {
   TerminalFirstContextProvider,
   type TerminalFirstContextValue,
 } from "./TerminalFirstContext";
 
-// The header toggle is suppressed in the iOS shell (the switcher is the native
-// Liquid Glass bar there); default the mock to "not iOS" for the web cases.
-const isIOSShellMock = vi.fn(() => false);
-vi.mock("@/lib/nativeBridge", () => ({
-  isIOSShell: () => isIOSShellMock(),
+const { isMobileMock } = vi.hoisted(() => ({ isMobileMock: vi.fn(() => false) }));
+vi.mock("@/hooks/useIsMobileViewport", () => ({
+  useIsMobileViewport: () => isMobileMock(),
 }));
 
 function makeCtx(overrides: Partial<TerminalFirstContextValue> = {}): TerminalFirstContextValue {
@@ -53,8 +53,27 @@ function terminalSegment() {
   return screen.getByRole("button", { name: /^terminal (view|is starting up…)$/i });
 }
 
+/** Renders the menu-items variant inside an open dropdown so the items mount. */
+function renderMenuItems(ctx: TerminalFirstContextValue | null) {
+  return render(
+    <TooltipProvider>
+      <DropdownMenu open>
+        <DropdownMenuContent>
+          {ctx ? (
+            <TerminalFirstContextProvider value={ctx}>
+              <ViewModeMenuItems />
+            </TerminalFirstContextProvider>
+          ) : (
+            <ViewModeMenuItems />
+          )}
+        </DropdownMenuContent>
+      </DropdownMenu>
+    </TooltipProvider>,
+  );
+}
+
 beforeEach(() => {
-  isIOSShellMock.mockReturnValue(false);
+  isMobileMock.mockReturnValue(false);
 });
 
 afterEach(() => {
@@ -75,6 +94,12 @@ describe("ViewModeToggle", () => {
     expect(container).toBeEmptyDOMElement();
   });
 
+  it("renders nothing on mobile — the switch folds into the header kebab", () => {
+    isMobileMock.mockReturnValue(true);
+    const { container } = renderToggle(makeCtx());
+    expect(container).toBeEmptyDOMElement();
+  });
+
   it("renders nothing outside a provider", () => {
     const { container } = renderToggle(null);
     expect(container).toBeEmptyDOMElement();
@@ -85,16 +110,36 @@ describe("ViewModeToggle", () => {
     expect(container).toBeEmptyDOMElement();
   });
 
-  it("renders nothing in the iOS shell (native bar owns the switcher)", () => {
-    isIOSShellMock.mockReturnValue(true);
-    const { container } = renderToggle(makeCtx());
-    expect(container).toBeEmptyDOMElement();
+  it("renders in the iOS shell — the header is the switcher's one placement", () => {
+    // The native bottom pill below the composer is retired; iOS gets the same
+    // header toggle as the web UI.
+    (window as unknown as Record<string, unknown>).omnigentNative = { kind: "ios" };
+    try {
+      renderToggle(makeCtx());
+      expect(screen.getByTestId("view-mode-toggle")).toBeVisible();
+    } finally {
+      delete (window as unknown as Record<string, unknown>).omnigentNative;
+    }
   });
 
   it("presses only the active segment in the chat view", () => {
     renderToggle(makeCtx({ view: "chat" }));
     expect(chatSegment()).toHaveAttribute("aria-pressed", "true");
     expect(terminalSegment()).toHaveAttribute("aria-pressed", "false");
+  });
+
+  it("uses the dark segmented-control surface tokens", () => {
+    renderToggle(makeCtx({ view: "chat" }));
+    expect(screen.getByTestId("view-mode-toggle")).toHaveClass(
+      "bg-muted",
+      "dark:bg-[var(--segmented-trough-bg)]",
+    );
+    expect(chatSegment()).toHaveClass(
+      "bg-background",
+      "dark:border-transparent",
+      "dark:bg-[var(--segmented-active-bg)]",
+    );
+    expect(terminalSegment()).toHaveClass("dark:bg-[var(--segmented-inactive-bg)]");
   });
 
   it("presses only the active segment in the terminal view", () => {
@@ -119,26 +164,40 @@ describe("ViewModeToggle", () => {
 
   it("names each segment on hover so the icon-only control is legible", async () => {
     renderToggle(makeCtx({ view: "chat" }));
+    expect(chatSegment()).toHaveAttribute("aria-keyshortcuts", `${ARIA_MOD_KEY}+Alt+\\`);
     // Radix opens on a real pointer move over the trigger (the wrapper span),
     // so a bare pointerEnter on the button wouldn't surface the tooltip.
     fireEvent.pointerMove(chatSegment().parentElement!, { pointerType: "mouse" });
-    expect(await screen.findByRole("tooltip")).toHaveTextContent("Chat view");
+    const tooltip = await screen.findByRole("tooltip");
+    expect(tooltip).toHaveTextContent("Chat view");
+    expect(tooltip).toHaveClass("menu-surface", "bg-popover", "text-popover-foreground");
+    expect(tooltip).not.toHaveClass("bg-neutral-900", "text-white");
+    const keys = Array.from(tooltip.querySelectorAll<HTMLElement>('[data-slot="kbd"]'));
+    expect(keys.map((key) => key.textContent)).toEqual([MOD_KEY, ALT_KEY, "\\"]);
+    for (const key of keys) {
+      expect(key).toHaveClass("bg-muted", "text-muted-foreground");
+    }
   });
 
-  it("disables the Terminal segment and shows a spinner while the terminal is coming up", () => {
-    renderToggle(makeCtx({ terminalsAvailable: false, terminalStartingUp: true }));
+  it("keeps the Terminal segment usable and shows a spinner while the terminal is coming up", () => {
+    const setView = vi.fn();
+    renderToggle(makeCtx({ setView, terminalsAvailable: false, terminalStartingUp: true }));
     const terminal = terminalSegment();
-    expect(terminal).toBeDisabled();
-    // The name carries the reason, so the disabled state explains itself.
+    expect(terminal).toBeEnabled();
     expect(terminal).toHaveAccessibleName(/starting up/i);
     expect(terminal.querySelector(".animate-spin")).not.toBeNull();
+    fireEvent.click(terminal);
+    expect(setView).toHaveBeenCalledWith("terminal");
   });
 
-  it("disables the Terminal segment WITHOUT a spinner when no terminal exists and none is coming up", () => {
-    renderToggle(makeCtx({ terminalsAvailable: false, terminalStartingUp: false }));
+  it("keeps the Terminal segment usable when the runner is offline", () => {
+    const setView = vi.fn();
+    renderToggle(makeCtx({ setView, terminalsAvailable: false, terminalStartingUp: false }));
     const terminal = terminalSegment();
-    expect(terminal).toBeDisabled();
+    expect(terminal).toBeEnabled();
     expect(terminal.querySelector(".animate-spin")).toBeNull();
+    fireEvent.click(terminal);
+    expect(setView).toHaveBeenCalledWith("terminal");
   });
 
   it("leaves the Chat segment usable while the terminal is unavailable", () => {
@@ -146,5 +205,44 @@ describe("ViewModeToggle", () => {
     renderToggle(makeCtx({ setView, terminalsAvailable: false, view: "terminal" }));
     fireEvent.click(chatSegment());
     expect(setView).toHaveBeenCalledWith("chat");
+  });
+});
+
+describe("ViewModeMenuItems", () => {
+  it("renders Chat and Terminal entries for terminal-first sessions", () => {
+    renderMenuItems(makeCtx());
+    expect(screen.getByTestId("view-mode-menu-chat")).toBeVisible();
+    expect(screen.getByTestId("view-mode-menu-terminal")).toBeVisible();
+  });
+
+  it("renders nothing for a non-terminal-first session", () => {
+    renderMenuItems(makeCtx({ isTerminalFirst: false }));
+    expect(screen.queryByTestId("view-mode-menu-chat")).toBeNull();
+  });
+
+  it("renders nothing while a shell owns the main view", () => {
+    renderMenuItems(makeCtx({ isShellView: true, view: "terminal" }));
+    expect(screen.queryByTestId("view-mode-menu-chat")).toBeNull();
+  });
+
+  it("switches to the terminal view when its entry is chosen", () => {
+    const setView = vi.fn();
+    renderMenuItems(makeCtx({ setView, view: "chat" }));
+    fireEvent.click(screen.getByTestId("view-mode-menu-terminal"));
+    expect(setView).toHaveBeenCalledWith("terminal");
+  });
+
+  it("switches back to the chat view when its entry is chosen", () => {
+    const setView = vi.fn();
+    renderMenuItems(makeCtx({ setView, view: "terminal" }));
+    fireEvent.click(screen.getByTestId("view-mode-menu-chat"));
+    expect(setView).toHaveBeenCalledWith("chat");
+  });
+
+  it("shows a spinner on the Terminal entry while the terminal is coming up", () => {
+    renderMenuItems(makeCtx({ terminalsAvailable: false, terminalStartingUp: true }));
+    const terminal = screen.getByTestId("view-mode-menu-terminal");
+    expect(terminal).toHaveTextContent(/starting up/i);
+    expect(terminal.querySelector(".animate-spin")).not.toBeNull();
   });
 });

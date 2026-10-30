@@ -7,7 +7,7 @@ that input file, which qwen's ``RemoteInputWatcher`` routes through the same
 ``submitQuery`` path the keyboard uses, so the message appears in the running TUI
 (and, since the web UI embeds the pane, in both surfaces). Output is
 terminal-originated; the embedded terminal renders it live and
-:mod:`omnigent.qwen_native_forwarder` mirrors the JSON event stream.
+:mod:`omnigent.harnesses.qwen_native.forwarder` mirrors the JSON event stream.
 
 Unlike goose-/cursor-native (tmux ``send-keys``), injection here is an atomic
 file append — no settle-detection, paste-commit polling, or draft-clearing. See
@@ -22,6 +22,11 @@ import os
 from collections.abc import AsyncIterator
 from pathlib import Path
 
+from omnigent.harnesses.qwen_native.bridge import (
+    BRIDGE_DIR_ENV_VAR,
+    submit_user_message,
+    wait_for_ready,
+)
 from omnigent.inner.executor import (
     EnqueuedContent,
     Executor,
@@ -31,11 +36,7 @@ from omnigent.inner.executor import (
     Message,
     ToolSpec,
     TurnComplete,
-)
-from omnigent.qwen_native_bridge import (
-    BRIDGE_DIR_ENV_VAR,
-    submit_user_message,
-    wait_for_ready,
+    describe_exception,
 )
 
 logger = logging.getLogger(__name__)
@@ -131,7 +132,7 @@ class QwenNativeExecutor(Executor):
             async with self._inject_lock:
                 await asyncio.to_thread(submit_user_message, self._bridge_dir, content=text)
         except RuntimeError as exc:
-            yield ExecutorError(message=str(exc))
+            yield ExecutorError(message=describe_exception(exc))
             return
         yield TurnComplete(response=None)
 

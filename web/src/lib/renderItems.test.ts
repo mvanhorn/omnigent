@@ -31,19 +31,22 @@ function ctx(opts?: {
   itemId?: string | null;
   responseId?: string;
   agent?: string | null;
+  turn?: number;
   timestamp?: number;
   createdBy?: string;
   createdAtS?: number;
+  clientCreatedAtS?: number;
 }): BlockContext {
   return {
     agent: opts?.agent ?? "test",
     depth: 0,
-    turn: 0,
+    turn: opts?.turn ?? 0,
     timestamp: opts?.timestamp ?? 0,
     responseId: opts?.responseId ?? "resp_1",
     itemId: opts?.itemId === undefined ? null : opts.itemId,
     ...(opts?.createdBy !== undefined ? { createdBy: opts.createdBy } : {}),
     ...(opts?.createdAtS !== undefined ? { createdAtS: opts.createdAtS } : {}),
+    ...(opts?.clientCreatedAtS !== undefined ? { clientCreatedAtS: opts.clientCreatedAtS } : {}),
   };
 }
 
@@ -58,6 +61,417 @@ function mkExec(name: string, callId: string): ToolExecution {
     output: null,
   };
 }
+
+describe("shell command user turns", () => {
+  function shellInput(itemId: string, input: string | null): AnyBlock {
+    return {
+      type: "terminal_command",
+      ctx: ctx({ itemId, responseId: itemId, createdBy: "author@example.com", createdAtS: 100 }),
+      kind: "input",
+      input,
+      stdout: null,
+      stderr: null,
+    };
+  }
+
+  const output: AnyBlock = {
+    type: "terminal_command",
+    ctx: ctx({ itemId: "output", responseId: "command" }),
+    kind: "output",
+    input: null,
+    stdout: "hi\n",
+    stderr: "warning\n",
+  };
+
+  it("separates repeated commands from the preceding answer and each other", () => {
+    const blocks: AnyBlock[] = [
+      {
+        type: "user_message",
+        ctx: ctx({ itemId: "greeting" }),
+        content: [{ type: "input_text", text: "hey" }],
+      },
+      { type: "text_done", ctx: ctx(), fullText: "Hello!", hasCodeBlocks: false },
+    ];
+    const commands = ['echo "hi"', "ls", 'echo "hi"'];
+    for (const [i, command] of commands.entries()) {
+      blocks.push(
+        shellInput(`input-${i}`, command),
+        {
+          ...output,
+          ctx: ctx({ itemId: `output-${i}`, responseId: `input-${i}` }),
+        },
+        {
+          type: "text_done",
+          ctx: ctx({ itemId: `answer-${i}`, responseId: `input-${i}` }),
+          fullText: `Command ${i + 1} finished.`,
+          hasCodeBlocks: false,
+        },
+      );
+    }
+
+    const bubbles = buildBubbles(blocks, null);
+    expect(bubbles.map((b) => b.kind)).toEqual([
+      "user",
+      "assistant",
+      "user",
+      "assistant",
+      "user",
+      "assistant",
+      "user",
+      "assistant",
+    ]);
+    for (const [i, command] of commands.entries()) {
+      expect(bubbles[2 + 2 * i]).toMatchObject({
+        kind: "user",
+        itemId: `input-${i}`,
+        content: [{ type: "input_text", text: `!${command}` }],
+        createdBy: "author@example.com",
+        createdAtS: 100,
+      });
+      expect(bubbles[3 + 2 * i]).toMatchObject({
+        kind: "assistant",
+        items: [
+          { kind: "terminal_command", terminalKind: "output", stdout: "hi\n", stderr: "warning\n" },
+          { kind: "text", text: `Command ${i + 1} finished.` },
+        ],
+      });
+    }
+  });
+
+  it.each(["history", "live"])("renders a shell-only start from %s as a user prompt", (source) => {
+    const blocks =
+      source === "history"
+        ? itemsToBlocks([
+            {
+              id: "command",
+              response_id: "shell-turn",
+              status: "completed",
+              type: "terminal_command",
+              kind: "input",
+              input: "ls",
+            },
+            {
+              id: "output",
+              response_id: "shell-turn",
+              status: "completed",
+              type: "terminal_command",
+              kind: "output",
+              stdout: "README.md\n",
+            },
+          ])
+        : new BlockStream().reduceSync([
+            {
+              type: "terminal_command",
+              itemId: "command",
+              responseId: "shell-turn",
+              kind: "input",
+              input: "ls",
+              stdout: null,
+              stderr: null,
+            },
+            {
+              type: "terminal_command",
+              itemId: "output",
+              responseId: "shell-turn",
+              kind: "output",
+              input: null,
+              stdout: "README.md\n",
+              stderr: null,
+            },
+          ]);
+    expect(buildBubbles(blocks, null)).toMatchObject([
+      { kind: "user", itemId: "command", content: [{ type: "input_text", text: "!ls" }] },
+      {
+        kind: "assistant",
+        items: [{ kind: "terminal_command", terminalKind: "output", stdout: "README.md\n" }],
+      },
+    ]);
+  });
+
+  it("preserves shell turn boundaries as input and output arrive incrementally", () => {
+    const cache = createBubbleCache();
+    const blocks: AnyBlock[] = [
+      { type: "text_done", ctx: ctx(), fullText: "Hello!", hasCodeBlocks: false },
+      shellInput("command", "echo hi"),
+      output,
+      shellInput("repeat", "echo hi"),
+      { ...output, ctx: ctx({ itemId: "repeat-output", responseId: "repeat" }) },
+      {
+        type: "user_message",
+        ctx: ctx({ itemId: "next" }),
+        content: [{ type: "input_text", text: "Continue" }],
+      },
+    ];
+    for (let length = 1; length <= blocks.length; length++) {
+      const prefix = blocks.slice(0, length);
+      expect(buildBubbles(prefix, null, cache)).toEqual(buildBubbles(prefix, null));
+    }
+    expect(buildBubbles(blocks, null, cache).map((b) => b.kind)).toEqual([
+      "assistant",
+      "user",
+      "assistant",
+      "user",
+      "assistant",
+      "user",
+    ]);
+  });
+
+  it("ends the previous tool's live phase when a shell prompt arrives", () => {
+    const tool: AnyBlock = {
+      type: "tool_group",
+      ctx: ctx({ itemId: "previous-tool" }),
+      executions: [mkExec("Read", "previous-call")],
+      iteration: 0,
+    };
+    const cache = createBubbleCache();
+    expect(buildBubbles([tool], null, cache, [], true)[0]).toMatchObject({
+      items: [{ kind: "tool", state: "input-available" }],
+    });
+    expect(buildBubbles([tool, shellInput("command", "ls")], null, cache, [], true)).toMatchObject([
+      { kind: "assistant", items: [{ kind: "tool", state: "no-output" }] },
+      { kind: "user", itemId: "command" },
+    ]);
+  });
+
+  it.each([null, "", " \t"])("does not invent a user turn for invalid input %s", (input) => {
+    expect(buildBubbles([shellInput("empty", input), output], null).map((b) => b.kind)).toEqual([
+      "assistant",
+    ]);
+  });
+});
+
+describe("sub-agent timeline events", () => {
+  const notice = (itemId = "notice_1"): AnyBlock => ({
+    type: "native_tool",
+    ctx: ctx({ itemId, responseId: `subagent_${itemId}` }),
+    toolType: "subagent_activity",
+    label: "Sub-agent activity",
+    data: {},
+  });
+  const work: AnyBlock = {
+    type: "tool_group",
+    ctx: ctx({ itemId: "parent_tool", responseId: "parent_turn" }),
+    executions: [mkExec("Agent", "call_1")],
+    iteration: 0,
+  };
+  const text = (itemId: string, responseId: string, fullText: string): AnyBlock => ({
+    type: "text_done",
+    ctx: ctx({ itemId, responseId }),
+    fullText,
+    hasCodeBlocks: false,
+  });
+  const answer = text("parent_answer", "parent_turn", "The review is complete.");
+
+  const prompt: AnyBlock = {
+    type: "user_message",
+    ctx: ctx({ itemId: "prompt", responseId: "prompt_turn" }),
+    content: [{ type: "input_text", text: "Review the change." }],
+  };
+  // Streams `blocks` after a prompt (so the reuse cache can engage) and checks
+  // every prefix against a full rebuild. Returns the bubbles after the prompt.
+  function buildStreamed(blocks: AnyBlock[]): Bubble[] {
+    const all = [prompt, ...blocks];
+    const cache = createBubbleCache();
+    for (let length = 1; length < all.length; length++) {
+      const prefix = all.slice(0, length);
+      expect(buildBubbles(prefix, null, cache)).toEqual(buildBubbles(prefix, null));
+    }
+    const bubbles = buildBubbles(all, null, cache);
+    expect(bubbles).toEqual(buildBubbles(all, null));
+    return bubbles.slice(1);
+  }
+
+  it.each([true, false])("preserves parent liveness with streaming response = %s", (streaming) => {
+    const active: ActiveResponse | null = streaming
+      ? { responseId: "parent_turn", state: "streaming", error: null }
+      : null;
+    const bubbles = buildBubbles([work, notice()], active, undefined, [], true);
+    expect(bubbles).toMatchObject([
+      {
+        kind: "assistant",
+        responseId: "parent_turn",
+        lifecycle: streaming ? "streaming" : "completed",
+        items: [
+          { kind: "tool", state: "input-available" },
+          { kind: "subagent_activity", itemId: "notice_1" },
+        ],
+      },
+    ]);
+    expect(liveCandidateAssistantIndex(bubbles)).toBe(0);
+  });
+
+  it.each([false, true])("keeps a mid-turn notice in its turn with steering = %s", (steered) => {
+    const user: AnyBlock = {
+      type: "user_message",
+      ctx: ctx({ itemId: "steering", responseId: "parent_turn" }),
+      content: [{ type: "input_text", text: "Include the API change too." }],
+    };
+    const bubbles = buildStreamed([work, notice(), ...(steered ? [user] : []), answer]);
+    const answerItem = { kind: "text", text: "The review is complete." };
+    expect(bubbles).toMatchObject([
+      {
+        kind: "assistant",
+        responseId: "parent_turn",
+        stableId: "parent_tool",
+        items: [{ kind: "tool" }, { kind: "subagent_activity" }, ...(steered ? [] : [answerItem])],
+      },
+      ...(steered
+        ? [
+            { kind: "user" },
+            { responseId: "parent_turn", stableId: "parent_answer", defaultExpanded: true },
+          ]
+        : []),
+    ]);
+    expect(lastRenderableAssistantIndex(bubbles)).toBe(bubbles.length - 1);
+    expect(liveCandidateAssistantIndex(bubbles)).toBe(bubbles.length - 1);
+  });
+
+  it("opens a woken turn's bubble with the notice that woke it", () => {
+    const bubbles = buildStreamed([
+      work,
+      notice("started"),
+      text("parent_wait", "parent_turn", "Waiting on the reviewer."),
+      notice("returned"),
+      { ...work, ctx: ctx({ itemId: "wake_tool", responseId: "wake_turn" }) },
+      text("wake_answer", "wake_turn", "The reviewer approved it."),
+    ]);
+    expect(bubbles).toMatchObject([
+      {
+        responseId: "parent_turn",
+        continued: true,
+        items: [
+          { kind: "tool" },
+          { kind: "subagent_activity", itemId: "started" },
+          { kind: "text" },
+        ],
+      },
+      {
+        responseId: "wake_turn",
+        stableId: "returned",
+        items: [
+          { kind: "subagent_activity", itemId: "returned" },
+          { kind: "tool" },
+          { kind: "text" },
+        ],
+      },
+    ]);
+  });
+
+  it("holds a woken lead's unnamed output with its notice until committed work names it", () => {
+    // Native reasoning deltas carry no response id, so they inherit the old turn's.
+    const thinking: AnyBlock = {
+      type: "reasoning_chunk",
+      ctx: ctx({ responseId: "parent_turn" }),
+      text: "Reading the result.",
+    };
+    const woken = [work, answer, notice("returned"), thinking];
+    expect(buildStreamed(woken)).toMatchObject([
+      {
+        responseId: "parent_turn",
+        items: [
+          { kind: "tool" },
+          { kind: "text" },
+          { kind: "subagent_activity" },
+          { kind: "reasoning" },
+        ],
+      },
+    ]);
+    expect(buildStreamed([...woken, text("wake_answer", "wake_turn", "Approved.")])).toMatchObject([
+      { responseId: "parent_turn", items: [{ kind: "tool" }, { kind: "text" }] },
+      {
+        responseId: "wake_turn",
+        items: [{ kind: "subagent_activity" }, { kind: "reasoning" }, { kind: "text" }],
+      },
+    ]);
+  });
+
+  it("splits at a notice only where committed work changes response", () => {
+    // A live delta carries the active response's id; server items decide, as on reload.
+    const delta: AnyBlock = {
+      type: "text_chunk",
+      ctx: ctx({ responseId: "codex_step2" }),
+      text: "On ",
+    };
+    expect(buildStreamed([work, notice(), delta, answer])).toHaveLength(1);
+    // A response that starts after the notice gets its own bubble, step ids included.
+    const nextStep = text("step_two", "codex_step2", "Next step.");
+    expect(buildStreamed([work, notice(), nextStep])).toMatchObject([
+      { responseId: "parent_turn" },
+      { responseId: "codex_step2", items: [{ kind: "subagent_activity" }, { kind: "text" }] },
+    ]);
+  });
+
+  it("keeps a late notice out of the turn's timing", () => {
+    const stamped = (block: AnyBlock, createdAtS: number): AnyBlock => ({
+      ...block,
+      ctx: { ...block.ctx, createdAtS },
+    });
+    const [bubble] = buildBubbles(
+      [stamped(work, 100), stamped(answer, 130), stamped(notice(), 900)],
+      null,
+    );
+    expect(bubble).toMatchObject({ workedForS: 30, lastActivityAtS: 130, createdAtS: 130 });
+  });
+
+  it("never looks past an unconfirmed user message for the next turn", () => {
+    const sent: AnyBlock = {
+      type: "user_message",
+      ctx: ctx({ itemId: "sent", responseId: "" }),
+      content: [{ type: "input_text", text: "Any update?" }],
+    };
+    expect(
+      buildStreamed([work, notice(), sent, text("wake_answer", "wake_turn", "Still running.")]),
+    ).toMatchObject([
+      { responseId: "parent_turn", items: [{ kind: "tool" }, { kind: "subagent_activity" }] },
+      { kind: "user", itemId: "sent" },
+      { responseId: "wake_turn" },
+    ]);
+  });
+
+  it("keeps notices standalone until work follows them", () => {
+    const notices = [notice("started"), notice("returned")];
+    expect(buildBubbles([prompt, ...notices], null).map((bubble) => bubble.kind)).toEqual([
+      "user",
+      "subagent_activity",
+      "subagent_activity",
+    ]);
+    expect(buildStreamed([...notices, answer])).toMatchObject([
+      {
+        kind: "assistant",
+        responseId: "parent_turn",
+        items: [{ kind: "subagent_activity" }, { kind: "subagent_activity" }, { kind: "text" }],
+      },
+    ]);
+    // A file block renders nothing, so it doesn't hide the work after it.
+    const file: AnyBlock = {
+      type: "file",
+      ctx: ctx({ itemId: "file" }),
+      fileId: "f",
+      filename: null,
+    };
+    expect(buildStreamed([notices[0]!, file, answer])).toMatchObject([
+      { kind: "assistant", items: [{ kind: "subagent_activity" }, { kind: "text" }] },
+    ]);
+  });
+
+  it("keeps a notice recorded before a wake marker in the turn it ended", () => {
+    const wake: AnyBlock = {
+      type: "user_message",
+      ctx: ctx({ itemId: "wake", responseId: "wake_turn" }),
+      content: [{ type: "input_text", text: "[System: sub-agent reviewer finished (completed)]" }],
+    };
+    const wakeTool = { ...work, ctx: ctx({ itemId: "wake_tool", responseId: "wake_turn" }) };
+    expect(buildStreamed([work, notice("returned"), wake, wakeTool])).toMatchObject([
+      {
+        responseId: "parent_turn",
+        continued: true,
+        items: [{ kind: "tool" }, { kind: "subagent_activity", itemId: "returned" }],
+      },
+      { kind: "user", itemId: "wake" },
+      { responseId: "wake_turn", items: [{ kind: "tool" }] },
+    ]);
+  });
+});
 
 describe("buildBubbles — bubble grouping", () => {
   it("UserMessageBlock + TextDone in same response → [user, assistant{ items: [text] }]", () => {
@@ -84,6 +498,225 @@ describe("buildBubbles — bubble grouping", () => {
     expect(asst.items.length).toBe(1);
     expect(asst.items[0]!.kind).toBe("text");
     expect((asst.items[0] as Extract<RenderItem, { kind: "text" }>).text).toBe("Hi!");
+  });
+
+  it("keeps a response expanded after a user interjects into that response", () => {
+    const blocks: AnyBlock[] = [
+      {
+        type: "text_done",
+        ctx: ctx({ itemId: "before", responseId: "resp_merge" }),
+        fullText: "Waiting for the merge bot.",
+        hasCodeBlocks: false,
+      },
+      {
+        type: "user_message",
+        ctx: ctx({ itemId: "question", responseId: "resp_merge" }),
+        content: [{ type: "input_text", text: "Does this conflict?" }],
+      },
+      {
+        type: "text_done",
+        ctx: ctx({ itemId: "checking", responseId: "resp_merge" }),
+        fullText: "Checking.",
+        hasCodeBlocks: false,
+      },
+      {
+        type: "tool_group",
+        ctx: ctx({ itemId: "tool", responseId: "resp_merge" }),
+        executions: [mkExec("shell", "call_1")],
+        iteration: 0,
+      },
+      {
+        type: "text_done",
+        ctx: ctx({ itemId: "answer", responseId: "resp_merge" }),
+        fullText: "No conflict.",
+        hasCodeBlocks: false,
+      },
+      {
+        type: "tool_group",
+        ctx: ctx({ itemId: "cleanup", responseId: "resp_merge" }),
+        executions: [mkExec("shell", "call_2")],
+        iteration: 0,
+      },
+      {
+        type: "text_done",
+        ctx: ctx({ itemId: "done", responseId: "resp_merge" }),
+        fullText: "Merged.",
+        hasCodeBlocks: false,
+      },
+    ];
+
+    const bubbles = buildBubbles(blocks, null);
+    const continuation = bubbles[2] as Extract<Bubble, { kind: "assistant" }>;
+    expect(continuation.items.map((item) => item.kind)).toEqual([
+      "text",
+      "tool",
+      "text",
+      "tool",
+      "text",
+    ]);
+    expect(continuation.defaultExpanded).toBe(true);
+  });
+
+  it("does not mark an ordinary next turn or anonymous live fragments as an interjection", () => {
+    const ordinary: AnyBlock[] = [
+      {
+        type: "text_done",
+        ctx: ctx({ itemId: "before", responseId: "resp_1" }),
+        fullText: "First answer.",
+        hasCodeBlocks: false,
+      },
+      {
+        type: "user_message",
+        ctx: ctx({ itemId: "question", responseId: "resp_2" }),
+        content: [{ type: "input_text", text: "Next question" }],
+      },
+      {
+        type: "text_done",
+        ctx: ctx({ itemId: "work", responseId: "resp_2" }),
+        fullText: "Working.",
+        hasCodeBlocks: false,
+      },
+      {
+        type: "tool_group",
+        ctx: ctx({ itemId: "tool", responseId: "resp_2" }),
+        executions: [mkExec("shell", "call_1")],
+        iteration: 0,
+      },
+      {
+        type: "text_done",
+        ctx: ctx({ itemId: "done", responseId: "resp_2" }),
+        fullText: "Second answer.",
+        hasCodeBlocks: false,
+      },
+    ];
+    const ordinaryReply = buildBubbles(ordinary, null)[2] as Extract<Bubble, { kind: "assistant" }>;
+    expect(ordinaryReply.defaultExpanded).toBeUndefined();
+
+    const anonymous = ordinary.map((block) => ({
+      ...block,
+      ctx: { ...block.ctx, responseId: "" },
+    })) as AnyBlock[];
+    const anonymousReply = buildBubbles(anonymous, null)[2] as Extract<
+      Bubble,
+      { kind: "assistant" }
+    >;
+    expect(anonymousReply.defaultExpanded).toBeUndefined();
+  });
+
+  it("does not detect an interjection across a completed-response marker", () => {
+    const blocks: AnyBlock[] = [
+      {
+        type: "text_done",
+        ctx: ctx({ itemId: "before", responseId: "resp_reused" }),
+        fullText: "First answer.",
+        hasCodeBlocks: false,
+      },
+      {
+        type: "response_end",
+        ctx: ctx({ responseId: "resp_reused" }),
+        status: "completed",
+        response: { id: "resp_reused", status: "completed", model: "test" },
+      },
+      {
+        type: "user_message",
+        ctx: ctx({ itemId: "question", responseId: "resp_reused" }),
+        content: [{ type: "input_text", text: "Next question" }],
+      },
+      {
+        type: "text_done",
+        ctx: ctx({ itemId: "answer", responseId: "resp_reused" }),
+        fullText: "Second answer.",
+        hasCodeBlocks: false,
+      },
+    ];
+
+    const reply = buildBubbles(blocks, null)[2] as Extract<Bubble, { kind: "assistant" }>;
+    expect(reply.defaultExpanded).toBeUndefined();
+  });
+
+  it("does not leak interjection expansion across system or response boundaries", () => {
+    const before: AnyBlock = {
+      type: "text_done",
+      ctx: ctx({ itemId: "before", responseId: "resp_reused" }),
+      fullText: "Waiting for work.",
+      hasCodeBlocks: false,
+    };
+    const human: AnyBlock = {
+      type: "user_message",
+      ctx: ctx({ itemId: "question", responseId: "resp_reused" }),
+      content: [{ type: "input_text", text: "Does this conflict?" }],
+    };
+    const answer = (responseId: string): AnyBlock => ({
+      type: "text_done",
+      ctx: ctx({ itemId: `answer_${responseId}`, responseId }),
+      fullText: "Done.",
+      hasCodeBlocks: false,
+    });
+    const lastAssistant = (blocks: AnyBlock[]) =>
+      buildBubbles(blocks, null).filter(
+        (bubble): bubble is Extract<Bubble, { kind: "assistant" }> => bubble.kind === "assistant",
+      )[1]!;
+
+    const system: AnyBlock = {
+      type: "user_message",
+      ctx: ctx({ itemId: "wake", responseId: "resp_reused" }),
+      content: [{ type: "input_text", text: "[System: timer timer_1 fired]" }],
+    };
+    expect(lastAssistant([before, system, answer("resp_reused")]).defaultExpanded).toBeUndefined();
+    expect(lastAssistant([before, system, human, answer("resp_reused")]).defaultExpanded).toBe(
+      true,
+    );
+
+    const restarted: AnyBlock = {
+      type: "response_start",
+      ctx: ctx({ responseId: "resp_reused" }),
+      model: "test",
+      responseId: "resp_reused",
+      conversationId: null,
+    };
+    expect(
+      lastAssistant([before, human, restarted, answer("resp_reused")]).defaultExpanded,
+    ).toBeUndefined();
+
+    expect(lastAssistant([before, human, answer("resp_new")]).defaultExpanded).toBeUndefined();
+  });
+
+  it("detects an interjection identically through the incremental bubble cache", () => {
+    const cache = createBubbleCache();
+    const before: AnyBlock[] = [
+      {
+        type: "text_done",
+        ctx: ctx({ itemId: "before", responseId: "resp_merge" }),
+        fullText: "Waiting for merge.",
+        hasCodeBlocks: false,
+      },
+    ];
+    buildBubbles(before, null, cache);
+    const withQuestion: AnyBlock[] = [
+      ...before,
+      {
+        type: "user_message",
+        ctx: ctx({ itemId: "question", responseId: "resp_merge" }),
+        content: [{ type: "input_text", text: "Does this conflict?" }],
+      },
+    ];
+    buildBubbles(withQuestion, null, cache);
+    const withAnswer: AnyBlock[] = [
+      ...withQuestion,
+      {
+        type: "text_done",
+        ctx: ctx({ itemId: "answer", responseId: "resp_merge" }),
+        fullText: "No conflict.",
+        hasCodeBlocks: false,
+      },
+    ];
+
+    expect(buildBubbles(withAnswer, null, cache)).toEqual(buildBubbles(withAnswer, null));
+    const reply = buildBubbles(withAnswer, null, cache)[2] as Extract<
+      Bubble,
+      { kind: "assistant" }
+    >;
+    expect(reply.defaultExpanded).toBe(true);
   });
 
   it("propagates ctx.createdBy onto the user bubble", () => {
@@ -147,7 +780,7 @@ describe("buildBubbles — bubble grouping", () => {
     // The blockStream stamps a unique response id on REQUEST-phase
     // elicitations precisely so they do NOT fold into the previous turn's
     // assistant bubble. With that distinct id, the card is its own
-    // elicitation-only bubble, which is what `isRequestElicitationBubble`
+    // elicitation-only bubble, which is what `isStandaloneElicitationBubble`
     // (ChatPage) keys on to lift the prompt above it.
     const blocks: AnyBlock[] = [
       {
@@ -175,6 +808,243 @@ describe("buildBubbles — bubble grouping", () => {
     expect(answer.items.map((i) => i.kind)).toEqual(["text"]);
     const card = bubbles[1] as Extract<Bubble, { kind: "assistant" }>;
     expect(card.items.map((i) => i.kind)).toEqual(["elicitation"]);
+  });
+
+  it("an AskUserQuestion card splits its turn into work / card / work", () => {
+    // The user answering a question is a turn boundary, not a step of the
+    // agent's work: the card takes a bubble of its own (so it renders
+    // outside the "Worked for" fold) and the work after the answer folds
+    // under a NEW one. All three carry the SAME response id — the card
+    // arrives mid-turn, so blockStream stamps it with the turn's id.
+    const blocks: AnyBlock[] = [
+      {
+        type: "user_message",
+        ctx: ctx({ itemId: "u1", responseId: "resp_1" }),
+        content: [{ type: "input_text", text: "Set it up" }],
+      },
+      {
+        type: "tool_group",
+        ctx: ctx({ responseId: "resp_1" }),
+        executions: [mkExec("ls", "c1")],
+        iteration: 0,
+      },
+      {
+        type: "elicitation",
+        ctx: ctx({ itemId: null, responseId: "resp_1" }),
+        elicitationId: "elic_ask",
+        message: "Claude wants to call **AskUserQuestion**",
+        phase: "pre_tool_use",
+        policyName: "claude_native_permission",
+        contentPreview: "AskUserQuestion({})",
+        requestedSchema: {},
+        status: "responded",
+        response: { action: "accept", content: { Framework: "React" } },
+        askUserQuestion: {
+          questions: [
+            {
+              question: "Which framework?",
+              options: [{ label: "React" }, { label: "Vue" }],
+              multiSelect: false,
+            },
+          ],
+        },
+      },
+      {
+        type: "tool_group",
+        ctx: ctx({ responseId: "resp_1" }),
+        executions: [mkExec("write", "c2")],
+        iteration: 0,
+      },
+      {
+        type: "text_done",
+        ctx: ctx({ itemId: "a1", responseId: "resp_1" }),
+        fullText: "Wired up React.",
+        hasCodeBlocks: false,
+      },
+    ];
+    const bubbles = buildBubbles(blocks, null);
+    expect(bubbles.map((b) => b.kind)).toEqual(["user", "assistant", "assistant", "assistant"]);
+    const before = bubbles[1] as Extract<Bubble, { kind: "assistant" }>;
+    const card = bubbles[2] as Extract<Bubble, { kind: "assistant" }>;
+    const after = bubbles[3] as Extract<Bubble, { kind: "assistant" }>;
+    expect(before.items.map((i) => i.kind)).toEqual(["tool"]);
+    expect(card.items.map((i) => i.kind)).toEqual(["elicitation"]);
+    expect(after.items.map((i) => i.kind)).toEqual(["tool", "text"]);
+    // The pre-card work has no answer of its own, so it needs `continued`
+    // to fold behind its own "Worked for" row.
+    expect(before.continued).toBe(true);
+    expect(card.responseId).toBe("resp_1");
+  });
+
+  it("an ExitPlanMode card splits its turn the same way", () => {
+    const blocks: AnyBlock[] = [
+      {
+        type: "tool_group",
+        ctx: ctx({ responseId: "resp_1" }),
+        executions: [mkExec("ls", "c1")],
+        iteration: 0,
+      },
+      {
+        type: "elicitation",
+        ctx: ctx({ itemId: null, responseId: "resp_1" }),
+        elicitationId: "elic_plan",
+        message: "Claude wants to call **ExitPlanMode**",
+        phase: "pre_tool_use",
+        policyName: "claude_native_permission",
+        contentPreview: "ExitPlanMode({...})",
+        requestedSchema: {},
+        status: "responded",
+        response: { action: "accept" },
+        exitPlanMode: { plan: "# Plan\n\n1. Do the thing" },
+      },
+      {
+        type: "text_done",
+        ctx: ctx({ itemId: "a1", responseId: "resp_1" }),
+        fullText: "Done.",
+        hasCodeBlocks: false,
+      },
+    ];
+    const bubbles = buildBubbles(blocks, null);
+    expect(bubbles.map((b) => b.kind)).toEqual(["assistant", "assistant", "assistant"]);
+    expect((bubbles[1] as Extract<Bubble, { kind: "assistant" }>).items.map((i) => i.kind)).toEqual(
+      ["elicitation"],
+    );
+  });
+
+  it("an approval card stays inside the turn it gated", () => {
+    // Approvals are part of the work's history — they fold with the trace
+    // in document order. Only cards that ask the USER split the bubble.
+    const blocks: AnyBlock[] = [
+      {
+        type: "tool_group",
+        ctx: ctx({ responseId: "resp_1" }),
+        executions: [mkExec("ls", "c1")],
+        iteration: 0,
+      },
+      {
+        type: "elicitation",
+        ctx: ctx({ itemId: null, responseId: "resp_1" }),
+        elicitationId: "elic_push",
+        message: "Allow `git push`?",
+        phase: "tool_call",
+        policyName: "blast_radius",
+        contentPreview: '{"command": "git push"}',
+        requestedSchema: {},
+        status: "responded",
+        response: { action: "accept" },
+      },
+      {
+        type: "text_done",
+        ctx: ctx({ itemId: "a1", responseId: "resp_1" }),
+        fullText: "Pushed.",
+        hasCodeBlocks: false,
+      },
+    ];
+    const bubbles = buildBubbles(blocks, null);
+    expect(bubbles.length).toBe(1);
+    const turn = bubbles[0] as Extract<Bubble, { kind: "assistant" }>;
+    expect(turn.items.map((i) => i.kind)).toEqual(["tool", "elicitation", "text"]);
+  });
+
+  it("a Claude background-task wake splits the turn so the finished answer keeps its bubble", () => {
+    // Claude Code resumes on a `<task-notification>` (mirrored as a meta
+    // user item) with no human message in between. Grouping every
+    // assistant item after the real question into one bubble folded the
+    // finished answer behind the follow-up work's "Worked for" row; the
+    // wake must land as a system marker that starts a new bubble.
+    const items: ConversationItem[] = [
+      {
+        id: "u_q",
+        response_id: "resp_q",
+        type: "message",
+        status: "completed",
+        role: "user",
+        content: [{ type: "input_text", text: "what is this latency?" }],
+      },
+      {
+        id: "a_answer",
+        response_id: "resp_answer",
+        type: "message",
+        status: "completed",
+        role: "assistant",
+        model: "claude-native-ui",
+        content: [{ type: "output_text", text: "It is end-to-end launch latency." }],
+      },
+      {
+        id: "u_wake",
+        response_id: "resp_wake",
+        type: "message",
+        status: "completed",
+        role: "user",
+        is_meta: true,
+        content: [
+          {
+            type: "input_text",
+            text: [
+              "<task-notification>",
+              "<task-id>b3f9a2c1d</task-id>",
+              "<status>completed</status>",
+              "<summary>Background command completed (exit code 0)</summary>",
+              "</task-notification>",
+            ].join("\n"),
+          },
+        ],
+      },
+      {
+        id: "a_followup_1",
+        response_id: "resp_followup",
+        type: "message",
+        status: "completed",
+        role: "assistant",
+        model: "claude-native-ui",
+        content: [{ type: "output_text", text: "Both runs finished — checking metrics." }],
+      },
+      {
+        id: "fc_runs",
+        response_id: "resp_followup",
+        type: "function_call",
+        status: "completed",
+        model: "claude-native-ui",
+        name: "shell",
+        arguments: '{"command": "air runs list"}',
+        call_id: "call_runs",
+      },
+      {
+        id: "fo_runs",
+        response_id: "resp_followup",
+        type: "function_call_output",
+        status: "completed",
+        call_id: "call_runs",
+        output: "run 1: 40s\nrun 2: 35s\n",
+      },
+      {
+        id: "a_followup_2",
+        response_id: "resp_followup",
+        type: "message",
+        status: "completed",
+        role: "assistant",
+        model: "claude-native-ui",
+        content: [{ type: "output_text", text: "Both additional runs succeeded." }],
+      },
+    ];
+
+    const bubbles = buildBubbles(itemsToBlocks(items), null);
+
+    expect(bubbles.map((b) => b.kind)).toEqual(["user", "assistant", "user", "assistant"]);
+    const answer = bubbles[1] as Extract<Bubble, { kind: "assistant" }>;
+    // Text only: nothing to fold, so the answer renders in full.
+    expect(answer.items.map((i) => i.kind)).toEqual(["text"]);
+    expect((answer.items[0] as Extract<RenderItem, { kind: "text" }>).text).toBe(
+      "It is end-to-end launch latency.",
+    );
+    const marker = bubbles[2] as Extract<Bubble, { kind: "user" }>;
+    expect(marker.itemId).toBe("u_wake");
+    expect((marker.content[0] as { text: string }).text).toBe(
+      "[System: background task b3f9a2c1d completed]\nBackground command completed (exit code 0)",
+    );
+    const followup = bubbles[3] as Extract<Bubble, { kind: "assistant" }>;
+    expect(followup.responseId).toBe("resp_followup");
+    expect(followup.items.some((i) => i.kind === "tool")).toBe(true);
   });
 
   it("two response_ids produce two assistant bubbles in order", () => {
@@ -239,6 +1109,110 @@ describe("buildBubbles — bubble grouping", () => {
     ]);
   });
 
+  it("error block level reaches the render item", () => {
+    const blocks: AnyBlock[] = [
+      {
+        type: "user_message",
+        ctx: ctx({ itemId: "u1", responseId: "resp_1" }),
+        content: [{ type: "input_text", text: "First" }],
+      },
+      {
+        type: "error",
+        ctx: ctx({ itemId: "err_info", responseId: "resp_1" }),
+        source: "harness",
+        code: "codex_thread_reset",
+        message: "Codex started a fresh thread.",
+        level: "info",
+      },
+    ];
+    const bubbles = buildBubbles(blocks, null);
+    const asst = bubbles[1] as Extract<Bubble, { kind: "assistant" }>;
+    expect(asst.items[0]).toMatchObject({ kind: "error", level: "info" });
+  });
+
+  it("groups consecutive errors from the same response, turn, and agent", () => {
+    const blocks: AnyBlock[] = [
+      {
+        type: "user_message",
+        ctx: ctx({ itemId: "u1", responseId: "resp_failed" }),
+        content: [{ type: "input_text", text: "Run it" }],
+      },
+      {
+        type: "error",
+        ctx: ctx({ itemId: "err_1", responseId: "resp_failed" }),
+        source: "execution",
+        code: "required_terminal_exited",
+        message: "Terminal exited.",
+      },
+      {
+        type: "error",
+        ctx: ctx({ itemId: "err_2", responseId: "resp_failed" }),
+        source: "execution",
+        code: "runner_disconnected",
+        message: "Runner disconnected.\n\nTerminal diagnostics:\ntunnel: closed",
+      },
+    ];
+
+    const bubbles = buildBubbles(blocks, null);
+    expect(bubbles.map((bubble) => bubble.kind)).toEqual(["user", "assistant"]);
+    const assistant = bubbles[1] as Extract<Bubble, { kind: "assistant" }>;
+    expect(assistant.items).toEqual([
+      {
+        kind: "error",
+        itemId: "err_1",
+        source: "execution",
+        code: "required_terminal_exited",
+        message: "Terminal exited.",
+        relatedErrors: [
+          {
+            itemId: "err_2",
+            source: "execution",
+            code: "runner_disconnected",
+            message: "Runner disconnected.\n\nTerminal diagnostics:\ntunnel: closed",
+          },
+        ],
+      },
+    ]);
+  });
+
+  it("keeps errors with different causal boundaries in separate bubbles", () => {
+    const blocks: AnyBlock[] = [
+      {
+        type: "error",
+        ctx: ctx({ itemId: "err_1", responseId: "resp_1" }),
+        source: "execution",
+        code: "runner_error",
+        message: "First turn failed.",
+      },
+      {
+        type: "error",
+        ctx: ctx({ itemId: "err_2", responseId: "resp_2", turn: 1 }),
+        source: "execution",
+        code: "runner_error",
+        message: "First turn failed.",
+      },
+    ];
+
+    const bubbles = buildBubbles(blocks, null);
+    expect(bubbles).toHaveLength(2);
+    expect(
+      bubbles.map((bubble) =>
+        bubble.kind === "assistant"
+          ? { responseId: bubble.responseId, items: bubble.items.length }
+          : bubble.kind,
+      ),
+    ).toEqual([
+      { responseId: "resp_1", items: 1 },
+      { responseId: "resp_2", items: 1 },
+    ]);
+    for (const bubble of bubbles) {
+      if (bubble.kind !== "assistant") continue;
+      expect((bubble.items[0] as Extract<RenderItem, { kind: "error" }>).relatedErrors).toBe(
+        undefined,
+      );
+    }
+  });
+
   it("compaction block becomes a standalone compaction bubble", () => {
     const blocks: AnyBlock[] = [
       {
@@ -286,6 +1260,84 @@ describe("buildBubbles — bubble grouping", () => {
     ];
     const bubbles = buildBubbles(blocks, null);
     expect(bubbles.map((b) => b.kind)).toEqual(["assistant", "compaction"]);
+  });
+
+  it("repeated compaction_loading blocks refresh one spinner instead of stacking", () => {
+    // A long compaction re-announces in_progress on every status poll. The
+    // walker must fold the repeats into the ONE live spinner — anchored to
+    // the server-reported start — or completion later orphans the extras.
+    const blocks: AnyBlock[] = [
+      { type: "compaction_loading", ctx: ctx({ clientCreatedAtS: 1_000 }), startedAtS: 900 },
+      { type: "compaction_loading", ctx: ctx({ clientCreatedAtS: 1_060 }), startedAtS: 900 },
+    ];
+    const bubbles = buildBubbles(blocks, null);
+    expect(bubbles.map((b) => b.kind)).toEqual(["compaction_loading"]);
+    expect((bubbles[0] as Extract<Bubble, { kind: "compaction_loading" }>).createdAtS).toBe(900);
+  });
+
+  it("a spinner refresh without a server start keeps the first client receive time", () => {
+    // An emitter that doesn't track started_at must not re-anchor the
+    // elapsed counter to the later announcement's receive time.
+    const blocks: AnyBlock[] = [
+      { type: "compaction_loading", ctx: ctx({ clientCreatedAtS: 1_000 }) },
+      { type: "compaction_loading", ctx: ctx({ clientCreatedAtS: 1_060 }) },
+    ];
+    const bubbles = buildBubbles(blocks, null);
+    expect(bubbles.map((b) => b.kind)).toEqual(["compaction_loading"]);
+    expect((bubbles[0] as Extract<Bubble, { kind: "compaction_loading" }>).createdAtS).toBe(1_000);
+  });
+
+  it("completion clears every compaction spinner, leaving only the marker", () => {
+    // Regression: each re-announcement used to stack a spinner and
+    // completion removed only the most recent one — the orphan kept
+    // counting and flashing beside the "Conversation compacted" marker.
+    const blocks: AnyBlock[] = [
+      { type: "compaction_loading", ctx: ctx({ clientCreatedAtS: 1_000 }) },
+      { type: "compaction_loading", ctx: ctx({ clientCreatedAtS: 1_060 }) },
+      { type: "compaction", ctx: ctx({ itemId: "comp_1", responseId: "resp_compact" }) },
+    ];
+    const bubbles = buildBubbles(blocks, null);
+    expect(bubbles.map((b) => b.kind)).toEqual(["compaction"]);
+  });
+
+  it("incremental appends fold re-announcements and clear the spinner on completion", () => {
+    // The cached walk must behave exactly like the full rebuild across the
+    // announce → re-announce → complete sequence (the live-stream path).
+    const cache = createBubbleCache();
+    const user: AnyBlock = {
+      type: "user_message",
+      ctx: ctx({ itemId: "u1", responseId: "resp_1" }),
+      content: [{ type: "input_text", text: "hello" }],
+    };
+    const first: AnyBlock = {
+      type: "compaction_loading",
+      ctx: ctx({ clientCreatedAtS: 1_000, responseId: "resp_compact" }),
+      startedAtS: 900,
+    };
+    const again: AnyBlock = {
+      type: "compaction_loading",
+      ctx: ctx({ clientCreatedAtS: 1_060, responseId: "resp_compact" }),
+      startedAtS: 900,
+    };
+    const done: AnyBlock = {
+      type: "compaction",
+      ctx: ctx({ itemId: "comp_1", responseId: "resp_compact" }),
+    };
+
+    let blocks: AnyBlock[] = [user, first];
+    expect(buildBubbles(blocks, null, cache).map((b) => b.kind)).toEqual([
+      "user",
+      "compaction_loading",
+    ]);
+
+    blocks = [...blocks, again];
+    let bubbles = buildBubbles(blocks, null, cache);
+    expect(bubbles.map((b) => b.kind)).toEqual(["user", "compaction_loading"]);
+    expect((bubbles[1] as Extract<Bubble, { kind: "compaction_loading" }>).createdAtS).toBe(900);
+
+    blocks = [...blocks, done];
+    bubbles = buildBubbles(blocks, null, cache);
+    expect(bubbles.map((b) => b.kind)).toEqual(["user", "compaction"]);
   });
 
   it("UserMessageBlock with mixed content preserves attachments", () => {
@@ -748,6 +1800,110 @@ describe("buildBubbles — tool joining", () => {
     const items = (bubbles[0] as Extract<Bubble, { kind: "assistant" }>).items;
     const t = items[0] as Extract<RenderItem, { kind: "tool" }>;
     expect(t.state).toBe("no-output");
+  });
+});
+
+describe("buildBubbles — session-driven trailing tool spinner", () => {
+  // claude-native has no streaming `activeResponse` — its running/idle lives
+  // in `sessionStatus`. The `sessionRunning` arg spins the newest turn's
+  // trailing tool phase so a dispatched-but-unresolved tool shows a spinner
+  // instead of "No output", without any bubble reaching lifecycle "streaming".
+  function toolState(bubbles: Bubble[]): string {
+    const asst = bubbles[bubbles.length - 1] as Extract<Bubble, { kind: "assistant" }>;
+    const tool = asst.items.find(
+      (item): item is Extract<RenderItem, { kind: "tool" }> => item.kind === "tool",
+    );
+    expect(tool).toBeDefined();
+    return tool!.state;
+  }
+
+  const danglingToolTurn: AnyBlock[] = [
+    {
+      type: "tool_group",
+      ctx: ctx({ itemId: "fc_1", responseId: "resp_1" }),
+      executions: [mkExec("Bash", "c1")],
+      iteration: 0,
+    },
+  ];
+
+  it("spins the newest turn's trailing tool while the session is running", () => {
+    // No activeResponse (claude-native never opens one), sessionRunning=true.
+    const bubbles = buildBubbles(danglingToolTurn, null, undefined, [], true);
+    expect(toolState(bubbles)).toBe("input-available");
+  });
+
+  it("does not spin when the session is idle (dangling tool resolves to no-output)", () => {
+    // The idle edge can land before the tool's result block — the tool must
+    // settle, not spin forever. This is the property the never-spin tests pin,
+    // now exercised through the session-driven path.
+    const bubbles = buildBubbles(danglingToolTurn, null, undefined, [], false);
+    expect(toolState(bubbles)).toBe("no-output");
+  });
+
+  it("a resolved tool shows its output regardless of session running", () => {
+    const blocks: AnyBlock[] = [
+      ...danglingToolTurn,
+      {
+        type: "tool_result",
+        ctx: ctx({ itemId: "fco_1", responseId: "resp_1" }),
+        name: "",
+        callId: "c1",
+        agentName: "test",
+        output: "done",
+      },
+    ];
+    const bubbles = buildBubbles(blocks, null, undefined, [], true);
+    expect(toolState(bubbles)).toBe("output-available");
+  });
+
+  it("only the NEWEST turn spins — an earlier turn's dangling tool stays no-output", () => {
+    const blocks: AnyBlock[] = [
+      {
+        type: "tool_group",
+        ctx: ctx({ itemId: "fc_old", responseId: "resp_old" }),
+        executions: [mkExec("Read", "c_old")],
+        iteration: 0,
+      },
+      { type: "user_message", ctx: ctx({ itemId: "u1", responseId: "" }), content: [] },
+      {
+        type: "tool_group",
+        ctx: ctx({ itemId: "fc_new", responseId: "resp_new" }),
+        executions: [mkExec("Bash", "c_new")],
+        iteration: 0,
+      },
+    ];
+    const bubbles = buildBubbles(blocks, null, undefined, [], true);
+    const assistants = bubbles.filter(
+      (b): b is Extract<Bubble, { kind: "assistant" }> => b.kind === "assistant",
+    );
+    const oldTool = assistants[0].items.find((item) => item.kind === "tool");
+    const newTool = assistants[1].items.find((item) => item.kind === "tool");
+    expect((oldTool as Extract<RenderItem, { kind: "tool" }>).state).toBe("no-output");
+    expect((newTool as Extract<RenderItem, { kind: "tool" }>).state).toBe("input-available");
+  });
+
+  it("a trailing user message means no live turn — nothing spins", () => {
+    // A just-sent prompt with no assistant output yet: newestAssistantTurnId
+    // returns null, so the earlier turn's tool does not spin.
+    const blocks: AnyBlock[] = [
+      ...danglingToolTurn,
+      { type: "user_message", ctx: ctx({ itemId: "u1", responseId: "" }), content: [] },
+    ];
+    const bubbles = buildBubbles(blocks, null, undefined, [], true);
+    const asst = bubbles.find(
+      (b): b is Extract<Bubble, { kind: "assistant" }> => b.kind === "assistant",
+    )!;
+    const tool = asst.items.find((item) => item.kind === "tool");
+    expect((tool as Extract<RenderItem, { kind: "tool" }>).state).toBe("no-output");
+  });
+
+  it("the cache re-walks on a running→idle flip so a dangling tool stops spinning", () => {
+    // The flip carries no block change; the cache key must still see it move.
+    const cache = createBubbleCache();
+    expect(toolState(buildBubbles(danglingToolTurn, null, cache, [], true))).toBe(
+      "input-available",
+    );
+    expect(toolState(buildBubbles(danglingToolTurn, null, cache, [], false))).toBe("no-output");
   });
 });
 
@@ -1266,6 +2422,28 @@ describe("buildBubbles — lifecycle from activeResponse", () => {
         itemId: "msg_interrupted",
         text: "partial answer",
         final: true,
+      },
+    ]);
+  });
+
+  it("carries a TextDone phase onto its text item", () => {
+    const blocks: AnyBlock[] = [
+      {
+        type: "text_done",
+        ctx: ctx({ itemId: "msg_commentary", responseId: "codex_turn_123" }),
+        fullText: "Checking the tests.",
+        hasCodeBlocks: false,
+        phase: "commentary",
+      },
+    ];
+    const a = buildBubbles(blocks, null)[0] as Extract<Bubble, { kind: "assistant" }>;
+    expect(a.items).toEqual([
+      {
+        kind: "text",
+        itemId: "msg_commentary",
+        text: "Checking the tests.",
+        final: true,
+        phase: "commentary",
       },
     ]);
   });
@@ -2604,6 +3782,12 @@ describe("bubblesEqual — React.memo comparator", () => {
     );
   });
 
+  it("reports not-equal when interjection expansion changes", () => {
+    const collapsed = assistant("Done", "completed") as Extract<Bubble, { kind: "assistant" }>;
+    const expanded: Bubble = { ...collapsed, defaultExpanded: true };
+    expect(bubblesEqual(collapsed, expanded)).toBe(false);
+  });
+
   it("reports not-equal when the item count changes", () => {
     const oneItem = assistant("Hi", "completed");
     const twoItems: Bubble = {
@@ -2732,7 +3916,7 @@ describe("buildBubbles — workedForS turn duration", () => {
   const textDone = (
     itemId: string,
     text: string,
-    stamps?: { timestamp?: number; createdAtS?: number },
+    stamps?: { timestamp?: number; createdAtS?: number; clientCreatedAtS?: number },
   ): AnyBlock => ({
     type: "text_done",
     ctx: ctx({ itemId, ...stamps }),
@@ -2780,6 +3964,183 @@ describe("buildBubbles — workedForS turn duration", () => {
         textDone("a2", "b", { createdAtS: 1_753_900_000 }),
       ]).workedForS,
     ).toBeUndefined();
+    // Post-timestamp-feature live shape: live blocks carry BOTH the
+    // page-relative clock and a client-epoch stamp. A mid-turn reload
+    // pairs a server-stamped first block with such a live last block —
+    // the epoch branch must not reach for the client stamp (it lives in
+    // `clientCreatedAtS` precisely so these guards stay single-clock).
+    expect(
+      assistantBubble([
+        textDone("a1", "a", { createdAtS: 1_753_900_000 }),
+        textDone("a2", "b", { timestamp: 42, clientCreatedAtS: 1_753_900_045 }),
+      ]).workedForS,
+    ).toBeUndefined();
+    // …reverse direction, live first block with both stamps.
+    expect(
+      assistantBubble([
+        textDone("a1", "a", { timestamp: 42, clientCreatedAtS: 1_753_900_045 }),
+        textDone("a2", "b", { createdAtS: 1_753_900_000 }),
+      ]).workedForS,
+    ).toBeUndefined();
+  });
+
+  it("spans live blocks that also carry client-epoch stamps via the page clock", () => {
+    // Pure-live turn post-timestamp-feature: every block has a
+    // clientCreatedAtS, but the page-relative branch still decides.
+    const bubble = assistantBubble([
+      textDone("a1", "working…", { timestamp: 10.25, clientCreatedAtS: 1_753_900_000 }),
+      textDone("a2", "done", { timestamp: 116.5, clientCreatedAtS: 1_753_900_106 }),
+    ]);
+    expect(bubble.workedForS).toBeCloseTo(106.25);
+  });
+});
+
+describe("buildBubbles — bubble display timestamps", () => {
+  const userBlock = (stamps: { createdAtS?: number; clientCreatedAtS?: number }): AnyBlock => ({
+    type: "user_message",
+    ctx: ctx({ itemId: "u1", responseId: "resp_1", ...stamps }),
+    content: [{ type: "input_text", text: "hi" }],
+  });
+  const textDone = (
+    itemId: string,
+    stamps?: { timestamp?: number; createdAtS?: number; clientCreatedAtS?: number },
+  ): AnyBlock => ({
+    type: "text_done",
+    ctx: ctx({ itemId, ...stamps }),
+    fullText: "text",
+    hasCodeBlocks: false,
+  });
+
+  it("prefers the server stamp, falls back to the client stamp", () => {
+    // Cold load: the server stamp flows straight through.
+    let bubble = buildBubbles([userBlock({ createdAtS: 1_753_900_000 })], null)[0] as Extract<
+      Bubble,
+      { kind: "user" }
+    >;
+    expect(bubble.createdAtS).toBe(1_753_900_000);
+    // Live: no server stamp yet, the client send-time stamp shows.
+    bubble = buildBubbles([userBlock({ clientCreatedAtS: 1_753_900_001 })], null)[0] as Extract<
+      Bubble,
+      { kind: "user" }
+    >;
+    expect(bubble.createdAtS).toBe(1_753_900_001);
+    // Neither: no timestamp rendered.
+    bubble = buildBubbles([userBlock({})], null)[0] as Extract<Bubble, { kind: "user" }>;
+    expect(bubble.createdAtS).toBeUndefined();
+  });
+
+  it("stamps an assistant group from its freshest stamped block", () => {
+    const bubble = buildBubbles(
+      [
+        textDone("a1", { clientCreatedAtS: 1_753_900_010 }),
+        textDone("a2", { clientCreatedAtS: 1_753_900_020 }),
+      ],
+      null,
+    )[0] as Extract<Bubble, { kind: "assistant" }>;
+    expect(bubble.createdAtS).toBe(1_753_900_020);
+    // The FRESHEST stamp wins regardless of which clock carried it —
+    // a mid-turn reload pairs server-stamped history with a live tail,
+    // and the display must reflect the latest activity, not whichever
+    // block walked first.
+    const reloaded = buildBubbles(
+      [
+        textDone("a1", { createdAtS: 1_753_900_005 }),
+        textDone("a2", { clientCreatedAtS: 1_753_900_010 }),
+      ],
+      null,
+    )[0] as Extract<Bubble, { kind: "assistant" }>;
+    expect(reloaded.createdAtS).toBe(1_753_900_010);
+  });
+
+  it("keeps a long turn's timestamp current instead of pinned to turn start", () => {
+    // Regression: a long turn under one response id showed the FIRST
+    // item's stamp, so an actively streaming "latest message" read
+    // 30+ minutes behind the wall clock.
+    const turnStart = 1_753_900_000;
+    const bubble = buildBubbles(
+      [
+        textDone("a1", { createdAtS: turnStart }),
+        textDone("a2", { createdAtS: turnStart + 40 * 60 }),
+        textDone("a3", { createdAtS: turnStart + 41 * 60 }),
+      ],
+      null,
+    )[0] as Extract<Bubble, { kind: "assistant" }>;
+    expect(bubble.createdAtS).toBe(turnStart + 41 * 60);
+  });
+
+  it("never moves the group timestamp backwards for a backdated tail block", () => {
+    // A late-arriving block can carry an older stamp (a relay-backdated
+    // tool result); the displayed time must not jump back.
+    const bubble = buildBubbles(
+      [
+        textDone("a1", { createdAtS: 1_753_900_000 }),
+        textDone("a2", { createdAtS: 1_753_900_300 }),
+        textDone("a3", { createdAtS: 1_753_900_100 }),
+      ],
+      null,
+    )[0] as Extract<Bubble, { kind: "assistant" }>;
+    expect(bubble.createdAtS).toBe(1_753_900_300);
+  });
+
+  it("does not stamp a bubble from a foreign absorbed tool result", () => {
+    // A delayed function_call_output is relay-backdated to its original
+    // turn's response id, so it lands after the next bubble's blocks and
+    // is absorbed into that bubble's group. It renders into its own
+    // turn's card via crossBubbleResults — it must not stamp the bubble
+    // that merely absorbed it.
+    const blocks: AnyBlock[] = [
+      {
+        type: "tool_group",
+        ctx: ctx({ itemId: "fc_a", responseId: "resp_A", createdAtS: 1_753_900_000 }),
+        executions: [mkExec("spawn_agent", "c1")],
+        iteration: 0,
+      },
+      userBlock({ createdAtS: 1_753_900_100 }),
+      textDone("b1", { createdAtS: 1_753_900_200 }),
+      {
+        type: "tool_result",
+        ctx: ctx({ itemId: "fco_a", responseId: "resp_A", createdAtS: 1_753_900_300 }),
+        name: "",
+        callId: "c1",
+        agentName: "test",
+        output: "late output",
+      },
+    ];
+    const bubbles = buildBubbles(blocks, null);
+    expect(bubbles.map((b) => b.kind)).toEqual(["assistant", "user", "assistant"]);
+    // Premise: the absorbed result renders into bubble A's tool card.
+    const bubbleA = bubbles[0] as Extract<Bubble, { kind: "assistant" }>;
+    expect(
+      bubbleA.items.some((item) => item.kind === "tool" && item.output === "late output"),
+    ).toBe(true);
+    // Bubble B keeps its own freshest stamp, not the foreign result's.
+    const bubbleB = bubbles[2] as Extract<Bubble, { kind: "assistant" }>;
+    expect(bubbleB.createdAtS).toBe(1_753_900_200);
+  });
+
+  it("still stamps from a tool result whose call lives in the same bubble", () => {
+    // A turn's latest activity is often its trailing tool result —
+    // excluding results wholesale would re-pin the timestamp.
+    const bubble = buildBubbles(
+      [
+        {
+          type: "tool_group",
+          ctx: ctx({ itemId: "fc_1", responseId: "resp_1", createdAtS: 1_753_900_000 }),
+          executions: [mkExec("Bash", "c1")],
+          iteration: 0,
+        },
+        {
+          type: "tool_result",
+          ctx: ctx({ itemId: "fco_1", responseId: "resp_1", createdAtS: 1_753_900_050 }),
+          name: "",
+          callId: "c1",
+          agentName: "test",
+          output: "ok",
+        },
+      ],
+      null,
+    )[0] as Extract<Bubble, { kind: "assistant" }>;
+    expect(bubble.createdAtS).toBe(1_753_900_050);
   });
 });
 

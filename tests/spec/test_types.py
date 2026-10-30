@@ -13,7 +13,7 @@ import json
 
 import pytest
 
-from omnigent.spec.types import ExecutorSpec, RetryPolicy
+from omnigent.spec.types import AgentSpec, ExecutorSpec, RetryPolicy
 
 
 @pytest.mark.parametrize(
@@ -42,6 +42,29 @@ def test_harness_kind(executor: ExecutorSpec, expected: str) -> None:
     would mis-badge the agent.
     """
     assert executor.harness_kind == expected
+
+
+@pytest.mark.parametrize(
+    ("policy", "expected"),
+    [
+        (RetryPolicy(), {"CLAUDE_CODE_MAX_RETRIES": "7", "API_TIMEOUT_MS": "120000"}),
+        (
+            RetryPolicy(max_retries=0, timeout_per_request_s=1.25),
+            {"CLAUDE_CODE_MAX_RETRIES": "0", "API_TIMEOUT_MS": "1250"},
+        ),
+        (
+            RetryPolicy(timeout_per_request_s=1.001),
+            {"CLAUDE_CODE_MAX_RETRIES": "7", "API_TIMEOUT_MS": "1001"},
+        ),
+        (
+            RetryPolicy(timeout_per_request_s=0.0001),
+            {"CLAUDE_CODE_MAX_RETRIES": "7", "API_TIMEOUT_MS": "1"},
+        ),
+        (RetryPolicy(timeout_per_request_s=None), {"CLAUDE_CODE_MAX_RETRIES": "7"}),
+    ],
+)
+def test_claude_cli_retry_environment(policy: RetryPolicy, expected: dict[str, str]) -> None:
+    assert policy.claude_cli.env() == expected
 
 
 def test_retry_policy_to_json_round_trips() -> None:
@@ -192,3 +215,48 @@ def test_retry_policy_from_json_rejects_non_list_status_codes() -> None:
     )
     with pytest.raises(ValueError, match="retryable_status_codes must be a list"):
         RetryPolicy.from_json(payload)
+
+
+# ── AgentSpec.source_rel_dir ──────────────────────────────────
+#
+# Bundle provenance for sub-agent workdir resolution: the directory
+# a sub-agent was parsed from, relative to its parent's ``agents/``.
+# Stamped only by the parser; never serialized.
+
+
+def test_agent_spec_source_rel_dir_defaults_to_none() -> None:
+    """A spec built without provenance carries none.
+
+    Root, synthetic and in-memory specs (e.g. ``__web_researcher``)
+    never come from a bundle subdirectory, and the resolver treats a
+    ``None`` here as "no child workdir" rather than guessing.
+    """
+    assert AgentSpec(spec_version=1, name="probe").source_rel_dir is None
+
+
+def test_agent_spec_source_rel_dir_excluded_from_equality() -> None:
+    """Provenance is metadata, not identity (``compare=False``).
+
+    Existing tests and caches compare specs structurally; stamping a
+    directory name must not make two otherwise-identical specs unequal.
+    """
+    bare = AgentSpec(spec_version=1, name="probe")
+    stamped = AgentSpec(spec_version=1, name="probe")
+    stamped.source_rel_dir = "researcher"
+
+    assert bare == stamped
+    assert stamped.source_rel_dir == "researcher"
+
+
+def test_agent_spec_positional_construction_unaffected() -> None:
+    """The field is appended last, so positional callers still work.
+
+    Pin against reordering: inserting it anywhere earlier would
+    silently rebind every positional argument after it.
+    """
+    spec = AgentSpec(1, "probe", "a description")
+
+    assert spec.spec_version == 1
+    assert spec.name == "probe"
+    assert spec.description == "a description"
+    assert spec.source_rel_dir is None

@@ -1,17 +1,6 @@
-// Editor for a project's stored default session settings (`config`), reached
-// from the project-folder kebab menu. Writing a project's config is what lets
-// the new-chat composer pre-fill host / working directory / agent and the
-// isolated-worktree default when starting a session in the project.
-//
-// Scope mirrors what the composer prefills today: host, workspace, agent,
-// whether new sessions start in a fresh git worktree, and the base branch a
-// worktree forks from (which overrides the user-global default in Settings ›
-// Git). Model / reasoning-effort / harness are per-agent run config,
-// deliberately out of scope here. The host and agent pickers reuse the
-// composer's components; the working directory reuses its filesystem browser
-// (inline, so it scrolls inside the modal).
-// Fields are optional: an unset one stores no default (an absent key), and an
-// all-default dialog stores an empty config.
+// Project settings dialog: edits the stored defaults (`config`) the new-session
+// composer prefills (host, workspace, agent, worktree and base branch, and a model
+// and effort for native harnesses), shown with the project's last start applied.
 
 import { ChevronDownIcon } from "lucide-react";
 import { type FormEvent, useEffect, useMemo, useRef, useState } from "react";
@@ -32,18 +21,32 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
+import { nativeEffortOptions } from "@/components/HarnessConfigControls";
 import { useProjectConfig, useUpdateProjectConfig } from "@/hooks/useConversations";
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
-import { useHosts } from "@/hooks/useHosts";
-import { sortAgentsForDisplay } from "@/lib/agentGrouping";
+import { useHostModelOptions, useHosts } from "@/hooks/useHosts";
+import { selectableSessionAgents } from "@/lib/agentGrouping";
 import { sandboxOptionLabel } from "@/lib/capabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { readAlwaysUseWorktree } from "@/lib/worktreeDefaultPreferences";
 import { SANDBOX_HOST_CHOICE } from "@/lib/hostPreferences";
-import { isNativeCodingAgent } from "@/lib/nativeCodingAgents";
+import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
+import { findNativeModelOption } from "@/lib/codexNativeModels";
+import { normalizeEffortLabel } from "@/lib/composerModelLabel";
+import {
+  isNativeCodingAgent,
+  nativeAgentHasCapability,
+  nativeCodingAgentForAvailableAgent,
+} from "@/lib/nativeCodingAgents";
 import type { ProjectConfig } from "@/lib/projectsApi";
+import {
+  clearProjectLaunchDefaults,
+  projectConfigWithLaunch,
+  readProjectLaunchDefaults,
+} from "@/lib/projectLaunchPreferences";
 import { shouldGuardDialogDismiss } from "@/lib/dialogDismissGuard";
 import { AgentHarnessPicker } from "./NewChatDialog";
-import { isNavigablePath, WorkspacePicker } from "./WorkspacePicker";
+import { WorkspacePickerDialog } from "./WorkspacePickerDialog";
 
 /** Select sentinel for "no default" — Radix Select can't hold an empty value. */
 const NONE = "__none__";
@@ -100,9 +103,23 @@ export function ProjectSettingsDialog({
   // fetch succeeds. A label-only folder (no id) has nothing to load, so it's
   // never in this state.
   const loadFailed = projectId !== null && isError;
+  // The project's last start fills the fields, as it does the composer, until
+  // the stored settings are edited after it; saving makes it the stored settings.
+  const launch = useMemo(
+    () =>
+      open && projectId !== null && stored !== undefined
+        ? readProjectLaunchDefaults(projectId, stored)
+        : null,
+    [open, projectId, stored],
+  );
   const updateConfig = useUpdateProjectConfig();
   const hosts = useHosts();
-  const { data: agents } = useAvailableAgents();
+  // Pin the stored default agent into discovery so an already-configured
+  // session-scoped agent (archived / paginated out of the scan) still
+  // resolves here — matching what the composer's prefill will see.
+  const { data: agents, isPlaceholderData: agentsArePlaceholder } = useAvailableAgents({
+    pinnedAgentIds: [stored?.agent_id, launch?.agentId].filter((id): id is string => id != null),
+  });
   const info = useServerInfo();
   // Sandbox is only a real default when the server can provision managed
   // sandbox hosts — mirror the composer's gate so we don't offer a target that
@@ -114,15 +131,23 @@ export function ProjectSettingsDialog({
   // the fetched config arrives); local until saved.
   const [hostId, setHostId] = useState<string>(NONE);
   const [workspace, setWorkspace] = useState("");
-  // Worktrees are opt-in: the toggle starts OFF and only an explicit ON is
-  // stored (as use_worktree:true), which the composer honors by creating a
-  // fresh worktree for new sessions in the project.
+  // Worktree default for the project. The toggle seeds from the project's
+  // stored value when set, else from the user-global "always use a worktree"
+  // default (Settings › Git). On save it stays "inherit" (stores nothing) while
+  // it matches the global default, and stores an explicit true/false only to
+  // override it — so a project can force a worktree on or opt out of a global on.
   const [useWorktree, setUseWorktree] = useState(false);
   // Base branch a new worktree forks from; blank stores no default (falls
   // through to the user-global default in Settings › Git). Only meaningful
   // alongside the worktree default, but kept independent so it survives toggling.
   const [baseBranch, setBaseBranch] = useState("");
   const [agentId, setAgentId] = useState<string | null>(null);
+  // Default model for new sessions, only meaningful when the default agent is
+  // a native harness with a model choice; NONE stores no default (unset key).
+  const [model, setModel] = useState<string>(NONE);
+  // Default reasoning effort, offered alongside the model for harnesses with an
+  // effort ladder; NONE stores no default (unset key).
+  const [effort, setEffort] = useState<string>(NONE);
   const [workspaceOpen, setWorkspaceOpen] = useState(false);
 
   // The agent picker and the host Select portal their dropdowns OUTSIDE
@@ -147,6 +172,10 @@ export function ProjectSettingsDialog({
     target: EventTarget | null;
     preventDefault: () => void;
   }) => {
+    if (workspaceOpen) {
+      event.preventDefault();
+      return;
+    }
     if (
       shouldGuardDialogDismiss(event.target, {
         selectOpen: dropdownOpenCountRef.current > 0,
@@ -162,44 +191,77 @@ export function ProjectSettingsDialog({
     // Don't seed a blank draft from a failed load — Save is blocked anyway, and
     // clobbering the fields would risk sending `{}` if the guard ever regressed.
     if (loadFailed) return;
-    const c: ProjectConfig = stored ?? {};
+    const c: ProjectConfig = projectConfigWithLaunch(stored ?? {}, launch);
     setHostId(c.host_id ?? NONE);
     setWorkspace(c.workspace ?? "");
-    setUseWorktree(c.use_worktree ?? false);
+    setUseWorktree(c.use_worktree ?? readAlwaysUseWorktree());
     setBaseBranch(c.base_branch ?? "");
     setAgentId(c.agent_id ?? null);
+    setModel(c.model ?? NONE);
+    // The server stores config untyped, so ignore a malformed effort.
+    setEffort(typeof c.effort === "string" && c.effort ? c.effort : NONE);
     setWorkspaceOpen(false);
-  }, [open, stored, loadFailed]);
+  }, [open, stored, loadFailed, launch]);
 
   const onSubmit = (e: FormEvent) => {
     e.preventDefault();
     // Guard against submitting a blank draft seeded from a failed load, which
     // the server would read as "clear the stored defaults".
     if (loadFailed) return;
-    // Build the config from set fields only — an unset slot is an absent key,
-    // so the whole object is `{}` when nothing is configured (the server treats
-    // that as "clear the stored defaults").
-    const config: ProjectConfig = {};
+    // A last-start agent that no longer exists saves as the stored agent, even
+    // before the fallback effect below has re-rendered the field.
+    const savedAgentId = launchAgentGone ? (stored?.agent_id ?? null) : agentId;
+    // Preserve keys owned by other dialogs and replace only this form's fields,
+    // starting from what the fields were filled in with when saving that agent,
+    // so an agent still resolving keeps its own model and effort (agentUnresolved).
+    const seeded = projectConfigWithLaunch(stored ?? {}, launch);
+    const config: ProjectConfig = {
+      ...(savedAgentId === (seeded.agent_id ?? null) ? seeded : (stored ?? {})),
+    };
     if (hostId !== NONE) config.host_id = hostId;
+    else delete config.host_id;
     // A workspace is host-relative and only meaningful with a concrete host —
     // don't persist a stale path from a since-cleared host, and drop it for the
     // sandbox (a sandbox create provisions its own workspace and ignores this).
     const ws =
       hostId !== NONE && hostId !== SANDBOX_HOST_CHOICE ? trimOrUndef(workspace) : undefined;
     if (ws) config.workspace = ws;
-    if (agentId) config.agent_id = agentId;
-    // Worktrees are opt-in: only an explicit ON is stored (as use_worktree:true);
-    // leaving it OFF stores nothing, so an all-default dialog still clears to {}.
-    if (useWorktree) config.use_worktree = true;
+    else delete config.workspace;
+    if (savedAgentId) config.agent_id = savedAgentId;
+    else delete config.agent_id;
+    // Store the worktree choice only when it overrides the user-global default;
+    // while it matches, leave the key unset so the project keeps inheriting
+    // (and an all-default dialog still clears to {}).
+    if (useWorktree !== readAlwaysUseWorktree()) config.use_worktree = useWorktree;
+    else delete config.use_worktree;
     // A base branch only forks a worktree, so it's only meaningful when the
     // worktree default is on — drop it otherwise so it can't linger as a stale,
     // invisible default after the toggle is turned off.
     const base = useWorktree ? trimOrUndef(baseBranch) : undefined;
     if (base) config.base_branch = base;
+    else delete config.base_branch;
+    // A model default is only meaningful for an agent whose harness takes a
+    // model override — drop it otherwise so a stale alias can't linger after
+    // the default agent changes to one without a model choice. While the
+    // stored default agent hasn't resolved from discovery yet, its capability
+    // is unknowable — keep the stored model (already in the spread) so an
+    // unrelated save during that window can't silently delete a valid default.
+    const agentUnresolved = agentId != null && selectedAgent === null;
+    if (supportsModelDefault && model !== NONE) config.model = model;
+    else if (!agentUnresolved) delete config.model;
+    if (supportsEffortDefault && effortValue !== NONE) config.effort = effortValue;
+    else if (!agentUnresolved) delete config.effort;
 
     updateConfig.mutate(
       { id: projectId, name: projectName, config },
-      { onSuccess: () => onOpenChange(false) },
+      {
+        onSuccess: () => {
+          // The saved settings replace the last start, even when they match the
+          // settings it was recorded against.
+          if (projectId !== null) clearProjectLaunchDefaults(projectId);
+          onOpenChange(false);
+        },
+      },
     );
   };
 
@@ -220,11 +282,102 @@ export function ProjectSettingsDialog({
 
   // Agent picker groups, mirroring the composer's split (native harness CLIs vs
   // SDK / bundle agents). The picker takes both lists and a selection.
-  const agentList = useMemo(() => sortAgentsForDisplay(agents ?? []), [agents]);
+  // Same resolver as the composer's picker (selectableSessionAgents): the two
+  // surfaces must offer the SAME set, or a project could pin a default the
+  // composer refuses to show — and then silently substitutes another for.
+  const agentList = useMemo(() => selectableSessionAgents(agents ?? []), [agents]);
   const harnessEntries = useMemo(() => agentList.filter(isNativeCodingAgent), [agentList]);
   const agentEntries = useMemo(() => agentList.filter((a) => !isNativeCodingAgent(a)), [agentList]);
   const selectedAgent = agentList.find((a) => a.id === agentId) ?? null;
   const agentLabel = selectedAgent ? selectedAgent.display_name : "No default";
+  // Like the composer, fall back to the stored agent when the last start's agent
+  // no longer exists, while the field still holds it.
+  const launchAgentGone =
+    launch?.agentId != null &&
+    agentId === launch.agentId &&
+    agents !== undefined &&
+    !agentsArePlaceholder &&
+    selectedAgent === null;
+  useEffect(() => {
+    if (!launchAgentGone) return;
+    setAgentId(stored?.agent_id ?? null);
+    setModel(stored?.model ?? NONE);
+    setEffort(typeof stored?.effort === "string" && stored.effort ? stored.effort : NONE);
+  }, [launchAgentGone, stored]);
+  // Model default is offered for harnesses whose create call carries a model
+  // override — the declared modelPicker capability, plus Codex, whose picker
+  // is host-resolved rather than capability-flagged (mirrors the composer's
+  // model_override gate in NewChatDialog).
+  const selectedNativeSpec = nativeCodingAgentForAvailableAgent(selectedAgent);
+  const harnessTakesModel =
+    nativeAgentHasCapability(selectedAgent, "modelPicker") ||
+    selectedNativeSpec?.harness === "codex-native";
+  // Live host-resolved model options. The project's default host when set,
+  // else the first online host (the composer's auto-pick) — without the
+  // fallback a Codex project (no static catalog) could never populate the
+  // picker unless a host default was also stored.
+  const modelCatalogHostId = browsableHostId ?? onlineHosts[0]?.host_id ?? null;
+  const { data: hostModelOptions } = useHostModelOptions(
+    modelCatalogHostId,
+    selectedNativeSpec?.harness ?? "",
+    harnessTakesModel && modelCatalogHostId !== null,
+  );
+  const modelOptions = useMemo(() => {
+    const live = (hostModelOptions ?? []).map((o) => ({
+      id: o.id,
+      label: o.displayName ?? o.id,
+    }));
+    if (live.length > 0) return live;
+    return selectedNativeSpec?.harness === "claude-native"
+      ? CLAUDE_NATIVE_MODELS.map((m) => ({ id: m.id, label: m.label }))
+      : [];
+  }, [hostModelOptions, selectedNativeSpec]);
+  // Keep a stored model the current options don't list as a labeled fallback
+  // item, so opening + saving the dialog doesn't silently drop the default.
+  const storedModelMissing = model !== NONE && !modelOptions.some((m) => m.id === model);
+  // With no catalog resolved and nothing stored, the select could only offer
+  // "No default" — an action it can't perform. Degrade honestly (documented
+  // catalog gap for host-resolved harnesses): disable it and say why, rather
+  // than hide the field the harness legitimately supports.
+  const modelPickerEmpty = modelOptions.length === 0 && model === NONE;
+  // Offer the control only for a model-taking harness; when it can only render
+  // "No default" it stays visible but disabled with an explanatory hint.
+  const supportsModelDefault = harnessTakesModel;
+  // Mirror the composer's effort ladder (Codex varies per model).
+  const effortLadder = (pinnedModel: string) =>
+    nativeEffortOptions(
+      selectedNativeSpec?.harness,
+      hostModelOptions ?? [],
+      pinnedModel === NONE ? null : pinnedModel,
+    );
+  // Codex ladders are known only once the catalog resolves the model; until then
+  // keep the stored level.
+  const effortLadderKnown = (pinnedModel: string) => {
+    if (selectedNativeSpec?.harness !== "codex-native") return true;
+    const options = hostModelOptions ?? [];
+    const target = pinnedModel === NONE ? options.find((m) => m.isDefault)?.id : pinnedModel;
+    return findNativeModelOption(options, target) !== null;
+  };
+  const effortOptions = supportsModelDefault ? effortLadder(model) : null;
+  const supportsEffortDefault = effortOptions !== null;
+  const effortInLadder = (options: typeof effortOptions, level: string) =>
+    (options ?? []).some((e) => e.value === level);
+  // A stored level a known ladder lacks would never apply, so show and save no default.
+  const effortValue =
+    effort !== NONE && effortLadderKnown(model) && !effortInLadder(effortOptions, effort)
+      ? NONE
+      : effort;
+  const effortDropped = effort !== NONE && effortValue === NONE;
+  const storedEffortMissing = effortValue !== NONE && !effortInLadder(effortOptions, effortValue);
+  const effortPickerEmpty = (effortOptions ?? []).length === 0 && effortValue === NONE;
+  const selectModel = (next: string) => {
+    setModel(next);
+    // Keep only the shown level, and only if the new model's ladder can run it.
+    const dropEffort =
+      effortValue === NONE ||
+      (effortLadderKnown(next) && !effortInLadder(effortLadder(next), effortValue));
+    if (dropEffort) setEffort(NONE);
+  };
   // The host the agent picker's readiness badges check against (its config
   // hints show whether a harness is set up there). Null when no concrete host.
   const warningHost = onlineHosts.find((h) => h.host_id === browsableHostId) ?? null;
@@ -246,6 +399,11 @@ export function ProjectSettingsDialog({
             Defaults for new sessions in <span className="font-medium">{projectName}</span>. Each is
             a starting point you can change per session; leave a field blank for no default.
           </DialogDescription>
+          {launch !== null && (
+            <p className="text-muted-foreground text-sm" data-testid="project-settings-last-start">
+              Filled in from the last session you started in {projectName}.
+            </p>
+          )}
         </DialogHeader>
         <form onSubmit={onSubmit} className="flex flex-col gap-4">
           <Field label="Host" hint="Where new sessions run by default">
@@ -301,20 +459,15 @@ export function ProjectSettingsDialog({
                 Pick a host first
               </p>
             ) : browsableHostId ? (
-              // A compact trigger showing the current path; clicking expands
-              // the filesystem browser as an overlay anchored to the trigger.
-              // The browser is rendered inside DialogContent (not a portaled
-              // popover) so it scrolls — a modal Dialog's scroll-lock blocks
-              // wheel events on portaled content — but positioned `absolute`
-              // so it floats over the fields below instead of stretching the
-              // modal. onNavigate updates the field live as you browse.
+              // Browsing uses the shared full-screen picker; navigation is
+              // provisional until the user confirms a folder.
               <div
                 className="relative flex flex-col gap-1.5"
                 data-testid="project-settings-workspace"
               >
                 <button
                   type="button"
-                  onClick={() => setWorkspaceOpen((v) => !v)}
+                  onClick={() => setWorkspaceOpen(true)}
                   aria-expanded={workspaceOpen}
                   disabled={isLoading}
                   className="flex h-8 w-full items-center justify-between gap-2 rounded-md border border-input bg-transparent px-3 text-ui outline-none disabled:cursor-not-allowed disabled:opacity-50"
@@ -328,26 +481,13 @@ export function ProjectSettingsDialog({
                     }`}
                   />
                 </button>
-                {workspaceOpen && (
-                  <>
-                    {/* Click-away: a transparent full-modal backdrop that
-                          closes the browser (keeping the current path) on any
-                          click outside it. */}
-                    <button
-                      type="button"
-                      aria-label="Close directory browser"
-                      className="fixed inset-0 z-10 cursor-default"
-                      onClick={() => setWorkspaceOpen(false)}
-                    />
-                    <div className="absolute top-full right-0 left-0 z-20 mt-1 rounded-[12px] border border-border bg-popover p-2 shadow-menu [&>[data-testid=workspace-picker]]:border-0">
-                      <WorkspacePicker
-                        hostId={browsableHostId}
-                        initialPath={isNavigablePath(workspace) ? workspace : undefined}
-                        onNavigate={setWorkspace}
-                      />
-                    </div>
-                  </>
-                )}
+                <WorkspacePickerDialog
+                  open={workspaceOpen}
+                  onOpenChange={setWorkspaceOpen}
+                  hostId={browsableHostId}
+                  initialPath={workspace}
+                  onConfirm={setWorkspace}
+                />
               </div>
             ) : (
               // A host is picked but not browsable (sandbox / offline stored
@@ -366,7 +506,7 @@ export function ProjectSettingsDialog({
 
           <Field
             label="Random worktree"
-            hint="Start each new session in a fresh randomly-named git worktree (vs. directly in the workspace)"
+            hint="Start each new session in a fresh randomly-named git worktree (vs. directly in the workspace). Overrides the global default in Settings › Git."
           >
             <div className="flex sm:justify-end">
               <Switch
@@ -405,7 +545,15 @@ export function ProjectSettingsDialog({
                 agentLabel={agentLabel}
                 hasAgents={agentList.length > 0}
                 host={warningHost}
-                onSelectAgent={(a) => setAgentId(a.id)}
+                onSelectAgent={(a) => {
+                  // A model default belongs to the picked harness's vocab —
+                  // don't carry an alias onto a different agent.
+                  if (a.id !== agentId) {
+                    setModel(NONE);
+                    setEffort(NONE);
+                  }
+                  setAgentId(a.id);
+                }}
                 pendingAgent={null}
                 pendingAgentId="__unused_pending_agent__"
                 onSelectPending={() => {}}
@@ -437,13 +585,83 @@ export function ProjectSettingsDialog({
                   variant="ghost"
                   size="sm"
                   className="h-auto p-0 text-muted-foreground text-sm hover:bg-transparent"
-                  onClick={() => setAgentId(null)}
+                  onClick={() => {
+                    setAgentId(null);
+                    setModel(NONE);
+                    setEffort(NONE);
+                  }}
                 >
                   Clear
                 </Button>
               )}
             </div>
           </Field>
+
+          {supportsModelDefault && (
+            <Field
+              label="Model"
+              hint={
+                modelPickerEmpty
+                  ? "No model catalog available — pick a Host default (or connect a host) to choose from its models"
+                  : "Default model for new sessions with this agent"
+              }
+            >
+              <Select
+                value={model}
+                onValueChange={selectModel}
+                onOpenChange={onDropdownOpenChange}
+                disabled={isLoading || modelPickerEmpty}
+              >
+                <SelectTrigger className="w-full" data-testid="project-settings-model">
+                  <SelectValue placeholder="No default" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value={NONE}>No default</SelectItem>
+                  {modelOptions.map((m) => (
+                    <SelectItem key={m.id} value={m.id}>
+                      {m.label}
+                    </SelectItem>
+                  ))}
+                  {storedModelMissing && <SelectItem value={model}>{model}</SelectItem>}
+                </SelectContent>
+              </Select>
+            </Field>
+          )}
+
+          {supportsEffortDefault && (
+            <Field
+              label="Effort"
+              hint={
+                effortDropped
+                  ? `The saved effort (${normalizeEffortLabel(effort)}) isn't available for this model; saving clears it.`
+                  : effortPickerEmpty
+                    ? "Pick a model or connect a host to see effort levels."
+                    : "Default reasoning effort for new sessions with this agent"
+              }
+            >
+              <Select
+                value={effortValue}
+                onValueChange={setEffort}
+                onOpenChange={onDropdownOpenChange}
+                disabled={isLoading || effortPickerEmpty}
+              >
+                <SelectTrigger className="w-full" data-testid="project-settings-effort">
+                  <SelectValue placeholder="No default" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value={NONE}>No default</SelectItem>
+                  {(effortOptions ?? []).map((e) => (
+                    <SelectItem key={e.value} value={e.value}>
+                      {e.label}
+                    </SelectItem>
+                  ))}
+                  {storedEffortMissing && (
+                    <SelectItem value={effortValue}>{normalizeEffortLabel(effortValue)}</SelectItem>
+                  )}
+                </SelectContent>
+              </Select>
+            </Field>
+          )}
 
           {loadFailed && (
             <p
@@ -473,9 +691,10 @@ export function ProjectSettingsDialog({
             <Button
               type="submit"
               data-testid="project-settings-save"
-              disabled={updateConfig.isPending || isLoading || loadFailed}
+              loading={updateConfig.isPending}
+              disabled={isLoading || loadFailed}
             >
-              {updateConfig.isPending ? "Saving…" : "Save"}
+              Save
             </Button>
           </DialogFooter>
         </form>

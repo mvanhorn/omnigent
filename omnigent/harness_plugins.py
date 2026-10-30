@@ -19,6 +19,7 @@ from omnigent._wrapper_labels import (
     CLAUDE_NATIVE_WRAPPER_VALUE,
     CODEX_NATIVE_WRAPPER_VALUE,
     CURSOR_NATIVE_WRAPPER_VALUE,
+    DEVIN_NATIVE_WRAPPER_VALUE,
     GOOSE_NATIVE_WRAPPER_VALUE,
     HERMES_NATIVE_WRAPPER_VALUE,
     KIMI_NATIVE_WRAPPER_VALUE,
@@ -37,6 +38,7 @@ from omnigent.harness_capabilities import (
     Elicitation,
     ForkHistory,
     HarnessCapabilities,
+    InstructionDelivery,
     IntegrationMode,
     ModelFamily,
     Resume,
@@ -85,7 +87,7 @@ class NativeHarnessProvider:
     ``NativeCodingAgent`` is pure identity data; behavior lives here as a
     sibling row keyed by the same ``key``. Every value is a dotted import path
     (``module:attr`` or ``module.attr``) resolved lazily at dispatch time via
-    :mod:`omnigent.native_dispatch`, so building the registry never imports the
+    :mod:`omnigent.native.native_dispatch`, so building the registry never imports the
     runner / CLI / native-harness stack. Optional hooks are ``None`` when the
     behavior is not yet a module-level function the resolver can reach (e.g.
     interrupt/stop handlers that are still runner closures, or the inline
@@ -95,6 +97,10 @@ class NativeHarnessProvider:
     key: str  # matches NativeCodingAgent.key
     run_native: str  # CLI + resume launch entry point
     auto_create_terminal: str  # runner terminal builder
+    # ``(session_id, instance) -> bool`` polled by the runner's terminal watcher
+    # until the native TUI accepts input, which then logs ``native_input_ready``.
+    # Required so no native harness can ship without input-readiness logging.
+    input_ready_probe: str
     spawn_env_builder: str | None = None
     # Session-label key carrying this harness's bridge id, when its spawn-env
     # builder takes a ``bridge_id=`` kwarg resolved from session labels
@@ -206,6 +212,24 @@ GOOSE_NATIVE_CODING_AGENT = NativeCodingAgent(
     terminal_name="goose",
 )
 
+
+# Devin spawns its own sub-agents in-TUI via the `run_subagent` tool. Each call
+# is mirrored as an ordinary tool card (the PreToolUse/PostToolUse hooks carry
+# it) AND promoted to an Omnigent child session once the delegate finishes: the
+# forwarder reconstructs its chain from Devin's own session store (see
+# `harnesses/devin_native/subagents.py`). Hence the `subagent_wrapper_label`
+# below, which is what makes `capabilities.subagents` True
+# (tests/test_harness_capabilities.py derives one from the other).
+DEVIN_NATIVE_CODING_AGENT = NativeCodingAgent(
+    key="devin",
+    display_name="Devin",
+    agent_name="devin-native-ui",
+    harness="devin-native",
+    wrapper_label=DEVIN_NATIVE_WRAPPER_VALUE,
+    subagent_wrapper_label="devin-native-ui-subagent",
+    terminal_name="devin",
+)
+
 ANTIGRAVITY_NATIVE_CODING_AGENT = NativeCodingAgent(
     key="antigravity",
     display_name="Antigravity",
@@ -255,22 +279,28 @@ _BRIDGE_ID_LABEL_HARNESSES: frozenset[str] = frozenset({"codex", "opencode", "an
 def _builtin_native_provider(key: str) -> NativeHarnessProvider:
     """Build a built-in provider row from the ``omnigent.<key>_native`` module.
 
-    The built-in native harnesses follow a uniform module layout: each exports
+    The built-in native harnesses follow a uniform package layout under
+    ``omnigent.harnesses.<key>_native``: the ``.main`` module exports
     ``run_<key>_native`` (CLI + resume launch) and ``_materialize_<key>_agent_spec``
-    (agent seeding), exposes a ``_launch_<key>`` terminal adapter in
-    ``omnigent.runner.native``, and exposes ``build_<key>_native_spawn_env`` in
-    ``omnigent.<key>_native_bridge``. The remaining hooks (interrupt, stop,
-    bridge-dir) are still runner-local closures / inline dispatch, so they stay
-    ``None`` until those hubs migrate onto the seam.
+    (agent seeding), a ``_launch_<key>`` terminal adapter lives in
+    ``omnigent.runner.native``, and ``build_<key>_native_spawn_env`` lives in the
+    ``.bridge`` submodule. The remaining hooks (interrupt, stop, bridge-dir) are
+    still runner-local closures / inline dispatch, so they stay ``None`` until
+    those hubs migrate onto the seam.
     """
-    module = f"omnigent.{key}_native"
+    pkg = f"omnigent.harnesses.{key}_native"
+    module = f"{pkg}.main"
     return NativeHarnessProvider(
         key=key,
         run_native=f"{module}:run_{key}_native",
         auto_create_terminal=f"omnigent.runner.native:_launch_{key}",
-        spawn_env_builder=f"{module}_bridge:build_{key}_native_spawn_env",
-        bridge_id_label_key=(f"{module}.bridge_id" if key in _BRIDGE_ID_LABEL_HARNESSES else None),
+        spawn_env_builder=f"{pkg}.bridge:build_{key}_native_spawn_env",
+        # Session label key — a stable wire identifier, not a module path.
+        bridge_id_label_key=(
+            f"omnigent.{key}_native.bridge_id" if key in _BRIDGE_ID_LABEL_HARNESSES else None
+        ),
         materialize_agent_spec=f"{module}:_materialize_{key}_agent_spec",
+        input_ready_probe=f"{pkg}.bridge:native_input_ready",
     )
 
 
@@ -293,6 +323,7 @@ _BUILTIN_NATIVE_PROVIDERS: tuple[NativeHarnessProvider, ...] = tuple(
         QWEN_NATIVE_CODING_AGENT,
         KIMI_NATIVE_CODING_AGENT,
         HERMES_NATIVE_CODING_AGENT,
+        DEVIN_NATIVE_CODING_AGENT,
     )
 )
 
@@ -309,6 +340,7 @@ _EF = EffortFamily
 _MF = ModelFamily
 _AU = AuthModel
 _FH = ForkHistory
+_ID = InstructionDelivery
 
 # Bench shell-tool provocation prompts (moved off the bench's hardcoded
 # _NATIVE_TOOL_PROVOCATION table): the generic variant, and a Bash-specific one
@@ -336,12 +368,13 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         fork_history=_FH.REBUILD,
         shell_tool_name="Bash",
         shell_tool_prompt=_BASH_PROMPT,
+        instruction_delivery=_ID.AGENT_STARTUP_ADDITIVE,
     ),
     "codex-native": _C(
         _IM.NATIVE_TUI,
         _EL.JSONRPC,
         _RS.WARM_REATTACH,
-        _EF.OPENAI,
+        _EF.CODEX_NATIVE,
         _MF.GPT,
         _AU.OMNIGENT_CREDENTIAL,
         subagents=True,
@@ -350,6 +383,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         fork_history=_FH.REBUILD,
         shell_tool_name="shell",
         shell_tool_prompt=_SHELL_PROMPT,
+        instruction_delivery=_ID.AGENT_STARTUP_ADDITIVE,
     ),
     # streaming is declared True unless a live bench run proves a harness does
     # NOT emit token-level deltas. Only kiro-native is so proven (0 deltas over
@@ -361,7 +395,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         _IM.NATIVE_TUI,
         _EL.NONE,
         _RS.WARM_REATTACH,
-        _EF.NONE,
+        _EF.PI,
         _MF.MULTI,
         _AU.SESSION_SCOPED_CONFIG,
         subagents=False,
@@ -370,6 +404,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         fork_history=_FH.REBUILD,
         shell_tool_name="Bash",
         shell_tool_prompt=_BASH_PROMPT,
+        instruction_delivery=_ID.AGENT_STARTUP_ADDITIVE,
     ),
     # streaming=False is LIVE-VERIFIED: a bench run observed 0 text deltas.
     "cursor-native": _C(
@@ -385,6 +420,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         fork_history=_FH.PREAMBLE,
         # No shell-tool provocation: cursor-native was intentionally absent from
         # the bench's table (its tool probe is skipped), so leave shell_tool_* None.
+        instruction_delivery=_ID.NOT_DELIVERED,
     ),
     # kiro_native_permissions.py: "TUI ACP recorder -> web elicitation".
     # streaming=False is LIVE-VERIFIED: a full SSE capture recorded 0 text
@@ -402,6 +438,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         fork_history=_FH.NONE,
         shell_tool_name="shell",
         shell_tool_prompt=_SHELL_PROMPT,
+        instruction_delivery=_ID.NOT_DELIVERED,
     ),
     "antigravity-native": _C(
         _IM.NATIVE_TUI,
@@ -416,6 +453,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         fork_history=_FH.NONE,
         shell_tool_name="run_command",
         shell_tool_prompt=_SHELL_PROMPT,
+        instruction_delivery=_ID.NOT_DELIVERED,
     ),
     "goose-native": _C(
         _IM.NATIVE_TUI,
@@ -430,6 +468,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         fork_history=_FH.NONE,
         shell_tool_name="developer__shell",
         shell_tool_prompt=_SHELL_PROMPT,
+        instruction_delivery=_ID.NOT_DELIVERED,
     ),
     # streaming=False is LIVE-VERIFIED: a bench run observed 0 text deltas.
     "qwen-native": _C(
@@ -445,6 +484,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         fork_history=_FH.REBUILD,
         shell_tool_name="run_shell_command",
         shell_tool_prompt=_SHELL_PROMPT,
+        instruction_delivery=_ID.NOT_DELIVERED,
     ),
     "kimi-native": _C(
         _IM.NATIVE_TUI,
@@ -459,6 +499,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         fork_history=_FH.NONE,
         shell_tool_name="Bash",
         shell_tool_prompt=_BASH_PROMPT,
+        instruction_delivery=_ID.NOT_DELIVERED,
     ),
     "opencode-native": _C(
         _IM.NATIVE_SERVER,
@@ -473,6 +514,54 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         fork_history=_FH.PREAMBLE,
         # NATIVE_SERVER, not driven by the bench's native-tui tool probe, so
         # shell_tool_* stay None.
+        instruction_delivery=_ID.COMPOSED_PER_TURN,
+    ),
+    # devin-native wraps the resident `devin` TUI. Every axis below was
+    # live-verified against devin 3000.10.21:
+    #   * HOOK elicitation — a PreToolUse hook returning
+    #     `hookSpecificOutput.permissionDecision: "deny"` blocks the tool EVEN
+    #     under `--permission-mode bypass`, and the reason reaches the model; the
+    #     PermissionRequest hook accepts `{"decision": "approve"}`. So Devin
+    #     honours the same output contract claude-native uses, and the shared
+    #     omnigent.native.native_policy_hook seam drives it unmodified.
+    #   * interrupt — Devin's own hint is "esc twice to interrupt"; two Escapes
+    #     yield "✱ Canceled." (one only clears the composer draft).
+    #   * steering — the composer stays writable mid-turn (its placeholder
+    #     becomes "Guide Devin while it works").
+    #   * effort — ANTHROPIC's low/medium/high/xhigh/max is exactly the rung set
+    #     Devin encodes as a model-variant suffix, which
+    #     omnigent.harnesses.devin_native.main.compose_devin_model recombines.
+    #   * streaming=False by construction: the forwarder mirrors whole hook
+    #     events, so it posts no external_output_text_delta at all.
+    "devin-native": _C(
+        _IM.NATIVE_TUI,
+        _EL.HOOK,
+        _RS.WARM_REATTACH,
+        _EF.ANTHROPIC,
+        _MF.MULTI,
+        _AU.OWN_AUTH,
+        # Devin's run_subagent delegates are mirrored as child sessions: the
+        # forwarder reconstructs each one's full transcript from Devin's own
+        # session store (message_nodes) on completion — see
+        # omnigent.harnesses.devin_native.subagents.
+        subagents=True,
+        interrupt=True,
+        streaming=False,
+        steering=True,
+        live_queue=True,
+        images=True,
+        compaction=True,
+        # PREAMBLE, not REBUILD: Devin's session store is read-only to Omnigent, so
+        # a fork replays its prior turns as text on the clone's first message (the
+        # choice cursor-native makes) rather than seeding a local transcript for
+        # `--resume`. See write_fork_preamble / wrap_fork_preamble.
+        fork_history=_FH.PREAMBLE,
+        shell_tool_name="exec",
+        shell_tool_prompt=_SHELL_PROMPT,
+        # A custom agent's instructions are delivered at launch as an always-on
+        # Windsurf rule in the workspace (Devin's only per-turn system-prompt
+        # channel; it has no --append-system-prompt). See write_devin_agent_rule.
+        instruction_delivery=_ID.AGENT_STARTUP_ADDITIVE,
     ),
     "hermes-native": _C(
         _IM.NATIVE_TUI,
@@ -487,6 +576,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         fork_history=_FH.REBUILD,
         shell_tool_name="terminal",
         shell_tool_prompt=_SHELL_PROMPT,
+        instruction_delivery=_ID.NOT_DELIVERED,
     ),
     # SDK / subprocess harnesses (run the vendor model directly). The first four
     # are bench-verified interrupt=streaming=True.
@@ -500,6 +590,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=False,
         interrupt=True,
         streaming=True,
+        instruction_delivery=_ID.COMPOSED_SESSION_SNAPSHOT,
     ),
     "codex": _C(
         _IM.CLI_SUBPROCESS,
@@ -511,17 +602,19 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=False,
         interrupt=True,
         streaming=True,
+        instruction_delivery=_ID.COMPOSED_PER_TURN,
     ),
     "pi": _C(
         _IM.CLI_SUBPROCESS,
         _EL.NONE,
         _RS.COLD_ONLY,
-        _EF.NONE,
+        _EF.PI,
         _MF.MULTI,
         _AU.OMNIGENT_CREDENTIAL,
         subagents=False,
         interrupt=True,
         streaming=True,
+        instruction_delivery=_ID.COMPOSED_PER_TURN,
     ),
     "openai-agents": _C(
         _IM.SDK_IN_PROCESS,
@@ -533,6 +626,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=False,
         interrupt=True,
         streaming=True,
+        instruction_delivery=_ID.COMPOSED_PER_TURN,
     ),
     "cursor": _C(
         _IM.SDK_IN_PROCESS,
@@ -544,17 +638,21 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=False,
         interrupt=True,
         streaming=True,
+        instruction_delivery=_ID.FIRST_USER_PREFIX,
     ),
     "antigravity": _C(
         _IM.SDK_IN_PROCESS,
         _EL.NONE,
         _RS.COLD_ONLY,
-        _EF.GEMINI,
+        # NONE until AntigravityExecutor forwards ``reasoning_effort`` to the SDK:
+        # advertising GEMINI here would show a dial whose pick changes nothing.
+        _EF.NONE,
         _MF.GEMINI,
         _AU.OWN_AUTH,
         subagents=False,
         interrupt=True,
         streaming=True,
+        instruction_delivery=_ID.COMPOSED_PER_TURN,
     ),
     # Generic ACP harness — drives any user-configured ACP agent command. Same
     # profile as goose/qwen (own-auth, cold resume, SSE permission), but its
@@ -569,6 +667,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=False,
         interrupt=True,
         streaming=True,
+        instruction_delivery=_ID.FIRST_USER_PREFIX,
     ),
     "goose": _C(
         _IM.ACP_SUBPROCESS,
@@ -580,6 +679,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=False,
         interrupt=True,
         streaming=True,
+        instruction_delivery=_ID.FIRST_USER_PREFIX,
     ),
     "qwen": _C(
         _IM.ACP_SUBPROCESS,
@@ -591,6 +691,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=False,
         interrupt=True,
         streaming=True,
+        instruction_delivery=_ID.FIRST_USER_PREFIX,
     ),
     "kimi": _C(
         _IM.CLI_SUBPROCESS,
@@ -602,6 +703,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=False,
         interrupt=True,
         streaming=True,
+        instruction_delivery=_ID.NOT_DELIVERED,
     ),
     "hermes": _C(
         _IM.CLI_SUBPROCESS,
@@ -613,6 +715,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=False,
         interrupt=True,
         streaming=True,
+        instruction_delivery=_ID.FIRST_USER_PREFIX,
     ),
     "copilot": _C(
         _IM.SDK_IN_PROCESS,
@@ -624,6 +727,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=False,
         interrupt=True,
         streaming=True,
+        instruction_delivery=_ID.COMPOSED_PER_TURN,
     ),
     # open-responses is resolved via an alternate path, but its executor
     # (omnigent/inner/open_responses_sdk.py) is concrete: interrupt_session()
@@ -640,6 +744,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=False,
         interrupt=True,
         streaming=True,
+        instruction_delivery=_ID.COMPOSED_PER_TURN,
     ),
 }
 
@@ -663,6 +768,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
             "copilot",
             "cursor",
             "cursor-native",
+            "devin-native",
             "goose",
             "goose-native",
             "hermes",
@@ -683,9 +789,10 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         | set(ACP_CLI_HARNESSES)
     ),
     harness_modules={
-        # Every catalog row runs the shared generic ACP wrap.
+        # Every catalog row runs the shared generic ACP wrap...
         **dict.fromkeys(ACP_CLI_HARNESSES, "omnigent.inner.acp_harness"),
         "acp": "omnigent.inner.acp_harness",
+        "devin-native": "omnigent.inner.devin_native_harness",
         "antigravity": "omnigent.inner.antigravity_harness",
         "antigravity-native": "omnigent.inner.antigravity_native_harness",
         "claude-native": "omnigent.inner.claude_native_harness",
@@ -712,11 +819,24 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
     aliases={
         **{alias: name for name, row in ACP_CLI_HARNESSES.items() for alias in row.aliases},
         "agy": "antigravity",
+        "agy-native": "antigravity-native",
         "claude": "claude-sdk",
+        # Both vendor spellings resolve to the native wrap, mirroring
+        # ``opencode`` -> ``opencode-native``. ``devin-acp`` was the built-in ACP
+        # row, removed in 0.14: keeping the id aliased is what stops a session,
+        # bundle or ``--harness devin-acp`` script that still names it from
+        # failing to resolve a harness at all. The ACP path never warm-resumed
+        # (COLD_ONLY, no session/load), so nothing that worked is lost. A
+        # user-configured ``acp:devin`` is untouched — it canonicalizes to
+        # ``acp`` and reads the user's own config.
+        "devin": "devin-native",
+        "devin-acp": "devin-native",
         "github-copilot": "copilot",
         "google-antigravity": "antigravity",
         "kimi-code": "kimi",
+        "native-agy": "antigravity-native",
         "native-antigravity": "antigravity-native",
+        "native-devin": "devin-native",
         "native-goose": "goose-native",
         "native-hermes": "hermes-native",
         "native-kimi": "kimi-native",
@@ -730,18 +850,22 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
     },
     native_harnesses=frozenset(
         {
+            "agy-native",
             "antigravity-native",
             "claude-native",
             "codex-native",
             "cursor-native",
+            "devin-native",
             "goose-native",
             "hermes-native",
             "kimi-native",
             "kiro-native",
+            "native-agy",
             "native-antigravity",
             "native-claude",
             "native-codex",
             "native-cursor",
+            "native-devin",
             "native-goose",
             "native-hermes",
             "native-kimi",
@@ -766,6 +890,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         QWEN_NATIVE_CODING_AGENT,
         KIMI_NATIVE_CODING_AGENT,
         HERMES_NATIVE_CODING_AGENT,
+        DEVIN_NATIVE_CODING_AGENT,
     ),
     native_providers=_BUILTIN_NATIVE_PROVIDERS,
     # Catalog rows gate readiness on their vendor binary; the install spec also
@@ -784,6 +909,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         "copilot": "HARNESS_COPILOT_MODEL",
         "cursor": "HARNESS_CURSOR_MODEL",
         "goose": "HARNESS_GOOSE_MODEL",
+        "hermes": "HARNESS_HERMES_MODEL",
         "kimi": "HARNESS_KIMI_MODEL",
         "openai-agents": "HARNESS_OPENAI_AGENTS_MODEL",
         "pi": "HARNESS_PI_MODEL",
@@ -810,6 +936,8 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         "codex": "Codex",
         "copilot": "Copilot",
         "cursor": "Cursor",
+        "devin-native": "Devin",
+        "hermes": "Hermes",
         # openai-agents is intentionally omitted from the picker catalog: it
         # stays a valid harness for YAML specs (and the credential-free
         # integration mock LLM), but is no longer offered as a UI pick.
@@ -977,7 +1105,7 @@ def plugin_state() -> HarnessPluginState:
             if error is not None:
                 raise ValueError(error)
             contributions.append(contribution)
-        except Exception as exc:  # noqa: BLE001 - broken plugins must not break core startup.
+        except Exception as exc:  # broken plugins must not break core startup.
             load_errors[entry_point.name] = str(exc)
             _logger.warning(
                 "could not load harness plugin entry point %s (%s)",
@@ -1132,7 +1260,7 @@ def harness_catalog() -> list[dict[str, object]]:
     # importable without pulling in the onboarding/config stack at module load.
     try:
         from omnigent.onboarding.harness_install import ui_setup_steps
-    except Exception:  # noqa: BLE001 — a broken onboarding import must not break the catalog
+    except Exception:  # a broken onboarding import must not break the catalog
         _logger.debug("setup-step metadata unavailable", exc_info=True)
         ui_setup_steps = None  # type: ignore[assignment]
     rows: list[dict[str, object]] = []
@@ -1161,7 +1289,7 @@ def harness_catalog() -> list[dict[str, object]]:
             if acp_capability is not None:
                 acp_row["capabilities"] = acp_capability.as_dict()
             rows.append(acp_row)
-    except Exception:  # noqa: BLE001 — a malformed acp: block must never break the catalog
+    except Exception:  # a malformed acp: block must never break the catalog
         _logger.debug("acp catalog rows skipped", exc_info=True)
     return rows
 
@@ -1182,7 +1310,7 @@ def harness_setup_steps_by_spelling() -> dict[str, list[dict[str, str | None]]]:
     """
     try:
         from omnigent.onboarding.harness_install import ui_installable_harnesses, ui_setup_steps
-    except Exception:  # noqa: BLE001 — a broken onboarding import must not break the catalog
+    except Exception:  # a broken onboarding import must not break the catalog
         _logger.debug("setup-step metadata unavailable", exc_info=True)
         return {}
     # Cover the picker ids (catalog rows) plus every installable spelling

@@ -41,6 +41,9 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
+import time
+from collections import deque
 from pathlib import Path
 from typing import NamedTuple
 
@@ -48,12 +51,14 @@ from packaging.version import InvalidVersion, Version
 
 from omnigent._platform import resolve_cli_binary
 from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
+from omnigent.cli_invocation import cli_invocation
 from omnigent.harness_install_spec import HarnessInstallSpec, SetupStep
-from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, GEMINI_FAMILY, OPENAI_FAMILY
-from omnigent.opencode_native_client import (
+from omnigent.harnesses.opencode_native.client import (
     OPENCODE_MAX_VERSION_EXCLUSIVE,
     OPENCODE_MIN_VERSION,
 )
+from omnigent.inner import _proc
+from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, GEMINI_FAMILY, OPENAI_FAMILY
 
 # Pi is not a configure-menu family (the menu is Claude + Codex), but the
 # first-run ``run`` flow falls back to it, so it has install metadata too.
@@ -86,7 +91,9 @@ KIRO_KEY = "kiro"
 # - codex: native policy hook requires >= 0.129.0
 #   (`omnigent/codex_native_app_server.py`).
 # - pi: non-interactive ``--approve`` override requires >= 0.79.0
-#   (``omnigent/pi_native.py``).
+#   (``omnigent/pi_native.py``). Adaptive thinking (thinking.type.adaptive
+#   for claude-4+/claude-5) requires >= 0.84.2
+#   (``omnigent/pi_native_credentials.py``).
 # - qwen: ``--input-file`` / ``--json-file`` bridge verified on v0.18.1
 #   (``omnigent/qwen_native_forwarder.py`` / ``docs/QWEN_NATIVE_DESIGN.md``).
 # - goose: SQLite forwarder schema verified on Goose 1.38.0
@@ -114,7 +121,7 @@ KIRO_KEY = "kiro"
 #   semver version with the build date alongside it
 #   (``Hermes Agent v0.19.1 (2026.7.30)``), so the floor is that semver.
 _CODEX_MIN_VERSION = "0.137.0"
-_PI_MIN_VERSION = "0.79.0"
+_PI_MIN_VERSION = "0.84.2"
 _QWEN_MIN_VERSION = "0.18.1"
 _GOOSE_MIN_VERSION = "1.38.0"
 _HERMES_MIN_VERSION = "0.17.0"
@@ -122,6 +129,7 @@ _KIRO_MIN_VERSION = "2.10.0"
 _CLAUDE_MIN_VERSION = "2.1.161"
 _CURSOR_MIN_VERSION = "2026.06.02"
 _KIMI_MIN_VERSION = "0.7.0"
+_ANTIGRAVITY_MIN_VERSION = "1.1.13"
 
 # OpenCode native harness CLI (``opencode serve`` / ``opencode attach``),
 # installed via the ``opencode-ai`` npm package. No login/logout/status argv
@@ -148,6 +156,21 @@ HERMES_KEY = "hermes"
 
 _HERMES_INSTALL_HINT = "curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash"
 
+# Devin (Cognition) ships via a curl installer rather than npm and authenticates
+# through its own ``devin auth login``, which writes a credential file it reads
+# back at spawn — Omnigent stores no Devin credential. ``devin auth status``
+# exits 0 only while logged in, giving the same revocation-aware status probe
+# Codex gets from ``codex login status``.
+DEVIN_KEY = "devin"
+
+_DEVIN_INSTALL_HINT = "curl -fsSL https://cli.devin.ai/install.sh | bash"
+
+# Anthropic recommends its native installer over ``npm install -g``: it writes
+# to a user-writable ``~/.local/bin`` and self-updates, so it sidesteps the
+# EACCES failure on a root-owned npm global prefix.
+# See https://code.claude.com/docs/en/setup#native-install-recommended
+_CLAUDE_INSTALL_HINT = "curl -fsSL https://claude.ai/install.sh | bash"
+
 
 # Keyed by harness family (Claude=anthropic, Codex=openai) plus the pi
 # fallback. Binaries/packages mirror ucode's ``TOOL_SPECS`` so the two tools
@@ -155,14 +178,20 @@ _HERMES_INSTALL_HINT = "curl -fsSL https://hermes-agent.nousresearch.com/install
 # subcommands (``claude auth login --claudeai`` / ``codex login``), so the user
 # can sign in to a subscription from ``configure harnesses`` directly.
 _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
+    # Claude ships a vendor installer, so like Hermes it carries an
+    # ``install_hint`` + ``install_command`` and no ``package``. ``package is
+    # None`` is what routes :func:`harness_setup_hint` and the runner's
+    # missing-CLI error to the installer instead of the npm command.
     ANTHROPIC_FAMILY: HarnessInstallSpec(
         "Claude",
         "claude",
-        "@anthropic-ai/claude-code",
+        package=None,
         login_args=("auth", "login", "--claudeai"),
         logout_args=("auth", "logout"),
         status_args=("auth", "status"),
         login_status_key="loggedIn",
+        install_hint=_CLAUDE_INSTALL_HINT,
+        install_command=("bash", "-c", _CLAUDE_INSTALL_HINT),
         # The native bridge injects Omnigent's MCP relay via `--mcp-config`;
         # that flag first shipped in Claude Code 0.2.75.
         min_version=_CLAUDE_MIN_VERSION,
@@ -189,17 +218,17 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
         # ``pi >= 0.79.0``; older CLIs would prompt mid-session.
         min_version=_PI_MIN_VERSION,
     ),
-    # Pin the install to the supported 1.17.x range: opencode-ai's npm ``latest``
+    # Pin the install to the supported 1.18.x range: opencode-ai's npm ``latest``
     # is a ``0.0.0-beta-*`` pre-release, so a bare ``opencode-ai`` would install a
     # version the runtime version-check (``check_opencode_version``,
-    # >=1.17.7,<1.18.0) then rejects. ``~1.17.7`` mirrors that exact range.
+    # >=1.17.7,<1.19.0) then rejects. ``~1.18.0`` resolves to the latest 1.18.x.
     # The same version bounds are enforced in setup via ``min_version`` /
     # ``max_version_exclusive`` so the install/upgrade prompt fires before
     # the runtime gate does.
     OPENCODE_KEY: HarnessInstallSpec(
         "OpenCode",
         "opencode",
-        "opencode-ai@~1.17.7",
+        "opencode-ai@~1.18.0",
         min_version=OPENCODE_MIN_VERSION,
         max_version_exclusive=OPENCODE_MAX_VERSION_EXCLUSIVE,
     ),
@@ -231,12 +260,14 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
         min_version=_CURSOR_MIN_VERSION,
     ),
     # Kimi Code CLI ships a single-binary ``kimi`` via a curl installer (no
-    # npm). ``kimi login`` is the interactive provider login (OAuth or a
-    # Moonshot API key). ``status_args`` is intentionally ``None``: kimi has
-    # no first-class "am I logged in?" exit-code probe — login state is
-    # inspected file-based via ``kimi_auth.kimi_login_detected`` instead. With
-    # ``None`` the login path runs every time the operator asks for it
-    # (interactive, so they can cancel if already authenticated).
+    # npm). ``kimi login`` is the interactive OAuth device flow (membership);
+    # pay-per-use users instead set a Kimi API key in
+    # ``~/.kimi-code/config.toml``. ``status_args`` is intentionally ``None``:
+    # kimi has no first-class "am I logged in?" exit-code probe — readiness is
+    # inspected file-based via ``kimi_auth.kimi_auth_configured`` instead (login
+    # credential OR configured API key). With ``None`` the login path runs every
+    # time the operator asks for it (interactive, so they can cancel if already
+    # authenticated).
     # ``logout_args`` is ``None`` because kimi has no ``kimi logout`` subcommand
     # (verified against kimi CLI v0.29.1 — ``kimi logout`` errors "unknown
     # command"), so ``harness_logout`` is a no-op for it (same as Qwen / agy).
@@ -274,6 +305,8 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
         status_args=("models",),
         install_hint="curl -fsSL https://antigravity.google/cli/install.sh | bash",
         auth_hint="run `agy` and complete the browser sign-in",
+        # Direct GEMINI_API_KEY authentication first shipped in agy 1.1.13.
+        min_version=_ANTIGRAVITY_MIN_VERSION,
     ),
     GOOSE_KEY: HarnessInstallSpec(
         "Goose",
@@ -289,6 +322,16 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
         install_hint=_HERMES_INSTALL_HINT,
         install_command=("bash", "-c", _HERMES_INSTALL_HINT),
         min_version=_HERMES_MIN_VERSION,
+    ),
+    DEVIN_KEY: HarnessInstallSpec(
+        "Devin",
+        "devin",
+        package=None,
+        login_args=("auth", "login"),
+        status_args=("auth", "status"),
+        install_hint=_DEVIN_INSTALL_HINT,
+        install_command=("bash", "-c", _DEVIN_INSTALL_HINT),
+        auth_hint="run `devin auth login` (Omnigent stores no Devin credential)",
     ),
 }
 
@@ -323,12 +366,13 @@ _HARNESS_NAME_TO_KEY: dict[str, str] = {
     "native-cursor": CURSOR_KEY,
     "kiro-native": KIRO_KEY,
     "native-kiro": KIRO_KEY,
-    # The native agy TUI bridge wraps the ``agy`` CLI; both spellings map to
-    # the Gemini family's install spec. (The in-process ``antigravity`` SDK
-    # harness is deliberately absent — like the other SDK harnesses it needs no
-    # CLI binary.)
+    # The native agy TUI bridge wraps the ``agy`` CLI. The in-process
+    # ``antigravity`` SDK harness is deliberately absent because it needs no
+    # CLI binary.
     "antigravity-native": GEMINI_FAMILY,
     "native-antigravity": GEMINI_FAMILY,
+    "agy-native": GEMINI_FAMILY,
+    "native-agy": GEMINI_FAMILY,
     "goose-native": GOOSE_KEY,
     "native-goose": GOOSE_KEY,
     # Headless Goose (``harness: goose``, drives ``goose acp``) wraps the same
@@ -354,6 +398,12 @@ _HARNESS_NAME_TO_KEY: dict[str, str] = {
     # gates on the same binary.
     "hermes-native": HERMES_KEY,
     "native-hermes": HERMES_KEY,
+    # Native Devin TUI (``devin-native``, via ``omni devin``) wraps the ``devin``
+    # CLI; ``native-devin`` gates on the same binary. The bare ``devin`` spelling
+    # canonicalizes to ``devin-native``, so it lands here too, and the ACP row
+    # gates on the same binary through the catalog.
+    "devin-native": DEVIN_KEY,
+    "native-devin": DEVIN_KEY,
 }
 
 
@@ -671,6 +721,21 @@ def harness_setup_hint(harness: str | None) -> str:
         login`"`` for native Cursor, or the ``omni setup`` hint otherwise.
     """
     spec = required_cli_for_harness(harness or "")
+    if spec is not None and spec.binary == "agy":
+        from omnigent.errors import ErrorCode, OmnigentError
+        from omnigent.harnesses.antigravity_native.credentials import (
+            resolve_antigravity_credentials,
+        )
+
+        try:
+            resolve_antigravity_credentials()
+        except OmnigentError as exc:
+            if exc.code == ErrorCode.INVALID_INPUT:
+                return (
+                    exc.message + " Run omni setup on the host to repair the Gemini configuration."
+                )
+        except (OSError, ValueError):
+            pass
     if spec is not None and spec.package is None and spec.install_hint:
         login = ""
         if spec.login_args:
@@ -678,7 +743,10 @@ def harness_setup_hint(harness: str | None) -> str:
         elif spec.auth_hint:
             login = f", then {spec.auth_hint}"
         return f"install the {spec.binary} CLI on that machine with `{spec.install_hint}`{login}"
-    return "run `omni setup` on that machine to install the CLI and set a default credential"
+    return (
+        f"run `{cli_invocation(name='omni')} setup` on that machine to install "
+        "the CLI and set a default credential"
+    )
 
 
 _VERSION_RE = re.compile(r"(\d+\.\d+\.\d+(?:[-.][0-9A-Za-z]+)*)")
@@ -711,7 +779,7 @@ def _parse_harness_cli_version(text: str) -> str | None:
     """Extract a semver-ish string from ``<binary> --version`` output.
 
     Mirrors the OpenCode-specific parser in
-    :func:`omnigent.opencode_native_app_server.parse_opencode_version` but is
+    :func:`omnigent.harnesses.opencode_native.app_server.parse_opencode_version` but is
     kept generic so any harness can declare a version range in its install spec.
     Date-shaped versions (e.g. Cursor's ``2026.06.22`` or
     ``2026.06.19-20-24-33-653a7fb``) are normalized to ``YYYY.MM.DD``.
@@ -731,6 +799,61 @@ def _parse_harness_cli_version(text: str) -> str | None:
 # enough that a wedged CLI fails fast.
 _DEFAULT_CLI_PROBE_TIMEOUT_S = 30.0
 READINESS_CLI_PROBE_TIMEOUT_S = 10.0
+
+# Cache successful probes to limit subprocess churn during readiness checks.
+# Launchers can delegate to an updated executable without changing themselves.
+_VERSION_PROBE_CACHE: dict[tuple[str, int, int], tuple[str, float]] = {}
+_LOGIN_PROBE_CACHE: dict[tuple[str, str], float] = {}
+_PROBE_CACHE_LOCK = threading.Lock()
+# ponytail: a 60s TTL bounds staleness without tracking launcher dependencies.
+_VERSION_PROBE_CACHE_TTL_S = 60.0
+_LOGIN_PROBE_CACHE_TTL_S = 120.0
+_PROBE_CACHE_MAX_ENTRIES = 64
+
+
+def _cli_probe_cwd() -> str | None:
+    """Return a stable cwd for a harness CLI probe, or ``None`` to inherit it.
+
+    A long-lived daemon can outlive the directory it was started from (a temp
+    checkout or a removed git worktree). A probe subprocess inherits that
+    deleted cwd, where ``claude`` exits non-zero, so a present CLI reads as
+    unavailable. Return ``None`` while the cwd is intact; once it is gone, fall
+    back to the home directory, else the filesystem root.
+    """
+    try:
+        os.getcwd()
+        return None
+    except OSError:
+        pass
+    try:
+        # Path.home() raises RuntimeError, not OSError, when HOME is unset.
+        home = Path.home()
+        if home.is_dir():
+            return str(home)
+    except (OSError, RuntimeError):
+        pass
+    return os.path.abspath(os.sep)
+
+
+def invalidate_harness_probe_caches() -> None:
+    """Force fresh CLI version and login probes after refresh or installation."""
+    with _PROBE_CACHE_LOCK:
+        _VERSION_PROBE_CACHE.clear()
+        _LOGIN_PROBE_CACHE.clear()
+
+
+def _binary_signature(binary: str) -> tuple[str, int, int] | None:
+    """Return *binary*'s identity signature for the version cache.
+
+    :param binary: Absolute path of the CLI binary, e.g. ``"/usr/bin/claude"``.
+    :returns: ``(path, mtime_ns, size)``, or ``None`` when it cannot be
+        stat'ed (caller probes uncached).
+    """
+    try:
+        stat = os.stat(binary)
+    except OSError:
+        return None
+    return (binary, stat.st_mtime_ns, stat.st_size)
 
 
 def _harness_cli_version_satisfies(
@@ -756,7 +879,16 @@ def _harness_cli_version_satisfies(
     try:
         parsed = Version(version)
     except InvalidVersion:
-        return False
+        # Fall back to the leading X.Y.Z segment for pre-release version
+        # strings that packaging rejects (e.g. ``0.146.0-alpha.9.2``).
+        # This avoids mis-classifying a newer pre-release as too old.
+        m = re.match(r"^(\d+\.\d+\.\d+)", version)
+        if not m:
+            return False
+        try:
+            parsed = Version(m.group(1))
+        except InvalidVersion:
+            return False
     if spec.min_version is not None:
         try:
             if parsed < Version(spec.min_version):
@@ -783,6 +915,19 @@ def harness_install_spec(key: str) -> HarnessInstallSpec | None:
     return _all_harness_install().get(key)
 
 
+def harness_cli_binary(key: str) -> str | None:
+    """Resolve the CLI selected for an install key, including Pi's path override."""
+    spec = harness_install_spec(key)
+    if spec is None:
+        return None
+    command = spec.binary
+    if key == PI_KEY:
+        from omnigent.harness_startup_config import resolve_harness_path
+
+        command = resolve_harness_path("pi") or command
+    return resolve_cli_binary(command)
+
+
 def harness_cli_version_satisfies(key: str) -> bool:
     """Return whether the installed CLI for *key* satisfies its version range.
 
@@ -798,7 +943,7 @@ def harness_cli_version_satisfies(key: str) -> bool:
     spec = harness_install_spec(key)
     if spec is None:
         return False
-    binary = resolve_cli_binary(spec.binary)
+    binary = harness_cli_binary(key)
     if binary is None:
         return False
     return _harness_cli_version_satisfies(spec, binary)
@@ -826,7 +971,7 @@ def harness_cli_installed(key: str, timeout: float = _DEFAULT_CLI_PROBE_TIMEOUT_
     spec = harness_install_spec(key)
     if spec is None:
         return False
-    binary = resolve_cli_binary(spec.binary)
+    binary = harness_cli_binary(key)
     if binary is None:
         return False
     return _harness_cli_version_satisfies(spec, binary, timeout)
@@ -849,7 +994,7 @@ def harness_cli_version(key: str) -> tuple[str | None, str | None]:
     spec = harness_install_spec(key)
     if spec is None:
         return None, None
-    binary = resolve_cli_binary(spec.binary)
+    binary = harness_cli_binary(key)
     if binary is None:
         return None, None
     version = _harness_cli_version_string(spec, binary)
@@ -876,20 +1021,49 @@ def _harness_cli_version_string(
 ) -> str | None:
     """Return the parsed, normalized version string from *binary* ``--version``.
 
+    Successful parses are cached briefly against ``(path, mtime_ns, size)``.
+    Expiration catches updates behind an unchanged launcher. Failed probes
+    (missing/hung binary, unparseable output) are never cached.
+
     :param timeout: Seconds to wait for the ``--version`` subprocess, e.g.
         :data:`READINESS_CLI_PROBE_TIMEOUT_S` on the readiness path.
     """
+    probe_cwd = _cli_probe_cwd()
+    if probe_cwd is not None and not os.path.isabs(binary):
+        # The daemon's starting cwd is gone, so the probe would run under a
+        # fallback dir; a relative discovered path re-resolves there to a
+        # different executable, so report unverifiable instead of probing it.
+        return None
+    sig = _binary_signature(binary)
+    if sig is not None:
+        with _PROBE_CACHE_LOCK:
+            cached = _VERSION_PROBE_CACHE.get(sig)
+        if cached is not None and time.monotonic() < cached[1]:
+            return cached[0]
     try:
         completed = subprocess.run(
             [binary, "--version"],
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
             timeout=timeout,
             check=False,
+            cwd=probe_cwd,
         )
     except (OSError, subprocess.SubprocessError):
         return None
-    return _parse_harness_cli_version((completed.stdout or "") + "\n" + (completed.stderr or ""))
+    # Failed launchers can print a runtime version, not the CLI's version.
+    if completed.returncode != 0:
+        return None
+    version = _parse_harness_cli_version(
+        (completed.stdout or "") + "\n" + (completed.stderr or "")
+    )
+    if version is not None and sig is not None:
+        with _PROBE_CACHE_LOCK:
+            if len(_VERSION_PROBE_CACHE) >= _PROBE_CACHE_MAX_ENTRIES:
+                _VERSION_PROBE_CACHE.clear()
+            _VERSION_PROBE_CACHE[sig] = (version, time.monotonic() + _VERSION_PROBE_CACHE_TTL_S)
+    return version
 
 
 def harness_install_command(key: str) -> list[str]:
@@ -897,8 +1071,9 @@ def harness_install_command(key: str) -> list[str]:
 
     :param key: A harness family or :data:`PI_KEY`.
     :returns: The install command, e.g. ``["npm", "install", "-g",
-        "@anthropic-ai/claude-code"]`` or an explicitly configured vendor
-        installer command.
+        "@openai/codex"]`` or an explicitly configured vendor installer command,
+        wrapped as ``["bash", "-c", <script>]``. For the form to show a user,
+        see :func:`harness_install_display`.
     :raises KeyError: If *key* has no install spec (caller should gate on
         :func:`harness_install_spec`).
     :raises ValueError: If *key* has a spec but no npm ``package`` (a CLI
@@ -915,12 +1090,144 @@ def harness_install_command(key: str) -> list[str]:
     return ["npm", "install", "-g", package]
 
 
+def harness_install_display(key: str) -> str:
+    """Return the install command in the form to show a user.
+
+    A vendor installer publishes the runnable one-liner in ``install_hint``,
+    while :func:`harness_install_command` wraps it as ``bash -c <script>`` for
+    ``subprocess``; showing that joined argv would print the wrapper for the
+    user to strip by hand. npm harnesses render from the argv as before.
+
+    :param key: A harness family or :data:`PI_KEY`.
+    :returns: e.g. ``"curl -fsSL https://claude.ai/install.sh | bash"``.
+    :raises KeyError: If *key* has no install spec.
+    :raises ValueError: If *key* has neither an ``install_hint`` nor a
+        ``package``.
+    """
+    spec = harness_install_spec(key)
+    if spec is not None and spec.install_hint:
+        return spec.install_hint
+    return " ".join(harness_install_command(key))
+
+
+# Lines of installer stderr kept for diagnosis. The output is teed straight to
+# this process as it arrives, so this buffer only has to be long enough to hold
+# npm's error block — not the whole install log, which must not grow the host
+# daemon's memory.
+_INSTALLER_STDERR_TAIL_LINES = 80
+
+# Grace for the tee thread to drain after the installer exits. Bounded so a
+# pipe that never reaches EOF cannot hang the install call.
+_INSTALLER_TEE_DRAIN_TIMEOUT_S = 5.0
+
+# npm's own machine-readable cause line: ``npm error code EACCES`` on npm 10+,
+# ``npm ERR! code EACCES`` on 9 and earlier. Matching the code rather than the
+# prose keeps this stable across npm majors.
+_NPM_ERROR_CODE_RE = re.compile(r"npm (?:error|ERR!)\s+code\s+([A-Z0-9_]+)")
+
+# npm cause code -> what the user can do about it. Deliberately small: these are
+# the failures a person can actually act on.
+_NPM_FAILURE_REASONS: dict[str, str] = {
+    "EACCES": "permission denied writing the global install directory",
+    "EPERM": "permission denied writing the global install directory",
+    "ECONNREFUSED": "could not reach the npm registry",
+    "ECONNRESET": "could not reach the npm registry",
+    "ENOTFOUND": "could not reach the npm registry",
+    "ETIMEDOUT": "could not reach the npm registry",
+    "EAI_AGAIN": "could not reach the npm registry (DNS lookup failed)",
+    "ENETUNREACH": "could not reach the npm registry (network unreachable)",
+    "E401": "the npm registry rejected the credentials",
+    "E403": "the npm registry refused access to the package",
+    "ENEEDAUTH": "the npm registry requires authentication",
+    "ENOSPC": "no space left on the device",
+}
+
+
+def _installer_failure_reason(returncode: int, stderr_tail: str) -> str:
+    """Name an install failure's cause, falling back to the exit code.
+
+    :param returncode: The installer's exit status.
+    :param stderr_tail: The tail of the installer's stderr, possibly empty.
+    :returns: A cause naming what the user can fix when the output identifies
+        one, else ``"installer exited with code <n>"``. The bare exit code is
+        the fallback rather than an error, because a vendor installer's output
+        is not npm-shaped and still has to produce *some* reason.
+    """
+    for code in _NPM_ERROR_CODE_RE.findall(stderr_tail):
+        explanation = _NPM_FAILURE_REASONS.get(code)
+        if explanation is not None:
+            return f"{explanation} (npm {code})"
+    return f"installer exited with code {returncode}"
+
+
+def _run_installer(cmd: list[str], *, timeout: float) -> tuple[int, str]:
+    """Run an installer, teeing its stderr so it is both shown and readable.
+
+    The installer's output has to keep streaming to this process — that is what
+    makes a failure visible in the setup terminal and the host log — but the
+    reason string also needs to read it. So stderr is piped and each line is
+    written straight through as it arrives, while a bounded tail is retained
+    for :func:`_installer_failure_reason`. stdout is left inheriting, untouched.
+
+    The tee thread owns the pipe and closes it at EOF. A child the installer
+    leaves running can hold the pipe open after the installer exits, so the
+    drain wait is bounded rather than closing the pipe here, which would block
+    until that child exits.
+
+    :param cmd: The installer argv, e.g. ``["npm", "install", "-g", pkg]``.
+    :param timeout: Seconds to wait before killing the installer.
+    :returns: ``(returncode, stderr_tail)``.
+    :raises subprocess.TimeoutExpired: If *timeout* elapses first; the
+        installer and its child processes are killed before this propagates.
+    :raises OSError: If the installer cannot be executed at all.
+    """
+    tail: deque[str] = deque(maxlen=_INSTALLER_STDERR_TAIL_LINES)
+    tail_lock = threading.Lock()
+    # Not _proc.spawn_kwargs(): a new session would cut the setup wizard's
+    # installers off from the terminal (prompts, /dev/tty, Ctrl-C).
+    proc = subprocess.Popen(
+        cmd,
+        stderr=subprocess.PIPE,
+        text=True,
+        errors="replace",
+        bufsize=1,
+    )
+    stream = proc.stderr
+    assert stream is not None  # stderr=PIPE above
+
+    def _tee() -> None:
+        with stream:
+            for line in stream:
+                with tail_lock:
+                    tail.append(line)
+                sys.stderr.write(line)
+                sys.stderr.flush()
+
+    # A reader thread, so a wedged installer still hits the timeout below
+    # instead of blocking forever on a read that never reaches EOF.
+    pump = threading.Thread(target=_tee, name="harness-install-stderr", daemon=True)
+    pump.start()
+    try:
+        returncode = proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        # Killing only the installer would leave npm lifecycle scripts or the
+        # inner shell of ``curl | bash`` running and writing to the pipe.
+        _proc.kill_tree(proc)
+        proc.wait()
+        raise
+    finally:
+        pump.join(timeout=_INSTALLER_TEE_DRAIN_TIMEOUT_S)
+    with tail_lock:
+        return returncode, "".join(tail)
+
+
 class HarnessInstallResult(NamedTuple):
     """Outcome of :func:`try_install_harness_cli`.
 
-    :param installed: Whether the CLI resolves after the attempt, via the same
-        :func:`resolve_cli_binary` ladder readiness uses (``PATH`` plus the
-        common global install dirs), not bare ``PATH`` alone.
+    :param installed: Whether the CLI is ready after the attempt by the same
+        :func:`harness_cli_installed` check readiness uses: it resolves via the
+        :func:`resolve_cli_binary` ladder (``PATH`` plus the common global
+        install dirs) and its version is in the supported range.
     :param reason: Human-readable failure reason when ``installed`` is False;
         ``None`` on success.
     """
@@ -933,17 +1240,23 @@ def try_install_harness_cli(key: str) -> HarnessInstallResult:
     """Install the harness CLI, returning whether it landed and why not.
 
     Same behavior and side effects as :func:`install_harness_cli` (the
-    installer's output streams to this process, uncaptured, so failures stay
-    visible in the setup terminal / host log), but returns a human-readable
-    reason so a UI-driven install can surface "npm is not available on the
-    host" instead of a silent boolean failure.
+    installer's output still streams to this process, so failures stay visible
+    in the setup terminal / host log), but returns a human-readable reason so a
+    UI-driven install can surface "npm is not available on the host" instead of
+    a silent boolean failure.
+
+    A failing installer's stderr is teed rather than merely passed through, so
+    the reason can name what the user has to fix — a permission problem and an
+    unreachable registry are both exit code 1 and were previously reported
+    identically.
 
     :param key: A harness family or :data:`PI_KEY`.
     :returns: A :class:`HarnessInstallResult` — ``(True, None)`` once the CLI
-        resolves via :func:`resolve_cli_binary` (including the no-op where it
-        was already present), otherwise ``(False, reason)`` naming the failure
-        (manual-only spec, missing installer, timeout, OS error, non-zero exit,
-        or a post-install binary-not-found).
+        resolves via :func:`resolve_cli_binary` and passes its version range
+        (including the no-op where it was already present), otherwise
+        ``(False, reason)`` naming the failure (manual-only spec, missing
+        installer, timeout, OS error, a diagnosed or bare non-zero exit, a
+        post-install binary-not-found, or a CLI still outside its range).
     :raises KeyError: If *key* has no install spec.
     """
     spec = harness_install_spec(key)
@@ -954,11 +1267,12 @@ def try_install_harness_cli(key: str) -> HarnessInstallResult:
     if shutil.which(cmd[0]) is None:
         return HarnessInstallResult(False, f"{cmd[0]!r} is not available on the host")
     try:
-        result = subprocess.run(cmd, check=False, timeout=300)
+        returncode, stderr_tail = _run_installer(cmd, timeout=300)
     except subprocess.TimeoutExpired:
         return HarnessInstallResult(False, "install timed out after 300s")
     except OSError as exc:
         return HarnessInstallResult(False, f"install command failed to run: {exc}")
+    invalidate_harness_probe_caches()
     # harness_install_command would have raised for a spec-less key, so spec is
     # non-None past this point.
     assert spec is not None
@@ -969,7 +1283,9 @@ def try_install_harness_cli(key: str) -> HarnessInstallResult:
     # binary the host daemon's frozen ``PATH`` omits but readiness still resolves
     # via the ladder — the spurious "failed" toast next to a green "ready" tick.
     resolved = resolve_cli_binary(spec.binary)
-    if resolved is not None:
+    # A failed upgrade leaves the outdated binary resolving, so success also needs
+    # the version check readiness applies.
+    if resolved is not None and harness_cli_installed(key):
         # Put the resolving dir on ``PATH`` for this process so the setup
         # wizard's *later* steps — harness_login / harness_cli_logged_in /
         # harness_logout — which shell out with the bare binary name and only
@@ -981,22 +1297,29 @@ def try_install_harness_cli(key: str) -> HarnessInstallResult:
         if resolved_dir not in path_entries:
             os.environ["PATH"] = os.pathsep.join([resolved_dir, *path_entries])
         return HarnessInstallResult(True, None)
-    if result.returncode != 0:
-        return HarnessInstallResult(False, f"installer exited with code {result.returncode}")
+    if returncode != 0:
+        return HarnessInstallResult(False, _installer_failure_reason(returncode, stderr_tail))
+    if resolved is not None:
+        version, required = harness_cli_version(key)
+        found = f"{version} (requires {required})" if version and required else "unsupported"
+        return HarnessInstallResult(
+            False, f"installer completed but {spec.binary!r} is still {found}"
+        )
     return HarnessInstallResult(
         False, f"installer completed but {spec.binary!r} could not be found"
     )
 
 
 def install_harness_cli(key: str) -> bool:
-    """Install the harness CLI; return whether it landed on ``PATH``.
+    """Install the harness CLI; return whether it is now ready to use.
 
     Thin wrapper over :func:`try_install_harness_cli` that discards the failure
     reason, preserving the boolean contract the setup wizard relies on.
 
     :param key: A harness family or :data:`PI_KEY`.
-    :returns: ``True`` when the CLI is on ``PATH`` after the install attempt,
-        ``False`` if the installer is missing or the install failed.
+    :returns: ``True`` when the CLI resolves and is version-compatible after
+        the install attempt, ``False`` if the installer is missing or the
+        install failed, including an upgrade that left the old version.
     :raises KeyError: If *key* has no install spec.
     """
     return try_install_harness_cli(key).installed
@@ -1020,6 +1343,11 @@ def harness_cli_logged_in(key: str, timeout: float = _DEFAULT_CLI_PROBE_TIMEOUT_
     (Codex's human line, ``agy models``' model list), so the exit code decides
     (``0`` only when logged in) and stdout is never parsed.
 
+    Positive verdicts are cached for :data:`_LOGIN_PROBE_CACHE_TTL_S`
+    seconds per ``(key, binary)`` so readiness refreshes don't exec the
+    vendor CLI on every pass; negative verdicts are never cached, and
+    :func:`harness_logout` invalidates the key's entries.
+
     :param key: A harness family, e.g. ``"anthropic"`` (Claude),
         ``"openai"`` (Codex), or ``"gemini"`` (Antigravity, via ``agy models``).
     :param timeout: Seconds to wait for the status subprocess, e.g. ``10.0`` on
@@ -1034,14 +1362,30 @@ def harness_cli_logged_in(key: str, timeout: float = _DEFAULT_CLI_PROBE_TIMEOUT_
     binary = resolve_cli_binary(spec.binary) if key == GEMINI_FAMILY else shutil.which(spec.binary)
     if binary is None:
         return False
-    argv_binary = binary if key == GEMINI_FAMILY else spec.binary
+    probe_cwd = _cli_probe_cwd()
+    if probe_cwd is not None and not os.path.isabs(binary):
+        # The daemon's starting cwd is gone, so the probe would run under a
+        # fallback dir; a relative discovered path re-resolves there to a
+        # different executable, so report not-logged-in instead of probing it.
+        return False
+    # Positive verdicts are TTL-cached (see the cache block above): logins
+    # are sticky, and the readiness loop re-probing a logged-in CLI every
+    # refresh is the ambient storm. Negatives always re-probe so a login
+    # made a moment ago is seen immediately.
+    cache_key = (key, binary)
+    with _PROBE_CACHE_LOCK:
+        if time.monotonic() < _LOGIN_PROBE_CACHE.get(cache_key, 0.0):
+            return True
     try:
         result = subprocess.run(
-            [argv_binary, *spec.status_args],
+            [binary, *spec.status_args],
             check=False,
             timeout=timeout,
+            # Concurrent probes must not change or restore a shared terminal's input mode.
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
+            cwd=probe_cwd,
         )
     except (OSError, subprocess.TimeoutExpired):
         return False
@@ -1052,14 +1396,20 @@ def harness_cli_logged_in(key: str, timeout: float = _DEFAULT_CLI_PROBE_TIMEOUT_
     # exit code is authoritative and stdout is never parsed — output that merely
     # happens to be JSON can't flip the verdict.
     status_key = spec.login_status_key
+    logged_in = result.returncode == 0
     if status_key is not None:
         try:
             payload = json.loads(result.stdout)
         except (json.JSONDecodeError, ValueError):
-            return result.returncode == 0
+            payload = None
         if isinstance(payload, dict) and status_key in payload:
-            return bool(payload[status_key])
-    return result.returncode == 0
+            logged_in = bool(payload[status_key])
+    if logged_in:
+        with _PROBE_CACHE_LOCK:
+            if len(_LOGIN_PROBE_CACHE) >= _PROBE_CACHE_MAX_ENTRIES:
+                _LOGIN_PROBE_CACHE.clear()
+            _LOGIN_PROBE_CACHE[cache_key] = time.monotonic() + _LOGIN_PROBE_CACHE_TTL_S
+    return logged_in
 
 
 def harness_login(key: str) -> bool:
@@ -1143,4 +1493,9 @@ def harness_logout(key: str) -> bool:
         subprocess.run([spec.binary, *spec.logout_args], check=False, timeout=60)
     except (OSError, subprocess.TimeoutExpired):
         return False
+    # Drop cached logged-in verdicts so the confirmation below re-probes —
+    # a cached positive would report this successful logout as failed.
+    with _PROBE_CACHE_LOCK:
+        for cache_key in [k for k in _LOGIN_PROBE_CACHE if k[0] == key]:
+            del _LOGIN_PROBE_CACHE[cache_key]
     return not harness_cli_logged_in(key)

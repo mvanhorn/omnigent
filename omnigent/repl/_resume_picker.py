@@ -28,12 +28,13 @@ import sys
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol, TextIO
+from typing import TYPE_CHECKING, Literal, Protocol, TextIO
 
 if TYPE_CHECKING:
     from omnigent_client import OmnigentClient
+    from omnigent_client._sessions import SessionListItem
     from prompt_toolkit.key_binding import KeyBindings
     from prompt_toolkit.key_binding.key_processor import KeyPressEvent
     from prompt_toolkit.styles import Style
@@ -60,20 +61,26 @@ from omnigent._wrapper_labels import (
 from omnigent._wrapper_labels import (
     WRAPPER_LABEL_KEY as _CLAUDE_NATIVE_WRAPPER_LABEL_KEY,
 )
+from omnigent.harness_plugins import CODEX_NATIVE_CODING_AGENT
 
 # Client-side persistent launch state. The picker reads this per row
 # to render workspace metadata for native wrapper sessions. Decoupled
 # from the heavy wrapper import graphs; these state modules have no
 # tmux / websocket dependencies.
-from omnigent.claude_native_state import read_launch_state as _read_claude_launch_state
-from omnigent.codex_native_state import read_launch_state as _read_codex_launch_state
-from omnigent.harness_plugins import CODEX_NATIVE_CODING_AGENT
-from omnigent.native_coding_agents import native_coding_agent_for_wrapper_label
+from omnigent.harnesses.claude_native.state import read_launch_state as _read_claude_launch_state
+from omnigent.harnesses.codex_native.state import read_launch_state as _read_codex_launch_state
+from omnigent.native.native_coding_agents import native_coding_agent_for_wrapper_label
 
 # Page size for the paginated picker.
 # Small enough that a 24-line terminal shows the whole page; big enough
 # that a typical user finds their conversation in the first page.
 _PAGE_SIZE = 10
+
+# Backoff schedule for transient 429s on the picker's session-list
+# call. Two short retries keep a momentary rate-limit invisible to the
+# user; a persistent one still surfaces (as a typed error the caller
+# renders concisely, never a raw traceback).
+_SESSION_LIST_RETRY_DELAYS_S: tuple[float, ...] = (0.5, 1.0)
 
 _CANCEL_TOKEN = "cancel"
 
@@ -897,6 +904,58 @@ def _page_start_for_selection(selected_index: int) -> int:
     return (selected_index // _PAGE_SIZE) * _PAGE_SIZE
 
 
+async def _list_sessions_with_retry(
+    client: OmnigentClient,
+    *,
+    limit: int = 200,
+    agent_id: str | None = None,
+    agent_name: str | None = None,
+    order: str = "desc",
+    kind: Literal["default", "sub_agent", "any"] | None = None,
+) -> list[SessionListItem]:
+    """List the caller's own sessions with bounded retries on 429.
+
+    A transient rate-limit on the picker's single list call should not
+    abort the resume journey: retry on the short
+    :data:`_SESSION_LIST_RETRY_DELAYS_S` schedule and re-raise only
+    when the 429 persists past the last attempt. Every other error
+    propagates immediately — only the transient-by-definition status
+    is worth waiting out.
+
+    :param client: SDK client whose ``sessions.list`` to call.
+    :param limit: Maximum number of session rows to fetch.
+    :param agent_id: Scope to this agent; ``None`` lists across agents.
+    :param agent_name: Scope to sessions whose bound agent has this name.
+    :param order: Sort order forwarded to ``list``.
+    :param kind: Session kind filter; ``None`` keeps the server default.
+    :returns: The session rows.
+    :raises omnigent_client.RateLimitedError: When every attempt was
+        rate-limited.
+    """
+    from omnigent_client import RateLimitedError
+
+    for delay_s in _SESSION_LIST_RETRY_DELAYS_S:
+        try:
+            return await client.sessions.list(
+                limit=limit,
+                agent_id=agent_id,
+                agent_name=agent_name,
+                order=order,
+                visibility="mine",
+                kind=kind,
+            )
+        except RateLimitedError:
+            await asyncio.sleep(delay_s)
+    return await client.sessions.list(
+        limit=limit,
+        agent_id=agent_id,
+        agent_name=agent_name,
+        order=order,
+        visibility="mine",
+        kind=kind,
+    )
+
+
 async def pick_conversation_from_sdk(
     client: OmnigentClient,
     *,
@@ -910,14 +969,15 @@ async def pick_conversation_from_sdk(
 
     Sessions API filters by direct ``conversation.agent_id`` (not via
     ``task.agent_id``) so wrapper sessions without task rows still
-    appear; also enforces ``has_agent_id`` and ``accessible_by`` server-side.
+    appear; also enforces ``has_agent_id`` and ownership server-side.
 
     :param agent_id: Scope to this agent; ``None`` lists across agents.
     :param agent_name_filter: Scope to sessions whose bound agent row
         has this name. Used for session-scoped agents that share a
         YAML name but intentionally do not share ``agent_id``.
     """
-    convos = await client.sessions.list(
+    convos = await _list_sessions_with_retry(
+        client,
         limit=200,
         agent_id=agent_id,
         agent_name=agent_name_filter,
@@ -932,6 +992,7 @@ async def pick_conversation_by_wrapper_label_from_sdk(
     *,
     wrapper_value: str,
     agent_name: str,
+    host_id: str | None = None,
     out: TextIO | None = None,
     in_: TextIO | None = None,
 ) -> str | None:
@@ -939,8 +1000,11 @@ async def pick_conversation_by_wrapper_label_from_sdk(
 
     Wrapper invocations (claude-native today) upload a fresh agent
     bundle per session, so ``agents.get_by_name`` returns no canonical
-    record — agent-id filtering can't be used. List every session the
-    caller can see and filter by the wrapper label client-side.
+    record — agent-id filtering can't be used. List the caller's own
+    sessions and filter by the wrapper label client-side. Native children
+    are listed too, but only for callers that pass ``host_id``: a child's
+    resumable host is inherited from its ancestry, so without a host to
+    compare against the picker keeps its top-level-only listing.
 
     Renders workspace metadata so the user can see which cwd each
     session was launched from -- claude --resume requires cwd parity
@@ -948,13 +1012,57 @@ async def pick_conversation_by_wrapper_label_from_sdk(
     user for the chdir prompt the wrapper raises after they pick.
     The cwd comes from the wrapper's client-side persistent state
     (``~/.omnigent/claude-native/``); sessions created on a
-    different machine will show as having no recorded cwd."""
-    all_convos = await client.sessions.list(limit=200, agent_id=None, order="desc")
+    different machine will show as having no recorded cwd.
+
+    :param host_id: When set, keep only rows running on this host (the
+        invoking machine). Native transcript and workspace state are
+        host-local, so a wrapper session bound to another host is a
+        dead end in this picker — resuming it cannot work here. A native
+        child inherits the host of its nearest bound ancestor; a child whose
+        ancestry is not fully listed is dropped because its host is unknown.
+        Rows without a recorded host (never bound, or an older
+        server that predates the field) are kept: dropping them would
+        hide resumable local sessions. ``None`` disables host
+        filtering (explicit ``--resume <id>`` stays unrestricted for
+        diagnostics / migration workflows — it never routes through
+        this picker).
+    """
+    all_convos = await _list_sessions_with_retry(client, limit=200, agent_id=None, order="desc")
+    if host_id is not None:
+        # Children get their own page so they never displace top-level rows, and
+        # only host-scoped callers see them: their host comes from their ancestry.
+        children = await _list_sessions_with_retry(
+            client, limit=200, agent_id=None, order="desc", kind="sub_agent"
+        )
+        listed = {c.id for c in all_convos}
+        all_convos = sorted(
+            [*all_convos, *(c for c in children if c.id not in listed)],
+            key=lambda c: getattr(c, "created_at", 0),
+            reverse=True,
+        )
+    rows_by_id = {c.id: c for c in all_convos}
+
+    def _resumable_here(c: SessionListItem) -> bool:
+        # A native child runs on the host of its nearest bound ancestor. The walk
+        # is bounded by the page size, so a corrupt parent cycle cannot hang it.
+        node: SessionListItem | None = c
+        for _ in range(len(rows_by_id)):
+            if node is None:
+                return False  # an ancestor is off-page, so ownership is unknown
+            if getattr(node, "host_id", None) is not None:
+                return node.host_id == host_id
+            parent_id = getattr(node, "parent_session_id", None)
+            if parent_id is None:
+                return True  # unbound root: never bound, or an older server
+            node = rows_by_id.get(parent_id)
+        return False
+
     convos = [
         c
         for c in all_convos
         if getattr(c, "labels", None)
         and c.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY) == wrapper_value
+        and (host_id is None or _resumable_here(c))
     ]
     previews = await _collect_previews_async(client, convos)
     return pick_conversation(
@@ -970,13 +1078,23 @@ async def pick_conversation_by_wrapper_label_from_sdk(
 async def pick_conversation_cross_agent_from_sdk(
     client: OmnigentClient,
     *,
+    owner_user_id: str | None = None,
     out: TextIO | None = None,
     in_: TextIO | None = None,
 ) -> str | None:
-    """Cross-agent variant: lists every session the caller can see
+    """Cross-agent variant: lists the caller's own sessions
     via ``/v1/sessions`` and renders runtime metadata for
-    ``omnigent resume``'s runtime-dispatch UX."""
-    convos = await client.sessions.list(limit=200, agent_id=None, order="desc")
+    ``omnigent resume``'s runtime-dispatch UX.
+
+    Resume requires ownership to bind a runner, so request
+    ``visibility="mine"``. When ``owner_user_id`` is set, also filter
+    the returned rows for older servers that ignore visibility.
+    ``None`` skips this fallback when identity could not be resolved
+    or the server runs without permissions.
+    """
+    convos = await _list_sessions_with_retry(client, limit=200, agent_id=None, order="desc")
+    if owner_user_id is not None:
+        convos = [c for c in convos if c.owner == owner_user_id]
     previews = await _collect_previews_async(client, convos)
     # Header label is intentionally generic — "resume" describes the
     # action, not a single agent. Without overriding the legacy
@@ -1480,10 +1598,10 @@ async def _collect_previews_async(
 
     async def fetch_one(conv: _ConversationRow) -> tuple[str, _Preview | None]:
         try:
-            items = await client.sessions.list_items(conv.id, limit=10, order="desc")
+            page = await client.sessions.list_items(conv.id, limit=10, order="desc")
         except Exception:  # noqa: BLE001 — preview is best-effort, swallow per-conv errors
             return conv.id, None
-        return conv.id, _last_message_preview_from_dicts(items)
+        return conv.id, _last_message_preview_from_dicts(page.data)
 
     capped = conversations[:_PREVIEW_PREFETCH_CAP]
     pairs = await asyncio.gather(*(fetch_one(c) for c in capped))
@@ -1659,7 +1777,7 @@ def _format_when(created_at: int) -> str:
         return f"{delta // 3600}h ago"
     if delta < 7 * 86400:
         return f"{delta // 86400}d ago"
-    return datetime.fromtimestamp(created_at, tz=timezone.utc).astimezone().strftime("%b %d %H:%M")
+    return datetime.fromtimestamp(created_at, tz=UTC).astimezone().strftime("%b %d %H:%M")
 
 
 def _read_line_choice(in_: TextIO) -> str | None:

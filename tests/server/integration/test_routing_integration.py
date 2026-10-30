@@ -33,9 +33,9 @@ from tests.server.helpers import (
     echo_runner_client,
 )
 
-ROUTED_MODEL = "databricks-claude-opus-4-8"
-LLM_PICKED_MODEL = "databricks-claude-sonnet-4-6"
-GPT_MODEL = "databricks-gpt-5-5"
+ROUTED_MODEL = "system.ai.claude-opus-4-8"
+LLM_PICKED_MODEL = "system.ai.claude-sonnet-4-6"
+GPT_MODEL = "system.ai.gpt-5-5"
 GLM_MODEL = "databricks-glm-5-2"
 # The spelling the gateway serves GLM under; see ``_SERVABLE_ALIASES``.
 GLM_SERVABLE = "system.ai.glm-5-2"
@@ -626,7 +626,7 @@ async def test_codex_session_keeps_glm_candidates_and_applies_a_glm_pick(
     applied — under the gateway's own ``system.ai.glm-5-2`` model route, which
     is the only name that serves.
     """
-    from omnigent.model_override import model_family_mismatch
+    from omnigent.models.model_override import model_family_mismatch
     from omnigent.server import smart_routing as smart_routing_module
     from omnigent.server.routes import sessions as sessions_facade
 

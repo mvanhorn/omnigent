@@ -1,3 +1,4 @@
+import type { NativePermissionDelivery } from "./nativePermissionDelivery";
 // Block walker — converts a flat `AnyBlock[]` into a list of bubble
 // groups for the JSX layer to map over.
 //
@@ -20,19 +21,23 @@
 
 import type {
   AnyBlock,
+  ErrorBlock,
   MessageContentBlock,
+  NativeToolBlock,
   RoutingDecisionBlock,
   ToolExecution,
   ToolResultBlock,
 } from "./blocks";
-import { LIVE_ITEM_PREFIX } from "./blocks";
+import { isTerminalCommandInput, LIVE_ITEM_PREFIX } from "./blocks";
+import { isUserInputElicitation } from "./askUserQuestion";
 import {
   type RoutingDecisionExtras,
   isSessionScopedDecision,
   routingExtras,
 } from "./routingDecision";
+import type { AssistantMessagePhase } from "./conversationItems";
 import { isSystemUserContent } from "./systemMessage";
-import type { RememberScope } from "./types";
+import type { AgyPermission, CodexPersistMode, RememberScope } from "./types";
 import type { ActiveResponse } from "@/store/types";
 
 /**
@@ -50,8 +55,30 @@ export type ToolState =
   | "no-output"; // turn finished (completed/incomplete) but no result was ever recorded
 
 /** A single rendered item inside an assistant bubble. */
+export interface RenderErrorDetails {
+  message: string;
+  source: string;
+  code: string;
+  level?: "error" | "info";
+  title?: string;
+  cause?: string;
+  remediation?: string;
+}
+
+export interface RelatedRenderError extends RenderErrorDetails {
+  itemId: string | null;
+}
+
 export type RenderItem =
-  | { kind: "text"; itemId: string | null; text: string; final: boolean }
+  | {
+      kind: "text";
+      itemId: string | null;
+      text: string;
+      final: boolean;
+      previewInterrupted?: boolean;
+      /** Harness label for the message (Codex); `commentary` is progress narration. */
+      phase?: AssistantMessagePhase;
+    }
   | {
       kind: "reasoning";
       itemId: string | null;
@@ -74,6 +101,7 @@ export type RenderItem =
       label: string;
       data: Record<string, unknown>;
     }
+  | { kind: "subagent_activity"; itemId: string | null; data: Record<string, unknown> }
   | {
       kind: "slash_command";
       itemId: string | null;
@@ -92,7 +120,11 @@ export type RenderItem =
       stderr: string | null;
     }
   | { kind: "policy_denied"; itemId: string | null; reason: string; phase: string }
-  | { kind: "error"; itemId: string | null; message: string; source: string; code: string }
+  | ({
+      kind: "error";
+      itemId: string | null;
+      relatedErrors?: RelatedRenderError[];
+    } & RenderErrorDetails)
   | {
       kind: "retry";
       itemId: string | null;
@@ -103,6 +135,7 @@ export type RenderItem =
     }
   | {
       kind: "elicitation";
+      nativeDelivery?: NativePermissionDelivery;
       itemId: string | null;
       elicitationId: string;
       targetSessionId?: string | null;
@@ -116,6 +149,7 @@ export type RenderItem =
       response: {
         action: "accept" | "decline" | "cancel" | "auto_resolved";
         content?: Record<string, unknown>;
+        _meta?: Record<string, unknown>;
       } | null;
       askUserQuestion?: Record<string, unknown> | null;
       exitPlanMode?: Record<string, unknown> | null;
@@ -126,7 +160,11 @@ export type RenderItem =
         execPolicyAmendment: string[] | null;
       } | null;
       allowAllEdits?: boolean;
+      allowAutoMode?: boolean;
+      permissionDirectories?: string[];
       rememberScope?: RememberScope | null;
+      codexPersistModes?: CodexPersistMode[];
+      agyPermission?: AgyPermission | null;
     };
 
 /** A bubble cluster. The page maps over these. */
@@ -134,9 +172,18 @@ export type Bubble =
   | {
       kind: "user";
       itemId: string;
+      /** Queued input that does not yet have a persisted transcript item. */
+      pending?: boolean;
+      /** Pending input sent mid-turn that the agent hasn't read yet. */
+      awaitingAgent?: boolean;
       content: MessageContentBlock[];
+      /** Shell input is literal command text, not Markdown or attachment markers. */
+      shellCommand?: string;
       /** Human author email, when known. */
       createdBy?: string;
+      /** Epoch seconds of this message, when known — server-stamped from
+       *  history, client-stamped while live. Display-only. */
+      createdAtS?: number;
       /**
        * Stable React key when promoted from an optimistic
        * `pendingUserMessages` entry — carries that entry's client temp
@@ -176,9 +223,21 @@ export type Bubble =
        * trailing answer of its own.
        */
       continued?: boolean;
+      /**
+       * The user spoke while this response was already producing assistant
+       * items. Start the continuation's fold expanded: it can contain a direct
+       * answer to that interjection followed by resumed background work, and
+       * the ordinary trailing-text heuristic cannot distinguish the two.
+       */
+      defaultExpanded?: boolean;
+      /** Freshest epoch stamp in the group (latest activity) —
+       *  server-stamped from history, client-stamped while live.
+       *  Display-only. */
+      createdAtS?: number;
     }
-  | { kind: "compaction_loading"; itemId: string }
+  | { kind: "compaction_loading"; itemId: string; createdAtS?: number }
   | { kind: "compaction"; itemId: string }
+  | { kind: "subagent_activity"; itemId: string; data: Record<string, unknown> }
   | {
       kind: "routing_decision";
       itemId: string;
@@ -229,6 +288,13 @@ export interface BubbleCache {
   blocks: AnyBlock[] | null;
   activeResponse: ActiveResponse | null;
   interruptedResponseIds: readonly string[] | null;
+  // Response id of the newest assistant turn while the SESSION is running,
+  // or null. Drives the trailing-tool spinner for harnesses whose
+  // running/idle lives in `sessionStatus` rather than a streaming
+  // `activeResponse` (see `newestAssistantTurnId`). Part of the cache key: a
+  // running→idle flip carries no block change, so the identity short-circuit
+  // must see it move or a dangling tool would spin forever.
+  liveTurnId: string | null;
   bubbles: Bubble[];
   lastBubbleStart: number;
   lastBubbleCount: number;
@@ -243,11 +309,46 @@ export function createBubbleCache(): BubbleCache {
     blocks: null,
     activeResponse: null,
     interruptedResponseIds: null,
+    liveTurnId: null,
     bubbles: [],
     lastBubbleStart: -1,
     lastBubbleCount: 1,
     supersededChips: new Set<number>(),
   };
+}
+
+/**
+ * Response id of the newest assistant turn — the turn whose trailing tool
+ * phase should spin while the SESSION is running.
+ *
+ * claude-native's running/idle lives in `sessionStatus` (the status file
+ * drives the badge; no streaming `activeResponse` is ever opened — see the
+ * transcript forwarder), so its in-flight tool calls can't key their spinner
+ * off `lifecycle === "streaming"` the way an in-process harness does. Instead
+ * the caller passes `sessionRunning` and this names which turn is live.
+ *
+ * Scans back from the end: the first assistant-side block carrying a real
+ * (non-anonymous) response id names that turn. A trailing user message (a
+ * just-sent prompt with no assistant output yet), a compaction/routing
+ * boundary, or an empty transcript yields `null` — there is no live turn.
+ */
+function newestAssistantTurnId(blocks: AnyBlock[]): string | null {
+  for (let i = blocks.length - 1; i >= 0; i -= 1) {
+    const b = blocks[i]!;
+    if (
+      b.type === "user_message" ||
+      isTerminalCommandInput(b) ||
+      b.type === "compaction" ||
+      b.type === "compaction_loading" ||
+      b.type === "routing_decision"
+    ) {
+      return null;
+    }
+    if (isNonRenderingBlock(b) || b.type === "tool_result" || isSubagentActivityBlock(b)) continue;
+    if (isAnonymousRid(b.ctx.responseId)) continue;
+    return b.ctx.responseId;
+  }
+  return null;
 }
 
 /**
@@ -270,14 +371,24 @@ export function createBubbleCache(): BubbleCache {
  *   and the unit tests rely on.
  * @param interruptedResponseIds - response ids whose bubbles should remain
  *   labelled cancelled even after the active response sidecar has moved on.
+ * @param sessionRunning - whether the SESSION status is running/waiting.
+ *   Lets the newest turn's trailing tool phase spin for a harness whose
+ *   liveness lives in `sessionStatus` rather than a streaming `activeResponse`
+ *   (claude-native). Does NOT change any bubble's `lifecycle` — fork, fold,
+ *   cancelled, and failed are unaffected; it only reaches the tool-state gate.
  */
 export function buildBubbles(
   blocks: AnyBlock[],
   activeResponse: ActiveResponse | null,
   cache?: BubbleCache,
   interruptedResponseIds: readonly string[] = EMPTY_INTERRUPTED_RESPONSE_IDS,
+  sessionRunning = false,
 ): Bubble[] {
   const interruptedResponses = new Set(interruptedResponseIds);
+  // The newest turn spins its trailing tools only while the session runs; an
+  // already-streaming `activeResponse` covers the in-process harnesses without
+  // it, so this is null unless the session is running.
+  const liveTurnId = sessionRunning ? newestAssistantTurnId(blocks) : null;
   // Resolved over the whole transcript before any reuse decision: a create-time
   // chip and the turn chip that repeats it verbatim are one verdict however far
   // apart they landed, and whether the pair is still visible decides whether the
@@ -285,8 +396,16 @@ export function buildBubbles(
   const superseded = supersededRoutingChips(blocks);
   if (cache === undefined) {
     return markContinuedTurns(
-      walkBubbles(blocks, activeResponse, interruptedResponses, 0, [], new Map(), superseded)
-        .bubbles,
+      walkBubbles(
+        blocks,
+        activeResponse,
+        interruptedResponses,
+        0,
+        [],
+        new Map(),
+        superseded,
+        liveTurnId,
+      ).bubbles,
       activeResponse,
     );
   }
@@ -295,14 +414,22 @@ export function buildBubbles(
   if (
     cache.blocks === blocks &&
     cache.activeResponse === activeResponse &&
-    cache.interruptedResponseIds === interruptedResponseIds
+    cache.interruptedResponseIds === interruptedResponseIds &&
+    cache.liveTurnId === liveTurnId
   ) {
     return cache.bubbles;
   }
 
   // Try the incremental path: reuse every finalized bubble (all but the
   // last) and rebuild only from where the last cached bubble started.
-  const reuse = reusablePrefix(blocks, activeResponse, interruptedResponses, cache, superseded);
+  const reuse = reusablePrefix(
+    blocks,
+    activeResponse,
+    interruptedResponses,
+    cache,
+    superseded,
+    liveTurnId,
+  );
   if (reuse !== null) {
     const subIndexSeed = new Map<string, number>();
     for (const b of reuse.prefix) {
@@ -318,10 +445,12 @@ export function buildBubbles(
       reuse.prefix,
       subIndexSeed,
       superseded,
+      liveTurnId,
     );
     cache.blocks = blocks;
     cache.activeResponse = activeResponse;
     cache.interruptedResponseIds = interruptedResponseIds;
+    cache.liveTurnId = liveTurnId;
     cache.bubbles = markContinuedTurns(rest.bubbles, activeResponse);
     cache.lastBubbleStart = rest.lastBubbleStart;
     cache.lastBubbleCount = rest.lastBubbleCount;
@@ -338,10 +467,12 @@ export function buildBubbles(
     [],
     new Map(),
     superseded,
+    liveTurnId,
   );
   cache.blocks = blocks;
   cache.activeResponse = activeResponse;
   cache.interruptedResponseIds = interruptedResponseIds;
+  cache.liveTurnId = liveTurnId;
   cache.bubbles = markContinuedTurns(full.bubbles, activeResponse);
   cache.lastBubbleStart = full.lastBubbleStart;
   cache.lastBubbleCount = full.lastBubbleCount;
@@ -440,16 +571,53 @@ function isAnonymousRid(rid: string): boolean {
   return rid === "" || rid.startsWith(LIVE_ITEM_PREFIX);
 }
 
+function errorDetails(block: ErrorBlock): RelatedRenderError {
+  return {
+    itemId: block.ctx.itemId,
+    message: block.message,
+    source: block.source,
+    code: block.code,
+    ...(block.level ? { level: block.level } : {}),
+    ...(block.title ? { title: block.title } : {}),
+    ...(block.cause ? { cause: block.cause } : {}),
+    ...(block.remediation ? { remediation: block.remediation } : {}),
+  };
+}
+
+/** Errors are related only when the transcript gives them the same causal identity. */
+function errorsShareCausalBoundary(first: ErrorBlock, next: ErrorBlock): boolean {
+  return (
+    !isAnonymousRid(first.ctx.responseId) &&
+    first.ctx.responseId === next.ctx.responseId &&
+    first.ctx.turn === next.ctx.turn &&
+    first.ctx.agent === next.ctx.agent
+  );
+}
+
 /**
  * Blocks stamped a distinct response id ON PURPOSE so they render as
  * their own bubble: deny/failure sentinels aren't part of any turn's
  * work, and REQUEST-phase elicitations get a unique id precisely so
- * `isRequestElicitationBubble` can lift them out. A response-id change
+ * `isStandaloneElicitationBubble` can lift them out. A response-id change
  * into or out of one of these is a real bubble boundary, not a
  * same-turn continuation.
  */
 function isStandaloneSentinelBlock(b: AnyBlock): boolean {
   return b.type === "policy_denied" || b.type === "error" || b.type === "elicitation";
+}
+
+/**
+ * A card that asks the USER — a question to answer, a plan to review —
+ * rather than approval to run something (see `isUserInputElicitation`).
+ *
+ * Such a card ends the assistant bubble it lands in and takes one of
+ * its own, so it renders where the answer belongs: outside the "Worked
+ * for" fold, with the work that follows the answer folding under a new
+ * one. Grouped with the turn it would collapse into the trace as if it
+ * were the agent's own step, hiding what the user said.
+ */
+function isUserInputElicitationBlock(b: AnyBlock): boolean {
+  return b.type === "elicitation" && isUserInputElicitation(b);
 }
 
 /** Whether a later assistant bubble continues the turn started at `from`. */
@@ -486,6 +654,7 @@ function reusablePrefix(
   interruptedResponses: ReadonlySet<string>,
   cache: BubbleCache,
   superseded: ReadonlySet<number>,
+  liveTurnId: string | null,
 ): { prefix: Bubble[]; startBlock: number } | null {
   if (cache.blocks === null || cache.bubbles.length === 0 || cache.lastBubbleStart <= 0) {
     return null;
@@ -539,6 +708,15 @@ function reusablePrefix(
     for (const b of prefix) {
       if (b.kind === "assistant" && b.responseId === activeId) return null;
     }
+  }
+  // Same hazard for the session-driven spinner: the turn that WAS live (its
+  // trailing tool showed a spinner) or the one that IS now must be re-walked,
+  // not reused, so its tool state settles. Guard both — on an A→B transition A
+  // has moved into the prefix carrying its stale spinner, and on a
+  // running→idle flip the still-last bubble must drop it.
+  const liveIds = [liveTurnId, cache.liveTurnId];
+  for (const b of prefix) {
+    if (b.kind === "assistant" && liveIds.includes(b.responseId)) return null;
   }
   for (const b of prefix) {
     if (b.kind === "assistant" && interruptedResponses.has(b.responseId)) {
@@ -620,6 +798,7 @@ function walkBubbles(
   seedBubbles: Bubble[],
   subIndexByResp: Map<string, number>,
   superseded: ReadonlySet<number>,
+  liveTurnId: string | null = null,
 ): { bubbles: Bubble[]; lastBubbleStart: number; lastBubbleCount: number } {
   const bubbles: Bubble[] = [...seedBubbles];
   // One cross-bubble result index per walk: the relay backdates a
@@ -649,6 +828,7 @@ function walkBubbles(
   let lastBubbleStart = bubbles.length > 0 ? 0 : -1;
   let lastBubbleCount = 1;
   let i = startIndex;
+  let expandNextAssistantResponseId: string | null = null;
 
   while (i < blocks.length) {
     const b = blocks[i]!;
@@ -656,11 +836,41 @@ function walkBubbles(
     // Lifecycle markers don't render — they exist for the streaming
     // reducer and the eager URL update, not the renderer.
     if (isNonRenderingBlock(b)) {
+      // A new lifecycle edge means the next assistant group is a distinct
+      // response, even if a harness happens to reuse the same response id.
+      expandNextAssistantResponseId = null;
       i += 1;
       continue;
     }
 
-    if (b.type === "user_message") {
+    // A sub-agent notice joins the assistant work beside it so it folds with
+    // that work. With no work after it yet it stands alone, and the run is one
+    // re-walk region so all of it can join the work that arrives next.
+    if (isSubagentActivityBlock(b) && workBesideNotice(blocks, i, 1) === undefined) {
+      lastBubbleStart = i;
+      lastBubbleCount = 0;
+      for (; i < blocks.length && isNoticeTransparent(blocks[i]!); i += 1) {
+        const notice = blocks[i]!;
+        if (isNonRenderingBlock(notice)) expandNextAssistantResponseId = null;
+        if (!isSubagentActivityBlock(notice)) continue;
+        bubbles.push({
+          kind: "subagent_activity",
+          itemId: notice.ctx.itemId ?? `subagent_activity_${i}`,
+          data: notice.data,
+        });
+        lastBubbleCount += 1;
+      }
+      continue;
+    }
+
+    if (b.type === "user_message" || isTerminalCommandInput(b)) {
+      // A native harness can accept a steering message without ending the
+      // response already in progress. In persisted history that user message
+      // has the same response id as assistant work immediately before it.
+      // The answer and the resumed work then share one assistant bubble; do
+      // not hide the answer merely because more work followed it.
+      expandNextAssistantResponseId =
+        b.type === "user_message" ? midResponseUserMessageId(blocks, i) : null;
       const chipIndexes = deferred.byMessage.get(i);
       const firstChip = chipIndexes?.[0];
       // The pair's region starts at whichever block came first, so an
@@ -674,11 +884,18 @@ function walkBubbles(
       bubbles.push({
         kind: "user",
         itemId: b.ctx.itemId ?? `user_${i}`,
-        content: b.content,
+        content:
+          b.type === "user_message" ? b.content : [{ type: "input_text", text: `!${b.input}` }],
+        ...(b.type === "terminal_command" ? { shellCommand: b.input } : {}),
         ...(b.ctx.createdBy !== undefined ? { createdBy: b.ctx.createdBy } : {}),
+        // Server stamp on cold load, client stamp while live — display
+        // only, so either clock is correct here.
+        ...(b.ctx.createdAtS !== undefined || b.ctx.clientCreatedAtS !== undefined
+          ? { createdAtS: b.ctx.createdAtS ?? b.ctx.clientCreatedAtS }
+          : {}),
         // Carry the optimistic temp id (when promoted) so bubbleKey holds
         // steady across the optimistic→committed swap — no remount/flink.
-        stableKey: b.stableKey,
+        stableKey: b.type === "user_message" ? b.stableKey : undefined,
       });
       if (chipIndexes !== undefined) {
         for (const chipIndex of chipIndexes) {
@@ -691,25 +908,47 @@ function walkBubbles(
     }
 
     if (b.type === "compaction_loading") {
+      // One compaction → one spinner. A long compaction re-announces
+      // in_progress on every status poll, so a spinner for this compaction
+      // may already be on screen; refresh it in place — preferring the
+      // server-reported start as the elapsed anchor — instead of stacking
+      // another spinner that completion would then orphan.
+      let existing = -1;
+      for (let j = bubbles.length - 1; j >= 0; j--) {
+        if (bubbles[j]?.kind === "compaction_loading") {
+          existing = j;
+          break;
+        }
+      }
+      if (existing !== -1) {
+        const prev = bubbles[existing] as Extract<Bubble, { kind: "compaction_loading" }>;
+        bubbles[existing] = { ...prev, createdAtS: b.startedAtS ?? prev.createdAtS };
+        lastBubbleStart = i;
+        lastBubbleCount = 0;
+        i += 1;
+        continue;
+      }
       lastBubbleStart = i;
       lastBubbleCount = 1;
       bubbles.push({
         kind: "compaction_loading",
         itemId: b.ctx.itemId ?? `compaction_loading_${i}`,
+        createdAtS: b.startedAtS ?? b.ctx.clientCreatedAtS,
       });
       i += 1;
       continue;
     }
 
     if (b.type === "compaction") {
-      // Remove the loading spinner for this compaction so the user sees
-      // a single transition from spinner → checkmark.  The spinner may
-      // not be the immediately preceding bubble when assistant blocks
-      // (text, tool calls) were streamed during compaction.
+      // Remove EVERY loading spinner for this compaction so the user sees
+      // a single transition from spinner → checkmark. The spinner may not
+      // be the immediately preceding bubble when assistant blocks (text,
+      // tool calls) were streamed during compaction, and a long compaction
+      // that re-announced progress may have left more than one — an
+      // unremoved spinner would keep counting beside the marker forever.
       for (let j = bubbles.length - 1; j >= 0; j--) {
         if (bubbles[j]?.kind === "compaction_loading") {
           bubbles.splice(j, 1);
-          break;
         }
       }
       lastBubbleStart = i;
@@ -761,12 +1000,18 @@ function walkBubbles(
     // a DISTINCT id on purpose still open their own bubble: deny/failure
     // sentinels (`policy_denied` / `error`) are not part of the turn's
     // work, and REQUEST-phase elicitations are stamped a unique id
-    // precisely so they stand alone (`isRequestElicitationBubble`).
-    let groupResponseId = b.ctx.responseId;
+    // precisely so they stand alone (`isStandaloneElicitationBubble`).
+    // Question/plan cards split the turn on their own (see
+    // `isUserInputElicitationBlock`) — they carry the turn's id, but the
+    // user answering one is a boundary, not a step of the work.
+    let groupResponseId = isSubagentActivityBlock(b) ? "" : b.ctx.responseId; // never a notice's own id
     const groupStart = i;
     // Sentinel-headed groups never absorb a different turn's blocks, in
     // either direction (see the id-change handling below).
     const groupOpenedOnSentinel = isStandaloneSentinelBlock(b);
+    // A question/plan card is the user's own answer point, so it takes a
+    // bubble of its own even under the turn's response id.
+    const groupOpenedOnUserInput = isUserInputElicitationBlock(b);
     while (i < blocks.length) {
       const cur = blocks[i]!;
       // Break on boundaries that start a new top-level bubble. Include
@@ -776,12 +1021,30 @@ function walkBubbles(
       // carries `state.responseId` into `ctx()` for all events).
       if (
         cur.type === "user_message" ||
+        isTerminalCommandInput(cur) ||
         cur.type === "compaction" ||
         cur.type === "compaction_loading" ||
         cur.type === "routing_decision"
       )
         break;
       if (isNonRenderingBlock(cur)) {
+        i += 1;
+        continue;
+      }
+      // Break at a question/plan card the same way a user message
+      // breaks: the work before it and the work after the answer are
+      // separate stretches, each folding under its own "Worked for".
+      if (i > groupStart && (groupOpenedOnUserInput || isUserInputElicitationBlock(cur))) break;
+      if (isSubagentActivityBlock(cur)) {
+        // A notice stays in its turn's bubble until committed work from another
+        // response follows it, then opens that response's bubble: a native fold
+        // that has shown never reopens to show the new response streaming.
+        if (
+          i > groupStart &&
+          (groupOpenedOnSentinel || noticeSeparatesResponses(blocks, groupStart, i))
+        ) {
+          break;
+        }
         i += 1;
         continue;
       }
@@ -831,18 +1094,59 @@ function walkBubbles(
 
     lastBubbleStart = groupStart;
     lastBubbleCount = 1;
-    const workedForS = turnWorkedForS(groupBlocks);
-    const lastActivityAtS = turnLastActivityAtS(groupBlocks);
+    // A notice is stamped when the sub-agent reported, not when this turn worked.
+    const workBlocks = groupBlocks.filter((bk) => !isSubagentActivityBlock(bk));
+    const workedForS = turnWorkedForS(workBlocks);
+    const lastActivityAtS = turnLastActivityAtS(workBlocks);
+    // Freshest stamp in the group — server stamp on cold load, client
+    // stamp while live, either clock display-only. The max tracks latest
+    // activity and never jumps back for a backdated tail block.
+    // A delayed result backdated to an earlier turn is absorbed into this
+    // group but renders into its own turn's card (crossBubbleResults), so
+    // only results whose call lives here count as this bubble's activity.
+    const localResultKeys = new Set<string>();
+    for (const bk of groupBlocks) {
+      if (bk.type === "tool_group") {
+        for (const ex of bk.executions) {
+          localResultKeys.add(`${bk.ctx.responseId}:${ex.callId}`);
+        }
+      }
+    }
+    const groupCreatedAtS = workBlocks
+      .filter(
+        (bk) =>
+          bk.type !== "tool_result" || localResultKeys.has(`${bk.ctx.responseId}:${bk.callId}`),
+      )
+      .map((bk) => bk.ctx.createdAtS ?? bk.ctx.clientCreatedAtS)
+      .reduce<number | undefined>(
+        (freshest, v) =>
+          v !== undefined && (freshest === undefined || v > freshest) ? v : freshest,
+        undefined,
+      );
     bubbles.push({
       kind: "assistant",
       responseId: groupResponseId,
       stableId,
       lifecycle,
       error,
-      items: buildAssistantItems(groupBlocks, lifecycle, crossBubbleResults),
+      // `sessionLive` spins this turn's trailing tools when the session is
+      // running and this is the newest turn — for a harness with no streaming
+      // `activeResponse`. `lifecycle` (and thus fork/fold) is untouched.
+      items: buildAssistantItems(
+        groupBlocks,
+        lifecycle,
+        crossBubbleResults,
+        liveTurnId !== null && groupResponseId === liveTurnId,
+      ),
       ...(workedForS !== undefined ? { workedForS } : {}),
       ...(lastActivityAtS !== undefined ? { lastActivityAtS } : {}),
+      ...(groupCreatedAtS !== undefined ? { createdAtS: groupCreatedAtS } : {}),
+      ...(expandNextAssistantResponseId !== null &&
+      groupBlocks.some((block) => block.ctx.responseId === expandNextAssistantResponseId)
+        ? { defaultExpanded: true }
+        : {}),
     });
+    expandNextAssistantResponseId = null;
   }
 
   return { bubbles, lastBubbleStart, lastBubbleCount };
@@ -1148,10 +1452,78 @@ function turnWorkedForS(groupBlocks: AnyBlock[]): number | undefined {
   return undefined;
 }
 
+function isSubagentActivityBlock(
+  b: AnyBlock,
+): b is NativeToolBlock & { toolType: "subagent_activity" } {
+  return b.type === "native_tool" && b.toolType === "subagent_activity";
+}
+
+/**
+ * What a notice looks past to find the work beside it: other notices, and
+ * blocks that never render on their own.
+ */
+function isNoticeTransparent(b: AnyBlock): boolean {
+  return (
+    isSubagentActivityBlock(b) ||
+    isNonRenderingBlock(b) ||
+    b.type === "tool_result" ||
+    b.type === "file"
+  );
+}
+
+/**
+ * The nearest assistant work beside the notice at `index`, stepping `step` and
+ * never below `floor`; `undefined` when a bubble boundary (or nothing) comes
+ * first. `committedOnly` skips streaming blocks to find a server item.
+ */
+function workBesideNotice(
+  blocks: AnyBlock[],
+  index: number,
+  step: 1 | -1,
+  committedOnly = false,
+  floor = 0,
+): AnyBlock | undefined {
+  for (let k = index + step; k >= floor && k < blocks.length; k += step) {
+    const b = blocks[k]!;
+    if (isNoticeTransparent(b)) continue;
+    if (
+      !isAssistantSideBlock(b) ||
+      isStandaloneSentinelBlock(b) ||
+      isUserInputElicitationBlock(b)
+    ) {
+      return undefined;
+    }
+    if (!committedOnly || isCommittedBlock(b)) return b;
+  }
+  return undefined;
+}
+
+/**
+ * A server item, whose response id is the same live and on reload. Live deltas
+ * carry the active response's id instead, and previews carry none.
+ */
+function isCommittedBlock(b: AnyBlock): boolean {
+  const { itemId, responseId } = b.ctx;
+  return itemId !== null && !itemId.startsWith(LIVE_ITEM_PREFIX) && !isAnonymousRid(responseId);
+}
+
+/**
+ * Whether the committed work on either side of the notice at `index` belongs to
+ * different responses: one stopped, and the next started after the notice.
+ */
+function noticeSeparatesResponses(blocks: AnyBlock[], groupStart: number, index: number): boolean {
+  const before = workBesideNotice(blocks, index, -1, true, groupStart);
+  const after = workBesideNotice(blocks, index, 1, true);
+  return (
+    before !== undefined && after !== undefined && before.ctx.responseId !== after.ctx.responseId
+  );
+}
+
 /** Filter to blocks that participate in assistant rendering. */
 function isAssistantSideBlock(b: AnyBlock): boolean {
   return (
     b.type !== "user_message" &&
+    !isTerminalCommandInput(b) &&
     b.type !== "compaction" &&
     // compaction_loading has its own top-level bubble slot and must not
     // end up in an assistant bubble's item list.
@@ -1163,6 +1535,37 @@ function isAssistantSideBlock(b: AnyBlock): boolean {
     // FileBlock is currently deferred from rendering; skip silently.
     b.type !== "file"
   );
+}
+
+/**
+ * Whether a user message interrupted assistant work in the same response.
+ *
+ * Native harnesses persist a steered message with the active response id. A
+ * normal next-turn message has a new response id, so comparing it with the
+ * preceding assistant work distinguishes the two without inspecting message
+ * wording. Runtime system messages and subagent activity are skipped; response
+ * lifecycle markers remain hard boundaries. Empty ids are provisional
+ * live-stream values, not durable turn identity, and are deliberately ignored.
+ */
+function midResponseUserMessageId(blocks: AnyBlock[], index: number): string | null {
+  const user = blocks[index];
+  if (
+    user?.type !== "user_message" ||
+    isAnonymousRid(user.ctx.responseId) ||
+    isSystemUserContent(user.content)
+  ) {
+    return null;
+  }
+  for (let previousIndex = index - 1; previousIndex >= 0; previousIndex -= 1) {
+    const previous = blocks[previousIndex]!;
+    if (isNonRenderingBlock(previous)) return null;
+    if (isSubagentActivityBlock(previous)) continue;
+    if (previous.type === "user_message" && isSystemUserContent(previous.content)) continue;
+    return isAssistantSideBlock(previous) && previous.ctx.responseId === user.ctx.responseId
+      ? user.ctx.responseId
+      : null;
+  }
+  return null;
 }
 
 /** Return true when persisted text marks the assistant turn interrupted. */
@@ -1185,11 +1588,12 @@ function buildAssistantItems(
   groupBlocks: AnyBlock[],
   lifecycle: ActiveResponse["state"],
   crossBubbleResults: Map<string, ToolResultBlock>,
+  sessionLive = false,
 ): RenderItem[] {
   // Results render only by folding into a call's card — strip them so
   // an absorbed out-of-band result can't split a text/reasoning run.
   const blocks = groupBlocks.filter((b) => b.type !== "tool_result");
-  const liveToolCallIds = trailingLiveToolCallIds(blocks, lifecycle);
+  const liveToolCallIds = trailingLiveToolCallIds(blocks, lifecycle, sessionLive);
 
   // Pre-compute: is there any non-empty TextDone in this bubble?
   // Used to drop trailing-empty assistant messages — the server
@@ -1263,6 +1667,12 @@ function buildAssistantItems(
       continue;
     }
 
+    if (isSubagentActivityBlock(b)) {
+      items.push({ kind: "subagent_activity", itemId: b.ctx.itemId, data: b.data });
+      i += 1;
+      continue;
+    }
+
     if (b.type === "native_tool") {
       items.push({
         kind: "native_tool",
@@ -1313,14 +1723,19 @@ function buildAssistantItems(
     }
 
     if (b.type === "error") {
+      const relatedErrors: RelatedRenderError[] = [];
+      i += 1;
+      while (i < blocks.length) {
+        const next = blocks[i]!;
+        if (next.type !== "error" || !errorsShareCausalBoundary(b, next)) break;
+        relatedErrors.push(errorDetails(next));
+        i += 1;
+      }
       items.push({
         kind: "error",
-        itemId: b.ctx.itemId,
-        message: b.message,
-        source: b.source,
-        code: b.code,
+        ...errorDetails(b),
+        ...(relatedErrors.length > 0 ? { relatedErrors } : {}),
       });
-      i += 1;
       continue;
     }
 
@@ -1340,6 +1755,7 @@ function buildAssistantItems(
     if (b.type === "elicitation") {
       items.push({
         kind: "elicitation",
+        ...(b.nativeDelivery ? { nativeDelivery: b.nativeDelivery } : {}),
         itemId: b.ctx.itemId,
         elicitationId: b.elicitationId,
         targetSessionId: b.targetSessionId,
@@ -1355,7 +1771,11 @@ function buildAssistantItems(
         exitPlanMode: b.exitPlanMode,
         codexCommand: b.codexCommand,
         allowAllEdits: b.allowAllEdits,
+        allowAutoMode: b.allowAutoMode,
+        permissionDirectories: b.permissionDirectories,
         rememberScope: b.rememberScope,
+        codexPersistModes: b.codexPersistModes,
+        agyPermission: b.agyPermission,
       });
       i += 1;
       continue;
@@ -1374,9 +1794,17 @@ function buildAssistantItems(
 function trailingLiveToolCallIds(
   blocks: AnyBlock[],
   lifecycle: ActiveResponse["state"],
+  sessionLive = false,
 ): Set<string> {
   const callIds = new Set<string>();
-  if (lifecycle !== "streaming") return callIds;
+  // Spin the trailing tool phase when EITHER this bubble is the streaming
+  // `activeResponse` (in-process harnesses) OR the session is running and this
+  // is its newest turn (`sessionLive`, for claude-native, whose liveness lives
+  // in `sessionStatus`). A settled turn — reloaded history, a finished or
+  // cancelled turn, a dead harness whose session reads idle — passes neither,
+  // so a result-less tool still resolves to `no-output`, never a perpetual
+  // spinner.
+  if (lifecycle !== "streaming" && !sessionLive) return callIds;
 
   for (let i = blocks.length - 1; i >= 0; i -= 1) {
     const b = blocks[i]!;
@@ -1402,6 +1830,8 @@ function textItem(run: AnyBlock[]): RenderItem {
         itemId: b.ctx.itemId,
         text: b.fullText,
         final: true,
+        ...(b.previewInterrupted ? { previewInterrupted: true } : {}),
+        ...(b.phase !== undefined ? { phase: b.phase } : {}),
       };
     }
   }
@@ -1509,8 +1939,13 @@ export function bubblesEqual(a: Bubble, b: Bubble): boolean {
       a.stableId !== b.stableId ||
       a.lifecycle !== b.lifecycle ||
       a.error !== b.error ||
+      // Render-affecting timestamp — must stay visible to the memo like
+      // the user branch's `createdAtS` comparison below.
+      a.createdAtS !== b.createdAtS ||
       // Flips when a later bubble continues this turn — the fold depends on it.
-      Boolean(a.continued) !== Boolean(b.continued)
+      Boolean(a.continued) !== Boolean(b.continued) ||
+      // Opens an interjected response's process fold on first render.
+      Boolean(a.defaultExpanded) !== Boolean(b.defaultExpanded)
     ) {
       return false;
     }
@@ -1525,8 +1960,12 @@ export function bubblesEqual(a: Bubble, b: Bubble): boolean {
   if (a.kind === "user" && b.kind === "user") {
     if (
       a.itemId !== b.itemId ||
+      Boolean(a.pending) !== Boolean(b.pending) ||
+      Boolean(a.awaitingAgent) !== Boolean(b.awaitingAgent) ||
       a.createdBy !== b.createdBy ||
+      a.createdAtS !== b.createdAtS ||
       a.stableKey !== b.stableKey ||
+      a.shellCommand !== b.shellCommand ||
       a.content.length !== b.content.length
     )
       return false;
@@ -1541,6 +1980,9 @@ export function bubblesEqual(a: Bubble, b: Bubble): boolean {
   if (a.kind === "routing_decision" && b.kind === "routing_decision") {
     // Verdict fields are immutable per item, so the id alone identifies it.
     return a.itemId === b.itemId;
+  }
+  if (a.kind === "subagent_activity" && b.kind === "subagent_activity") {
+    return a.itemId === b.itemId && a.data === b.data;
   }
   return false;
 }

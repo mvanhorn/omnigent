@@ -6,11 +6,20 @@ import logging
 import os
 import re
 import sys
+from collections.abc import Collection
+from dataclasses import replace
 from pathlib import Path
 from typing import Literal, TypedDict, cast
 
 import yaml
-from pydantic import BaseModel, ConfigDict, ValidationError, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.inner.datamodel import (
@@ -23,7 +32,10 @@ from omnigent.inner.datamodel import (
     OSEnvSandboxSpec,
     OSEnvSpec,
     TerminalEnvSpec,
+    parse_write_paths,
 )
+from omnigent.inner.git_ssh_policy import parse_git_ssh_bindings as _parse_git_ssh
+from omnigent.inner.sandbox import containment_prefix
 from omnigent.spec.types import (
     DEFAULT_ASK_TIMEOUT,
     AgentSpec,
@@ -49,8 +61,10 @@ from omnigent.spec.types import (
     SandboxConfig,
     SharePolicy,
     SkillSpec,
+    ToolGroupsConfig,
     ToolsConfig,
 )
+from omnigent.spec.validator import _SKILL_NAME_MAX_LEN, _SKILL_NAME_PATTERN
 
 _log = logging.getLogger(__name__)
 
@@ -89,9 +103,10 @@ class _ConfigYamlLoader(yaml.SafeLoader):
 _BOOL_TAG = "tag:yaml.org,2002:bool"
 _YAML_1_2_BOOL_RE = re.compile(r"^(?:true|True|TRUE|false|False|FALSE)$")
 
-# ``executor.config`` keys kept as their nested YAML structure instead of
-# string-coerced — their consumers read the nested mapping/list shape.
-_STRUCTURED_EXECUTOR_CONFIG_KEYS: frozenset[str] = frozenset()
+# ``executor.config`` keys whose YAML types must survive instead of being string-coerced.
+_STRUCTURED_EXECUTOR_CONFIG_KEYS: frozenset[str] = frozenset(
+    {"context_files", "system_prompt_mode"}
+)
 
 # Copy the resolver dict onto the subclass before mutating — it's inherited
 # from SafeLoader by reference, so in-place edits below would strip
@@ -163,6 +178,27 @@ def _parse_float_field(raw: object, field_name: str) -> float:
         ) from exc
 
 
+class AgentImageConfigMissingError(OmnigentError, FileNotFoundError):
+    """An agent image directory that carries no ``config.yaml``.
+
+    Every other structural problem in :func:`parse` raises a coded
+    :class:`~omnigent.errors.OmnigentError`; a missing ``config.yaml`` used to
+    raise a bare :class:`FileNotFoundError`, which reached the server's
+    catch-all and was booked as an unhandled internal error. It is really a
+    404: the referenced image has no spec to read, which is what an agent cache
+    entry whose directory outlived its contents looks like.
+
+    Subclasses :class:`FileNotFoundError` as well, so callers that already
+    catch that — the documented contract of :func:`parse` — keep working.
+    """
+
+    def __init__(self, root: Path) -> None:
+        """
+        :param root: Agent image directory that has no ``config.yaml``.
+        """
+        super().__init__(f"config.yaml not found in {root}", code=ErrorCode.NOT_FOUND)
+
+
 def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
     """
     Parse an agent image directory into an :class:`AgentSpec`.
@@ -178,13 +214,14 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
     :raises OmnigentError: If ``config.yaml`` is not valid YAML,
         has structural issues, or (when *expand_env* is ``True``)
         contains unresolved env vars.
-    :raises FileNotFoundError: If ``config.yaml`` is missing.
+    :raises AgentImageConfigMissingError: If ``config.yaml`` is missing. Also
+        a :class:`FileNotFoundError`, so existing handlers still catch it.
     """
     config_path = root / "config.yaml"
     if not config_path.exists():
-        raise FileNotFoundError(f"config.yaml not found in {root}")
+        raise AgentImageConfigMissingError(root)
 
-    raw = yaml.load(config_path.read_text(), Loader=_ConfigYamlLoader)
+    raw = yaml.load(config_path.read_text(encoding="utf-8"), Loader=_ConfigYamlLoader)
     if not isinstance(raw, dict):
         raise OmnigentError(
             f"config.yaml must be a YAML mapping, got {type(raw).__name__}",
@@ -218,6 +255,12 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
             executor.model = llm.model
         if executor.connection is None and llm.connection is not None:
             executor.connection = llm.connection
+        if executor.reasoning_effort is None:
+            llm_effort = llm.extra.get("reasoning_effort")
+            if llm_effort is not None:
+                executor.reasoning_effort = str(llm_effort)
+        elif "reasoning_effort" in llm.extra:
+            llm.extra["reasoning_effort"] = executor.reasoning_effort
     # Ensure spec.llm is populated from executor fields when only the
     # executor: block declares model/connection (the common case for
     # user-authored YAML). Internal consumers (policy builder,
@@ -239,6 +282,10 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
     compaction = _parse_compaction(raw.get("compaction"))
     guardrails = _parse_guardrails(raw.get("guardrails"), expand_env=expand_env)
     os_env = _parse_os_env(raw.get("os_env"))
+    from omnigent.sandbox.copy_on_write import validate_copy_on_write_harness
+
+    validate_copy_on_write_harness(os_env, executor.harness_kind)
+    model_egress = _parse_model_egress(raw.get("model_egress"))
     terminals = _parse_terminals(raw.get("terminals"))
     params = raw.get("params", {})
     # Top-level ``async:`` flag gates the LLM-callable async-dispatch
@@ -265,6 +312,9 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
     # the specified sub-agent types. Defaults to False — session
     # reads stay always-on, but every write grant is explicit.
     spawn = bool(raw.get("spawn", False))
+    # Top-level ``tool_groups:`` opts out of framework-owned tool groups
+    # that otherwise register on every agent; each group defaults to on.
+    tool_groups = parse_tool_groups(raw.get("tool_groups"), spawn=spawn)
     # Top-level ``agent_session_sharing:`` flag is the SOLE enabler of
     # the ``sys_session_share`` tool, independent of ``spawn`` /
     # ``tools.agents`` (and unrelated to server-API / CLI sharing).
@@ -279,7 +329,7 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
     if raw_instructions is None:
         raw_instructions = raw.get("prompt")
     instructions = _resolve_instructions(root, raw_instructions)
-    skills = _discover_skills(root / "skills")
+    skills = _with_legacy_skill_names(_discover_skills(root / "skills"))
     skills_filter = _parse_skills_filter(raw.get("skills"))
     mcp_servers = _discover_mcp_servers(root / "tools" / "mcp", expand_env=expand_env)
     mcp_servers = mcp_servers + _parse_inline_mcp_servers(raw_tools, expand_env=expand_env)
@@ -305,9 +355,11 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
         sub_agents=sub_agents,
         async_enabled=async_enabled,
         os_env=os_env,
+        model_egress=model_egress,
         terminals=terminals,
         timers=timers,
         spawn=spawn,
+        tool_groups=tool_groups,
         agent_session_sharing=agent_session_sharing,
     )
 
@@ -457,6 +509,90 @@ def _parse_tools_config(
         retry=retry,
         sandbox=sandbox,
     )
+
+
+_TOOL_GROUP_NAMES: frozenset[str] = frozenset(ToolGroupsConfig.__dataclass_fields__)
+
+
+def parse_tool_groups(raw: object, *, spawn: bool) -> ToolGroupsConfig:
+    """
+    Parse the top-level ``tool_groups:`` block into a
+    :class:`ToolGroupsConfig`.
+
+    Strict on purpose: the block exists to *remove* tools, so a typo'd
+    group name or a non-boolean value fails the load rather than
+    silently leaving every group registered. Shared by the native parser
+    and the omnigent-dialect adapter so both loaders reject the same input.
+
+    :param raw: The raw ``tool_groups:`` value, or ``None`` if absent.
+        Example: ``{"browser": False, "scheduled_tasks": False}``.
+    :param spawn: The spec's top-level ``spawn:`` flag, needed to reject
+        disabling agent discovery while ``sys_session_create`` is granted.
+    :returns: A populated :class:`ToolGroupsConfig`; every group on
+        when *raw* is ``None``.
+    :raises OmnigentError: If *raw* is not a mapping, names an unknown
+        group, maps a group to a non-boolean, or disables
+        ``agent_discovery`` while a tool that needs it stays enabled.
+    """
+    if raw is None:
+        return ToolGroupsConfig()
+    if not isinstance(raw, dict):
+        raise OmnigentError(
+            f"tool_groups must be a YAML mapping, got {type(raw).__name__}",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    unknown = sorted(str(key) for key in raw if str(key) not in _TOOL_GROUP_NAMES)
+    if unknown:
+        raise OmnigentError(
+            f"tool_groups: unknown group(s) {unknown}; "
+            f"expected one of {sorted(_TOOL_GROUP_NAMES)}",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    enabled: dict[str, bool] = {}
+    for name, value in raw.items():
+        if not isinstance(value, bool):
+            raise OmnigentError(
+                f"tool_groups.{name} must be a boolean, got {type(value).__name__}",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        enabled[str(name)] = value
+    groups = ToolGroupsConfig(**enabled)
+    _reject_orphaned_agent_id_tools(groups, spawn=spawn)
+    return groups
+
+
+def _reject_orphaned_agent_id_tools(groups: ToolGroupsConfig, *, spawn: bool) -> None:
+    """
+    Refuse disabling agent discovery while a tool that takes an agent id stays on.
+
+    ``sys_session_create`` (granted by ``spawn: true``) and
+    ``sys_scheduled_task_create`` tell the model to take ``agent_id`` from
+    ``sys_agent_list`` / ``sys_agent_get``, so without them the model is
+    pointed at tools the runner refuses.
+
+    :param groups: The parsed tool groups.
+    :param spawn: The spec's top-level ``spawn:`` flag.
+    :raises OmnigentError: If ``agent_discovery`` is off while ``spawn`` or
+        the ``scheduled_tasks`` group is on.
+    """
+    if groups.agent_discovery:
+        return
+    dependents = [
+        label
+        for label, on in (
+            ("spawn: true", spawn),
+            ("tool_groups.scheduled_tasks", groups.scheduled_tasks),
+        )
+        if on
+    ]
+    if dependents:
+        raise OmnigentError(
+            f"tool_groups.agent_discovery: false conflicts with {' and '.join(dependents)}: "
+            "those tools send the model to sys_agent_list / sys_agent_get for an "
+            "agent_id; keep agent_discovery on, or also set scheduled_tasks: false "
+            "and drop spawn",
+            code=ErrorCode.INVALID_INPUT,
+        )
 
 
 def _parse_sandbox_config(
@@ -662,6 +798,8 @@ def _parse_executor(
     )
     raw_model = raw.get("model")
     model: str | None = str(raw_model) if raw_model is not None else None
+    raw_effort = raw.get("reasoning_effort")
+    reasoning_effort: str | None = str(raw_effort) if raw_effort is not None else None
     # Parse ``executor.connection:`` — same shape as ``llm.connection:``
     # (a flat dict of string key-value pairs with optional ${VAR}
     # expansion). Lifted from the ``executor:`` block so connection
@@ -682,6 +820,7 @@ def _parse_executor(
         profile=profile,
         config=config,
         model=model,
+        reasoning_effort=reasoning_effort,
         connection=connection,
         context_window=context_window,
         auth=auth,
@@ -948,6 +1087,7 @@ def _parse_os_env_sandbox(
     mask_paths = _parse_mask_paths(raw.get("mask_paths"))
     env_passthrough = _parse_env_passthrough(raw.get("env_passthrough"))
     egress_rules = _parse_egress_rules(raw.get("egress_rules"))
+    git_ssh = _parse_git_ssh(raw.get("git_ssh"))
     from omnigent.inner.sandbox import _default_sandbox_for_platform, _resolve_sandbox_type
 
     if "type" not in raw:
@@ -961,6 +1101,16 @@ def _parse_os_env_sandbox(
                 code=ErrorCode.INVALID_INPUT,
             )
         sandbox_type = _resolve_sandbox_type(raw_type)
+    try:
+        parsed_write_paths = parse_write_paths(write_paths_raw)
+    except ValueError as exc:
+        raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
+    if sandbox_type != "linux_bwrap" and any(
+        not isinstance(p, str) and p.copy_on_write for p in parsed_write_paths or []
+    ):
+        raise OmnigentError(
+            "copy_on_write requires sandbox.type=linux_bwrap", code=ErrorCode.INVALID_INPUT
+        )
     if egress_rules and sandbox_type not in ("linux_bwrap", "darwin_seatbelt"):
         raise OmnigentError(
             "os_env.sandbox.egress_rules requires sandbox.type=linux_bwrap "
@@ -971,6 +1121,12 @@ def _parse_os_env_sandbox(
             "Fix: set os_env.sandbox.type to linux_bwrap on Linux or "
             "darwin_seatbelt on macOS; do not use sandbox.type=none with "
             "egress_rules.",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    if git_ssh and sandbox_type not in ("linux_bwrap", "darwin_seatbelt"):
+        raise OmnigentError(
+            "os_env.sandbox.git_ssh requires linux_bwrap or darwin_seatbelt "
+            "for hard network enforcement",
             code=ErrorCode.INVALID_INPUT,
         )
     credential_proxy = _parse_credential_proxy(raw.get("credential_proxy"))
@@ -1002,7 +1158,7 @@ def _parse_os_env_sandbox(
     return OSEnvSandboxSpec(
         type=sandbox_type,
         read_paths=[str(p) for p in read_paths_raw] if read_paths_raw is not None else None,
-        write_paths=[str(p) for p in write_paths_raw] if write_paths_raw is not None else None,
+        write_paths=parsed_write_paths,
         write_files=[str(p) for p in write_files_raw] if write_files_raw is not None else None,
         allow_network=bool(raw.get("allow_network", True)),
         cwd_allow_hidden=cwd_allow_hidden,
@@ -1014,6 +1170,7 @@ def _parse_os_env_sandbox(
         egress_rules=egress_rules,
         egress_allow_private_destinations=allow_private,
         credential_proxy=credential_proxy,
+        git_ssh=git_ssh,
     )
 
 
@@ -1023,11 +1180,9 @@ def _parse_cwd_allow_hidden(raw: object) -> list[str] | None:
     ``os_env.sandbox``.
 
     Each entry must be a single path component (no ``/``, ``\\``,
-    or ``.`` / ``..`` traversal) so a misconfigured spec can't punch
-    a hole through arbitrary subdirectories of cwd. The bwrap backend
-    looks each entry up in ``cwd.iterdir()`` directly; sanitising
-    here keeps the resolver simple and the failure mode loud at
-    parse time rather than at runtime.
+    or ``.`` / ``..`` traversal). The special entry ``"*"`` explicitly
+    disables dotpath masking for trusted roots while preserving escaping-
+    symlink masking.
 
     :param raw: Raw value from the YAML, e.g. ``[".venv", ".git"]``,
         or ``None`` when the field is absent.
@@ -1310,6 +1465,35 @@ def _parse_egress_rules(raw: object) -> list[str] | None:
     return validated
 
 
+def _parse_model_egress(raw: object) -> list[str] | None:
+    """Parse the explicit model-signing grant independently of generic egress."""
+    if raw is None:
+        return None
+    if not isinstance(raw, list) or not raw:
+        raise OmnigentError(
+            "model_egress must be a non-empty list of HTTP egress rules",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    from omnigent.inner.egress.rules import parse_rule
+
+    validated: list[str] = []
+    for index, entry in enumerate(raw):
+        if not isinstance(entry, str):
+            raise OmnigentError(
+                f"model_egress[{index}] must be a string",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        try:
+            parse_rule(entry)
+        except ValueError as exc:
+            raise OmnigentError(
+                f"model_egress[{index}] is invalid: {exc}",
+                code=ErrorCode.INVALID_INPUT,
+            ) from exc
+        validated.append(entry)
+    return validated
+
+
 # YAML ``credential_proxy[*].type`` values are validated by the
 # ``Literal`` on :class:`_CredentialProxyItemModel`. ``https_*`` are
 # low-level primitives that work for any SaaS; ``git_https`` /
@@ -1326,7 +1510,8 @@ class _CredentialSourceModel(BaseModel):  # type: ignore[explicit-any]
     """Pydantic boundary model for a ``credential_proxy[*].source`` mapping.
 
     The secret origin is a structured single-key mapping —
-    ``{env: VAR}``, ``{file: path}``, or ``{command: cmd}`` — rather than
+    ``{env: VAR}``, ``{file: path}``, ``{command: cmd}``, or
+    ``{unix_socket: path}`` — rather than
     a prefix-encoded string. Exactly one key must be set. Pydantic
     validates the shape here; :meth:`to_spec` converts it to the internal
     :class:`CredentialSourceSpec` dataclass the runtime consumes.
@@ -1337,6 +1522,9 @@ class _CredentialSourceModel(BaseModel):  # type: ignore[explicit-any]
         secret, e.g. ``"~/.config/tokens/github_pat.txt"``.
     :param command: Shell command whose stdout is the secret, e.g.
         ``"gh auth token"``.
+    :param unix_socket: Private HTTP broker socket serving a token at ``/token``.
+    :param refresh_interval_seconds: Optional positive cache lifetime for
+        file or Unix socket sources, in seconds.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -1344,6 +1532,10 @@ class _CredentialSourceModel(BaseModel):  # type: ignore[explicit-any]
     env: str | None = None
     file: str | None = None
     command: str | None = None
+    unix_socket: str | None = None
+    refresh_interval_seconds: float | None = Field(
+        default=None, gt=0, allow_inf_nan=False, strict=True
+    )
 
     @model_validator(mode="after")
     def _exactly_one_source(self) -> _CredentialSourceModel:
@@ -1357,17 +1549,33 @@ class _CredentialSourceModel(BaseModel):  # type: ignore[explicit-any]
         """
         set_keys = [
             name
-            for name, value in (("env", self.env), ("file", self.file), ("command", self.command))
+            for name, value in (
+                ("env", self.env),
+                ("file", self.file),
+                ("command", self.command),
+                ("unix_socket", self.unix_socket),
+            )
             if value is not None
         ]
         if len(set_keys) != 1:
-            raise ValueError("source must set exactly one of 'env', 'file', or 'command'")
+            raise ValueError(
+                "source must set exactly one of 'env', 'file', 'command', or 'unix_socket'"
+            )
         if self.env is not None and not _ENV_VAR_NAME_RE.match(self.env):
             raise ValueError("source 'env' must be a POSIX environment variable name")
         if self.file is not None and not self.file.strip():
             raise ValueError("source 'file' must be a non-empty path")
         if self.command is not None and not self.command.strip():
             raise ValueError("source 'command' must be a non-empty command")
+        if self.unix_socket is not None and not self.unix_socket.strip():
+            raise ValueError("source 'unix_socket' must be a non-empty path")
+        if self.refresh_interval_seconds is not None and (
+            self.env is not None or self.command is not None
+        ):
+            raise ValueError(
+                "refresh_interval_seconds requires a file or unix_socket source; "
+                "shell commands cannot refresh"
+            )
         return self
 
     def to_spec(self) -> CredentialSourceSpec:
@@ -1375,15 +1583,29 @@ class _CredentialSourceModel(BaseModel):  # type: ignore[explicit-any]
         Convert this validated model into a :class:`CredentialSourceSpec`.
 
         :returns: The internal dataclass the runtime resolves the secret
-            from. Exactly one of ``env`` / ``file`` / ``command`` is set
+            from. Exactly one of ``env`` / ``file`` / ``command`` / ``unix_socket`` is set
             (guaranteed by :meth:`_exactly_one_source`).
         """
         if self.env is not None:
             return CredentialSourceSpec(kind="env", env=self.env)
+        if self.unix_socket is not None:
+            return CredentialSourceSpec(
+                kind="unix_socket",
+                path=self.unix_socket.strip(),
+                refresh_interval_seconds=self.refresh_interval_seconds,
+            )
         if self.file is not None:
-            return CredentialSourceSpec(kind="file", path=self.file.strip())
+            return CredentialSourceSpec(
+                kind="file",
+                path=self.file.strip(),
+                refresh_interval_seconds=self.refresh_interval_seconds,
+            )
         assert self.command is not None
-        return CredentialSourceSpec(kind="command", command=self.command.strip())
+        return CredentialSourceSpec(
+            kind="command",
+            command=self.command.strip(),
+            refresh_interval_seconds=self.refresh_interval_seconds,
+        )
 
 
 class _CredentialProxyItemModel(BaseModel):  # type: ignore[explicit-any]
@@ -2030,14 +2252,14 @@ def _read_contained_file(root: Path, value: str) -> str | None:
     """
     Read a bundle-relative file named by *value*, only if it stays in *root*.
 
-    The instruction-file reference comes from a spec field (``instructions:``)
-    that, for an uploaded bundle, is attacker-controlled. Resolving symlinks
-    and ``..`` and confirming the target is contained in *root* prevents a
-    crafted spec (e.g. ``instructions: ../../etc/passwd``) from reading files
+    The instruction-file reference comes from a spec field (``instructions:``
+    or ``prompt:``) or automatic context-file discovery in a bundle that may
+    be attacker-controlled. Resolving symlinks and ``..`` and confirming the
+    target is contained in *root* prevents a crafted spec
+    (e.g. ``instructions: ../../etc/passwd``) from reading files
     outside the bundle on the runner. A non-contained or non-existent path
-    returns ``None`` so the caller falls back to treating *value* as literal
-    instruction text — preserving the existing "missing file → inline text"
-    behavior for the CLI.
+    returns ``None`` so an explicit reference falls back to literal instruction
+    text, while automatic discovery skips it and tries the next context file.
 
     :param root: The bundle root directory the value is anchored to,
         e.g. ``Path("/tmp/agent-bundle")``.
@@ -2045,14 +2267,19 @@ def _read_contained_file(root: Path, value: str) -> str | None:
         ``"prompts/system.md"``.
     :returns: The file contents if *value* names a file contained within
         *root*, else ``None``.
+    :raises UnicodeDecodeError: If a contained instruction file cannot be decoded.
     """
-    candidate = root / value
     try:
-        resolved = candidate.resolve()
-        if resolved.is_relative_to(root.resolve()) and resolved.is_file():
-            return resolved.read_text()
+        root_prefix = containment_prefix(os.path.realpath(root))
+        resolved = os.path.realpath(root / value)
+    except (OSError, ValueError):
+        return None
+    try:
+        if resolved.startswith(root_prefix):
+            candidate = Path(resolved)
+            if candidate.is_file():
+                return candidate.read_text(encoding="utf-8")
     except OSError:
-        # Path too long or invalid characters — treat as inline text.
         pass
     return None
 
@@ -2062,12 +2289,11 @@ def _resolve_instructions(root: Path, raw_value: object) -> str | None:
     Resolve the instructions for an agent image.
 
     - If ``instructions`` is set in config.yaml and the value is
-      a path to an existing file relative to *root*, read that
-      file.
+      a path to an existing file contained in *root*, read that file.
     - If ``instructions`` is set but is not a file path, treat
       the value as inline text.
     - If ``instructions`` is not set, scan ``_CONTEXT_FILE_PRIORITY``
-      and return the first file found (first-wins, no merge).
+      and return the first file contained in *root* (first-wins, no merge).
 
     :param root: Path to the agent image directory.
     :param raw_value: The raw ``instructions`` value from
@@ -2088,12 +2314,9 @@ def _resolve_instructions(root: Path, raw_value: object) -> str | None:
         return text
     # Default: first-wins scan across known context files.
     for filename in _CONTEXT_FILE_PRIORITY:
-        candidate = root / filename
-        try:
-            if candidate.is_file():
-                return candidate.read_text()
-        except OSError:
-            pass
+        contained = _read_contained_file(root, filename)
+        if contained is not None:
+            return contained
     return None
 
 
@@ -2138,7 +2361,7 @@ def _parse_skills_filter(raw: object) -> str | list[str]:
     Parse the top-level YAML ``skills:`` field into a host-skill
     filter string or list of names.
 
-    Distinct from the bundle-side ``skills/<name>/SKILL.md`` files
+    Distinct from the bundle-side ``skills/<dir>/SKILL.md`` files
     discovered by :func:`_discover_skills` — that's the agent's own
     bundled skills, always loaded. This filter only controls
     HOST-scope skills that the harness picks up from the user's
@@ -2230,7 +2453,7 @@ def discover_host_skills(
         for spec in _discover_skills(d, skipped=skipped):
             if spec.name in seen_names:
                 continue
-            if filter_names is not None and spec.name not in filter_names:
+            if filter_names is not None and not skill_matches_names(spec, filter_names):
                 continue
             seen_names.add(spec.name)
             skills.append(spec)
@@ -2271,16 +2494,24 @@ def discover_host_skills(
     return skills
 
 
+# How many grouping levels ``_discover_skills`` descends below ``skills/``:
+# ``skills/<namespace>/<skill>/SKILL.md`` is found, deeper nesting is not.
+_SKILL_NAMESPACE_MAX_DEPTH = 1
+
+
 def _discover_skills(
     skills_dir: Path,
     *,
     skipped: list[str] | None = None,
+    _depth: int = 0,
 ) -> list[SkillSpec]:
     """
     Discover and parse all skills under the ``skills/`` directory.
 
     Each subdirectory containing a ``SKILL.md`` file is parsed via
-    :func:`_parse_skill`.
+    :func:`_parse_skill`. A subdirectory without one is a namespace
+    folder and is scanned one level deeper, so
+    ``skills/<namespace>/<skill>/SKILL.md`` is discovered too.
 
     :param skills_dir: Path to the ``skills/`` directory, e.g.
         ``root / "skills"``.
@@ -2291,7 +2522,10 @@ def _discover_skills(
         Pass ``None`` (the default) to fail loud on the first
         error — used for bundled skills that the agent author
         controls.
-    :returns: A sorted list of parsed :class:`SkillSpec` objects.
+    Namespace folders only group skills; they do not alter the skill name
+    declared in ``SKILL.md``.
+
+    :returns: Parsed :class:`SkillSpec` objects in deterministic path order.
         Returns an empty list if *skills_dir* does not exist.
     """
     if not skills_dir.is_dir():
@@ -2309,10 +2543,13 @@ def _discover_skills(
         return []
     skills: list[SkillSpec] = []
     for skill_dir in entries:
-        if not skill_dir.is_dir():
+        if not skill_dir.is_dir() or skill_dir.name.startswith("."):
             continue
         skill_md = skill_dir / "SKILL.md"
         if not skill_md.exists():
+            # Namespace folder: group skills one level deeper.
+            if _depth < _SKILL_NAMESPACE_MAX_DEPTH:
+                skills.extend(_discover_skills(skill_dir, skipped=skipped, _depth=_depth + 1))
             continue
         try:
             skill = _parse_skill(skill_md)
@@ -2356,12 +2593,121 @@ def _falsey_flag(raw: object) -> bool:
     return isinstance(raw, str) and raw.strip().lower() in _FALSEY_STRINGS
 
 
+# The only line recovery rewrites: a top-level ``description:`` whose value
+# starts on the same line. Every other key keeps strict YAML semantics, so a
+# setting like ``user-invocable: false: internal only`` still fails loudly
+# instead of being read as a truthy string.
+_FRONTMATTER_DESCRIPTION_RE = re.compile(r"\Adescription:[ \t]+(?P<value>\S.*)\Z")
+
+# An indented ``key: value`` line is a mis-indented setting, not prose. Folding
+# it into the description would drop the setting it declares.
+_KEY_SHAPED_LINE_RE = re.compile(r"\A[ \t]+[A-Za-z0-9_.-]+:([ \t].*)?\Z")
+
+# Value openers that mean YAML structure (flow collection, block scalar, anchor,
+# alias, tag) or an already-quoted scalar. Quoting these would change what the
+# frontmatter says, so they are left for the strict parse to accept or reject.
+_YAML_VALUE_INDICATORS = ("'", '"', "[", "{", "|", ">", "&", "*", "!", "?", "%", "@", "`")
+
+
+def _quote_description_with_colon(frontmatter_str: str) -> str:
+    """
+    Quote a plain ``description:`` scalar whose value carries a ``": "``.
+
+    Skill authors write prose in ``description:`` and prose contains colons,
+    which YAML reads as a nested mapping and rejects. Claude Code accepts those
+    files, so rejecting them drops a skill the user has installed. Rewriting
+    only that one line and re-parsing keeps every other malformed frontmatter
+    loud: no other key is touched, a value opening a flow collection, block
+    scalar, or quote is left alone, and so is one carrying a `` #`` comment,
+    since quoting any of those would change what the frontmatter says rather
+    than recover it.
+
+    :param frontmatter_str: Raw frontmatter block, e.g.
+        ``"name: x\ndescription: does y: and z\n"``.
+    :returns: The block with a colon-bearing description double-quoted.
+    """
+    lines = frontmatter_str.split("\n")
+    out: list[str] = []
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        index += 1
+        match = _FRONTMATTER_DESCRIPTION_RE.match(line)
+        value = match.group("value").rstrip() if match else ""
+        if (
+            match is None
+            or value.startswith(_YAML_VALUE_INDICATORS)
+            or " #" in value
+            or (": " not in value and not value.endswith(":"))
+        ):
+            out.append(line)
+            continue
+        # A plain scalar folds its indented continuation lines into one value
+        # with single spaces, so absorb a wrapped description. A key-shaped
+        # line ends the run: it is left in place for the re-parse to reject.
+        while (
+            index < len(lines)
+            and lines[index][:1] in (" ", "\t")
+            and lines[index].strip()
+            and not _KEY_SHAPED_LINE_RE.match(lines[index])
+        ):
+            value = f"{value} {lines[index].strip()}"
+            index += 1
+        escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+        out.append(f'description: "{escaped}"')
+    return "\n".join(out)
+
+
+def skill_matches_names(spec: SkillSpec, names: Collection[str]) -> bool:
+    """
+    Whether a configured ``skills:`` name list selects *spec*.
+
+    Lists written before skills were invoked by directory may name a skill
+    by its frontmatter ``name``, so that label is accepted as an alias.
+
+    :param spec: Parsed skill, e.g. directory ``review`` labelled ``code-review``.
+    :param names: Configured names, e.g. ``["code-review"]``.
+    :returns: ``True`` when the list names the skill's command or its label.
+    """
+    return spec.name in names or (spec.display_name is not None and spec.display_name in names)
+
+
+def _is_valid_bundled_skill_name(name: str) -> bool:
+    """Whether *name* passes the bundled-skill name validation."""
+    return bool(_SKILL_NAME_PATTERN.match(name)) and len(name) <= _SKILL_NAME_MAX_LEN
+
+
+def _with_legacy_skill_names(skills: list[SkillSpec]) -> list[SkillSpec]:
+    """
+    Keep the frontmatter name of bundled skills whose directory is not a valid name.
+
+    Bundles were validated on the frontmatter ``name`` before skills were
+    invoked by directory, so ``skills/Code_Review/`` named ``code-review``
+    still loads, as ``code-review``.
+
+    :param skills: Bundled skills as parsed from ``<bundle>/skills/``.
+    :returns: The same skills, with the frontmatter name as the command
+        where only it is valid.
+    """
+    return [
+        replace(skill, name=skill.display_name, display_name=None)
+        if skill.display_name is not None
+        and not _is_valid_bundled_skill_name(skill.name)
+        and _is_valid_bundled_skill_name(skill.display_name)
+        else skill
+        for skill in skills
+    ]
+
+
 def _parse_skill(skill_md: Path) -> SkillSpec:
     """
     Parse a single ``SKILL.md`` file into a :class:`SkillSpec`.
 
     The file must begin with YAML frontmatter delimited by ``---``
     lines, containing at least ``name`` and ``description`` keys.
+    The skill's directory name becomes :attr:`SkillSpec.name` (the
+    invocation identifier); a frontmatter ``name`` that differs from it
+    becomes :attr:`SkillSpec.display_name`.
 
     :param skill_md: Path to the ``SKILL.md`` file, e.g.
         ``skills/code-review/SKILL.md``.
@@ -2373,14 +2719,15 @@ def _parse_skill(skill_md: Path) -> SkillSpec:
         ``strict=False``) can catch them uniformly.
     """
     try:
-        text = skill_md.read_text()
+        text = skill_md.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as exc:
         # UnicodeDecodeError (a non-UTF-8 SKILL.md) is a ValueError, not an
         # OSError — funnel it through OmnigentError too so the lenient
         # scanner in _discover_skills and the per-skill guards in the menu
         # providers catch it and skip the file instead of 500-ing the menu.
         raise OmnigentError(
-            f"SKILL.md could not be read: {skill_md}: {exc}",
+            f"SKILL.md could not be read: {skill_md} "
+            f"({type(exc).__name__}, errno={getattr(exc, 'errno', None)})",
             code=ErrorCode.INVALID_INPUT,
         ) from exc
     match = _FRONTMATTER_RE.match(text)
@@ -2393,10 +2740,14 @@ def _parse_skill(skill_md: Path) -> SkillSpec:
     try:
         frontmatter = yaml.safe_load(frontmatter_str)
     except yaml.YAMLError as exc:
-        raise OmnigentError(
-            f"SKILL.md has invalid YAML frontmatter: {skill_md}: {exc}",
-            code=ErrorCode.INVALID_INPUT,
-        ) from exc
+        # Retry prose containing colons; diagnostics must not include file contents.
+        try:
+            frontmatter = yaml.safe_load(_quote_description_with_colon(frontmatter_str))
+        except yaml.YAMLError:
+            raise OmnigentError(
+                f"SKILL.md has invalid YAML frontmatter: {skill_md} ({type(exc).__name__})",
+                code=ErrorCode.INVALID_INPUT,
+            ) from exc
     if not isinstance(frontmatter, dict):
         raise OmnigentError(
             f"SKILL.md frontmatter must be a YAML mapping: {skill_md}",
@@ -2417,12 +2768,14 @@ def _parse_skill(skill_md: Path) -> SkillSpec:
     # ``user-invocable: false`` marks an internal orchestration skill that
     # the user should not invoke directly; absent/true ⇒ invocable.
     user_invocable = not _falsey_flag(frontmatter.get("user-invocable", True))
+    label = str(name)
     return SkillSpec(
-        name=str(name),
+        name=skill_md.parent.name,
         description=str(description),
         content=content.strip(),
         skill_dir=skill_md.parent,
         user_invocable=user_invocable,
+        display_name=label if label != skill_md.parent.name else None,
     )
 
 
@@ -2529,8 +2882,8 @@ def _parse_inline_mcp_servers(
         in config.yaml. ``None`` or a non-dict value returns an empty
         list without raising.
     :param expand_env: Whether to expand ``${VAR}`` references in
-        ``headers`` and ``env`` values. ``True`` (default) for
-        deploy/runtime; ``False`` for scaffolding/validation.
+        ``url``, ``headers`` and ``env`` values. ``True`` (default)
+        for deploy/runtime; ``False`` for scaffolding/validation.
     :returns: A list of :class:`MCPServerConfig` objects, one per
         inline MCP entry, in YAML key order.
     """
@@ -2545,6 +2898,9 @@ def _parse_inline_mcp_servers(
         if str(val.get("type", "")) != "mcp":
             continue
         name = str(key)
+        if val.get("transport") == "registry":
+            servers.append(_parse_registry_mcp_server(name, val, "inline MCP server"))
+            continue
         command = val.get("command")
         url = val.get("url")
         if command is not None:
@@ -2564,6 +2920,8 @@ def _parse_inline_mcp_servers(
                 code=ErrorCode.INVALID_INPUT,
             )
         headers = expand_env_vars(raw_headers) if expand_env and raw_headers else raw_headers
+        if url is not None:
+            url = expand_env_vars({"url": str(url)})["url"] if expand_env else str(url)
         raw_env = val.get("env", {})
         if raw_env and not isinstance(raw_env, dict):
             raise OmnigentError(
@@ -2584,17 +2942,6 @@ def _parse_inline_mcp_servers(
                     code=ErrorCode.INVALID_INPUT,
                 )
             databricks_profile = str(raw_profile)
-        # Optional per-server tool allow-list (the YAML ``tools:`` whitelist) —
-        # only these tool names are exposed to the model; ``None`` exposes all.
-        # Mirrors ``MCPTool.tools`` and is filtered downstream in
-        # server/mcp_pool.py + runner/mcp_manager.py.
-        raw_allow = val.get("tools")
-        if raw_allow is not None and not isinstance(raw_allow, list):
-            raise OmnigentError(
-                f"Inline MCP server {name!r} 'tools' must be a list of tool names",
-                code=ErrorCode.INVALID_INPUT,
-            )
-        tool_allowlist = [str(t) for t in raw_allow] if raw_allow else None
         servers.append(
             MCPServerConfig(
                 name=name,
@@ -2603,16 +2950,49 @@ def _parse_inline_mcp_servers(
                 description=str(raw_desc)
                 if (raw_desc := val.get("description")) is not None
                 else None,
-                url=str(url) if url is not None else None,
+                url=url if url is not None else None,
                 command=str(command) if command is not None else None,
                 args=args,
                 headers=headers,
                 env=env,
                 databricks_profile=databricks_profile,
-                tools=tool_allowlist,
+                tools=_parse_mcp_tool_allowlist(name, val, "inline MCP server"),
             )
         )
     return servers
+
+
+def _parse_mcp_tool_allowlist(
+    name: object,
+    raw: dict[str, object],
+    source: object,
+) -> list[str] | None:
+    """
+    Parse the optional per-server ``tools:`` allow-list.
+
+    Only these tool names are exposed to the model; ``None`` exposes
+    all. Mirrors ``MCPTool.tools`` and is filtered downstream in
+    ``server/mcp_pool.py`` + ``runner/mcp_manager.py``. Shared by the
+    inline (``config.yaml``) and sidecar (``tools/mcp/*.yaml``) MCP
+    parsers so both forms honour the same allow-list — a restriction
+    silently accepted in one form and dropped in the other would fail
+    open, granting more tools than the spec asked for.
+
+    :param name: The MCP server's ``name`` field, used in the error
+        message.
+    :param raw: Parsed YAML mapping for the MCP server.
+    :param source: Path (sidecar) or label (inline) identifying the
+        YAML source, used in the error message.
+    :returns: List of allowed tool names, or ``None`` to expose all.
+    :raises OmnigentError: If ``tools`` is present and not a list.
+    """
+    raw_allow = raw.get("tools")
+    if raw_allow is not None and not isinstance(raw_allow, list):
+        raise OmnigentError(
+            f"MCP server {name!r} 'tools' must be a list of tool names: {source}",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    return [str(t) for t in raw_allow] if raw_allow else None
 
 
 def _discover_mcp_servers(
@@ -2641,7 +3021,7 @@ def _discover_mcp_servers(
         return []
     servers: list[MCPServerConfig] = []
     for yaml_file in sorted(mcp_dir.glob("*.yaml")):
-        raw = yaml.safe_load(yaml_file.read_text())
+        raw = yaml.safe_load(yaml_file.read_text(encoding="utf-8"))
         if not isinstance(raw, dict):
             raise OmnigentError(
                 f"MCP config must be a YAML mapping: {yaml_file}",
@@ -2660,6 +3040,12 @@ def _discover_mcp_servers(
                 code=ErrorCode.INVALID_INPUT,
             )
         transport_str = str(transport)
+        if transport_str == "registry":
+            raise OmnigentError(
+                "Managed MCP references must be inline in config.yaml tools, "
+                "where older servers can ignore them; registry sidecars are unsupported",
+                code=ErrorCode.INVALID_INPUT,
+            )
         if transport_str == "http":
             servers.append(_parse_http_mcp_server(name, raw, yaml_file, expand_env=expand_env))
         elif transport_str == "stdio":
@@ -2671,6 +3057,33 @@ def _discover_mcp_servers(
                 code=ErrorCode.INVALID_INPUT,
             )
     return servers
+
+
+def _parse_registry_mcp_server(name: str, raw: dict, source: str) -> MCPServerConfig:
+    """Keep only a catalog reference in agent bundles and runner configuration."""
+    if any(
+        key in raw
+        for key in (
+            "url",
+            "headers",
+            "command",
+            "args",
+            "env",
+            "auth",
+            "profile",
+            "databricks_server",
+        )
+    ):
+        raise OmnigentError(
+            f"Registry MCP {name!r} cannot override its server configuration: {source}",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    return MCPServerConfig(
+        name=name,
+        transport="registry",
+        description=raw.get("description"),
+        tools=[] if raw.get("tools") == [] else _parse_mcp_tool_allowlist(name, raw, source),
+    )
 
 
 def _parse_http_mcp_server(
@@ -2695,7 +3108,7 @@ def _parse_http_mcp_server(
         ``{"name": "github", "transport": "http", "url": "..."}``.
     :param yaml_file: Path to the source file — used in error messages.
     :param expand_env: Whether to expand ``${VAR}`` references in
-        ``headers``.
+        ``url`` and ``headers``.
     :returns: A fully populated :class:`MCPServerConfig` with
         ``transport == "http"``.
     :raises OmnigentError: If ``url`` is missing or a stdio-only
@@ -2714,6 +3127,9 @@ def _parse_http_mcp_server(
             f"MCP server {name!r} missing required field 'url': {yaml_file}",
             code=ErrorCode.INVALID_INPUT,
         )
+    url_str = str(url)
+    if expand_env:
+        url_str = expand_env_vars({"url": url_str})["url"]
     raw_headers = raw.get("headers", {})
     if not isinstance(raw_headers, dict):
         raise OmnigentError(
@@ -2725,9 +3141,10 @@ def _parse_http_mcp_server(
     return MCPServerConfig(
         name=str(name),
         transport="http",
-        url=str(url),
+        url=url_str,
         headers=expand_env_vars(headers) if expand_env else headers,
         description=str(raw_description) if raw_description is not None else None,
+        tools=_parse_mcp_tool_allowlist(name, raw, yaml_file),
         timeout=(
             _parse_int_field(raw["timeout"], f"MCP server {name!r}.timeout")
             if "timeout" in raw
@@ -2826,6 +3243,7 @@ def _parse_stdio_mcp_server(
         args=[str(a) for a in raw_args],
         env=env,
         description=str(raw_description) if raw_description is not None else None,
+        tools=_parse_mcp_tool_allowlist(name, raw, yaml_file),
         timeout=(
             _parse_int_field(raw["timeout"], f"MCP server {name!r}.timeout")
             if "timeout" in raw
@@ -2931,7 +3349,12 @@ def _discover_sub_agents(
         config_yaml = agent_dir / "config.yaml"
         if not config_yaml.exists():
             continue
-        sub_agents.append(parse(agent_dir, expand_env=expand_env))
+        sub_spec = parse(agent_dir, expand_env=expand_env)
+        # Provenance for bundle-dir resolution: the directory name, never
+        # the YAML ``name``. A child's skills and local tools live under
+        # ``<parent bundle>/agents/<dir>``, and the two can differ.
+        sub_spec.source_rel_dir = agent_dir.name
+        sub_agents.append(sub_spec)
     return sub_agents
 
 
@@ -3260,6 +3683,30 @@ def _parse_policy_base_fields(
     if is_function:
         # ``on:`` is ignored for function policies — the callable self-selects
         # which events to handle by returning ALLOW for events it doesn't act on.
+        # Silently discarding an authored output-phase binding misleads the
+        # bundle author into believing an output gate is bound when nothing
+        # ever restricts the callable to (or guarantees it sees) that phase —
+        # say so. Scoped to the output phases (``response`` /
+        # ``llm_response``): an unenforced output gate is a policy hole,
+        # while the common ``on: [tool_call]`` annotation is harmless
+        # documentation on a callable that self-filters anyway.
+        raw_on = data.get("on")
+        if isinstance(raw_on, str):
+            entries: list[object] = [raw_on]
+        elif isinstance(raw_on, list):
+            entries = raw_on
+        else:
+            entries = []
+        if any(entry in ("response", "llm_response") for entry in entries):
+            _log.warning(
+                "policy %r: `on: %r` is ignored for type: function policies — "
+                "the callable self-selects which event types it handles at "
+                "runtime. If this policy is meant to gate the assistant's "
+                "output, filter inside the callable instead (e.g. "
+                "make_fixed_action_callable's on_phases=['response']).",
+                name,
+                raw_on,
+            )
         on_value = None
     else:
         on_value = _parse_on(data.get("on", ["request", "response"]), policy_name=name)
@@ -3282,6 +3729,14 @@ def _parse_function_policy(
     """
     Parse a ``type: function`` policy block.
 
+    The callable path comes from ``function:`` or its ``handler:``
+    alias. Factory arguments may be given inline as
+    ``function: {path, arguments}`` or via a sibling
+    ``factory_params:`` mapping (the ``handler`` + ``factory_params``
+    shape shared with the runtime Policy entity and the
+    ``/v1/policies`` API). The two argument sources are mutually
+    exclusive.
+
     :param name: Enclosing policy name (error messages +
         recorded on the spec).
     :param data: Raw YAML mapping for this policy.
@@ -3289,8 +3744,10 @@ def _parse_function_policy(
         policy types (``name``, ``on``, ``condition``,
         ``ask_timeout``).
     :returns: A populated :class:`FunctionPolicySpec`.
-    :raises OmnigentError: On missing ``function:`` field
-        or malformed ``action`` / ``set_labels`` values.
+    :raises OmnigentError: On missing ``function:`` field,
+        malformed ``set_labels`` / ``config`` values, a
+        non-mapping ``factory_params``, or arguments supplied via
+        both ``function.arguments`` and ``factory_params``.
     """
     # Accept both ``function:`` and ``handler:`` for the callable path.
     # ``handler`` is the proto/service-policies convention; ``function``
@@ -3312,9 +3769,30 @@ def _parse_function_policy(
             f"policy {name!r}: 'config' must be a dict, got {type(config).__name__}",
             code=ErrorCode.INVALID_INPUT,
         )
+    function = _parse_function_ref(function_raw, policy_name=name)
+    # ``factory_params:`` is a sibling-key alias for ``function.arguments`` —
+    # the ``handler:`` + ``factory_params:`` shape used by the runtime Policy
+    # entity, the ``/v1/policies`` API, and the docs. Fold it into the
+    # FunctionRef so the same block works in a spec bundle and the server
+    # ``--config``, not just the single-file omnigent loader.
+    factory_params = data.get("factory_params")
+    if factory_params is not None:
+        if not isinstance(factory_params, dict):
+            raise OmnigentError(
+                f"policy {name!r}: `factory_params` must be a mapping (or omitted), "
+                f"got {type(factory_params).__name__}",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        if function.arguments is not None:
+            raise OmnigentError(
+                f"policy {name!r}: set factory arguments via `function.arguments` or a "
+                f"sibling `factory_params:`, not both.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        function = FunctionRef(path=function.path, arguments=factory_params)
     return FunctionPolicySpec(
         **base_kwargs,
-        function=_parse_function_ref(function_raw, policy_name=name),
+        function=function,
         set_labels=set_labels,
         config=config,
     )

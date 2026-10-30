@@ -1,9 +1,14 @@
-import { Loader2Icon, MessagesSquareIcon, TerminalIcon } from "lucide-react";
+import { CheckIcon, Loader2Icon, MessagesSquareIcon, TerminalIcon } from "lucide-react";
+import { ARIA_MOD_KEY, VIEW_MODE_TOGGLE_KEYS } from "@/components/KeyboardShortcut";
 import { Button } from "@/components/ui/button";
+import { DropdownMenuItem, DropdownMenuSeparator } from "@/components/ui/dropdown-menu";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
-import { isIOSShell } from "@/lib/nativeBridge";
+import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { useViewModeToggleHotkey } from "@/hooks/useViewModeToggleHotkey";
 import { cn } from "@/lib/utils";
 import { useTerminalFirst } from "./TerminalFirstContext";
+
+const ignoreViewChange = () => {};
 
 /**
  * Header Chat/Terminal switcher for terminal-first sessions. Two icon
@@ -14,15 +19,29 @@ import { useTerminalFirst } from "./TerminalFirstContext";
  *
  * Self-gates to null when there's nothing to toggle:
  *   - non-terminal-first sessions,
- *   - the iOS shell (the switcher is the native Liquid Glass bar there),
  *   - a rail-opened shell owning the main view (isShellView) — its own
  *     close affordance is the way back to chat.
+ *
+ * On a desktop-width viewport it renders in the header on every shell — the
+ * native iOS bottom pill is retired (AppShell pushes it hidden at boot), so the
+ * header is the one placement. On a mobile-width viewport the segmented track
+ * is dropped and the switch folds into the header kebab instead (see
+ * {@link ViewModeMenuItems}), so the narrow header pill isn't split between a
+ * view switch and the "…" menu.
  */
-export function ViewModeToggle() {
+export function ViewModeToggle({ hotkeyEnabled = true, alwaysVisible = false } = {}) {
   const ctx = useTerminalFirst();
-  if (!ctx || !ctx.isTerminalFirst || ctx.isShellView || isIOSShell()) return null;
+  const isMobile = useIsMobileViewport();
+  useViewModeToggleHotkey({
+    enabled: Boolean(hotkeyEnabled && ctx?.isTerminalFirst && !ctx.isShellView),
+    view: ctx?.view ?? "chat",
+    setView: ctx?.setView ?? ignoreViewChange,
+  });
+  if (!ctx || !ctx.isTerminalFirst || ctx.isShellView) return null;
+  // Mobile folds the switch into the header kebab (ViewModeMenuItems).
+  if (isMobile && !alwaysVisible) return null;
 
-  const { view, setView, terminalsAvailable, terminalStartingUp } = ctx;
+  const { view, setView, terminalStartingUp } = ctx;
   const terminalLabel = terminalStartingUp ? "Terminal is starting up…" : "Terminal view";
 
   return (
@@ -30,31 +49,30 @@ export function ViewModeToggle() {
       role="group"
       aria-label="Switch between chat and terminal"
       data-testid="view-mode-toggle"
-      // Inset track: p-0.5 around two size-6 segments lands the control at
-      // 32px tall, matching the header's other controls.
-      className="flex items-center gap-0.5 rounded-[var(--radius-lg)] bg-muted/60 p-0.5"
+      // Two 36×24 segments separated by 2px make a flush 74×24 track.
+      // Desktop-only — mobile folds the switch into the header kebab.
+      className="flex h-6 w-[74px] shrink-0 items-center gap-0.5 rounded-[6px] bg-muted p-0 dark:bg-[var(--segmented-trough-bg)]"
     >
       <ViewModeSegment
         label="Chat view"
         active={view === "chat"}
         onClick={() => setView("chat")}
         testId="view-mode-chat"
+        componentId="chat.header.view_chat"
       >
-        <MessagesSquareIcon className="size-3.5" />
+        <MessagesSquareIcon className="size-4" />
       </ViewModeSegment>
-      {/* Terminal stays disabled until a PTY is reachable; the spinner while
-          it's coming up reads as "loading" rather than a dead segment. */}
       <ViewModeSegment
         label={terminalLabel}
         active={view === "terminal"}
-        disabled={!terminalsAvailable}
         onClick={() => setView("terminal")}
         testId="view-mode-terminal"
+        componentId="chat.header.view_terminal"
       >
         {terminalStartingUp ? (
-          <Loader2Icon className="size-3.5 animate-spin" aria-hidden />
+          <Loader2Icon className="size-4 animate-spin" aria-hidden />
         ) : (
-          <TerminalIcon className="size-3.5" />
+          <TerminalIcon className="size-4" />
         )}
       </ViewModeSegment>
     </div>
@@ -70,23 +88,20 @@ export function ViewModeToggle() {
 function ViewModeSegment({
   label,
   active,
-  disabled = false,
   onClick,
   testId,
+  componentId,
   children,
 }: {
   label: string;
   active: boolean;
-  disabled?: boolean;
   onClick: () => void;
   testId: string;
+  componentId: string;
   children: React.ReactNode;
 }) {
   return (
     <Tooltip>
-      {/* Wrapper span owns hover/focus: a disabled button gets no pointer
-          events, so the tooltip explaining *why* it's disabled would never
-          open if it anchored to the button itself. */}
       <TooltipTrigger asChild>
         <span className="inline-flex">
           <Button
@@ -95,14 +110,15 @@ function ViewModeSegment({
             size="icon-xs"
             aria-label={label}
             aria-pressed={active}
-            disabled={disabled}
+            aria-keyshortcuts={`${ARIA_MOD_KEY}+Alt+\\`}
             onClick={onClick}
             data-testid={testId}
+            componentId={componentId}
             className={cn(
-              "border-none",
+              "h-6 w-9 rounded-[6px] border px-2.5 py-0",
               active
-                ? "bg-background text-foreground shadow-sm hover:bg-background"
-                : "text-muted-foreground hover:bg-transparent hover:text-foreground",
+                ? "border-border bg-background text-foreground shadow-sm hover:bg-background dark:border-transparent dark:bg-[var(--segmented-active-bg)] dark:hover:bg-[var(--segmented-active-bg)]"
+                : "border-transparent text-muted-foreground hover:bg-transparent hover:text-foreground dark:bg-[var(--segmented-inactive-bg)] dark:hover:bg-[var(--segmented-inactive-bg)]",
             )}
           >
             {children}
@@ -111,7 +127,54 @@ function ViewModeSegment({
       </TooltipTrigger>
       {/* Bottom placement: the header sits at top-0, so a top-side tooltip
           would render above the viewport edge and get clipped. */}
-      <TooltipContent side="bottom">{label}</TooltipContent>
+      <TooltipContent side="bottom" shortcut={VIEW_MODE_TOGGLE_KEYS}>
+        <span>{label}</span>
+      </TooltipContent>
     </Tooltip>
+  );
+}
+
+/**
+ * Chat/Terminal switch as dropdown-menu items — the mobile counterpart of the
+ * {@link ViewModeToggle} segmented track, folded into the header kebab so the
+ * narrow header pill carries one trigger instead of a switch beside the "…"
+ * menu. Self-gates to null on the same conditions as the toggle (non
+ * terminal-first sessions, and a shell owning the main view). The active view
+ * carries a trailing check; a trailing separator sets the switch off from the
+ * menu items that follow.
+ */
+export function ViewModeMenuItems() {
+  const ctx = useTerminalFirst();
+  if (!ctx || !ctx.isTerminalFirst || ctx.isShellView) return null;
+
+  const { view, setView, terminalStartingUp } = ctx;
+  const terminalLabel = terminalStartingUp ? "Terminal (starting up…)" : "Terminal";
+
+  return (
+    <>
+      <DropdownMenuItem
+        className="gap-2.5 px-2.5 py-2 text-ui"
+        onSelect={() => setView("chat")}
+        data-testid="view-mode-menu-chat"
+      >
+        <MessagesSquareIcon className="size-4" />
+        Chat
+        {view === "chat" && <CheckIcon className="ml-auto size-4" />}
+      </DropdownMenuItem>
+      <DropdownMenuItem
+        className="gap-2.5 px-2.5 py-2 text-ui"
+        onSelect={() => setView("terminal")}
+        data-testid="view-mode-menu-terminal"
+      >
+        {terminalStartingUp ? (
+          <Loader2Icon className="size-4 animate-spin" aria-hidden />
+        ) : (
+          <TerminalIcon className="size-4" />
+        )}
+        {terminalLabel}
+        {view === "terminal" && <CheckIcon className="ml-auto size-4" />}
+      </DropdownMenuItem>
+      <DropdownMenuSeparator />
+    </>
   );
 }

@@ -18,6 +18,7 @@ import sys
 import tempfile
 from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
+from datetime import UTC
 from typing import TYPE_CHECKING, Protocol, TextIO, TypeAlias
 
 from omnigent_client import (
@@ -30,6 +31,7 @@ from omnigent_client import (
     ResponseEndBlock,
     ResponseStartBlock,
     Session,
+    StaleCursorError,
     StreamHooks,
     ToolExecution,
     ToolGroup,
@@ -49,6 +51,7 @@ from omnigent_ui_sdk import (
     save_user_config,
     update_user_config,
 )
+from omnigent_ui_sdk.terminal import StreamLive
 
 # ``FormattedItem`` is the SDK formatter's per-method return type
 # (``Rich.RenderableType | StreamingText | StreamReplace``). The
@@ -68,6 +71,15 @@ from rich.console import RenderableType
 from rich.markup import escape
 from rich.text import Text
 
+from omnigent.cli_diagnostics import printable
+from omnigent.cli_invocation import cli_invocation
+from omnigent.harness_aliases import canonicalize_harness
+from omnigent.remote_launch import (
+    REMOTE_LAUNCH_MESSAGE,
+    no_online_runner_message,
+    resolve_remote_launch_host,
+)
+from omnigent.session_host import set_session_host
 from omnigent.spec.types import SkillSpec
 
 if TYPE_CHECKING:
@@ -76,6 +88,10 @@ if TYPE_CHECKING:
     from omnigent.server.schemas import SessionStatusEvent
 
 _log = logging.getLogger(__name__)
+
+# The session stream has no replay, so the REPL waits for the server's
+# subscription heartbeat before posting; the cap covers servers without one.
+_STREAM_READY_TIMEOUT_S: float = 5.0
 
 
 def _is_recoverable_sse_transport_error(exc: BaseException) -> bool:
@@ -112,11 +128,18 @@ def _is_recoverable_sse_transport_error(exc: BaseException) -> bool:
         httpx.ReadTimeout,
         httpx.ConnectError,
         httpx.ConnectTimeout,
+        # A peer that drops the connection while the request is still
+        # being sent surfaces as a write error — the same transient
+        # interruption as a read-side drop, just caught one syscall earlier.
+        httpx.WriteError,
+        httpx.WriteTimeout,
         httpcore.RemoteProtocolError,
         httpcore.ReadError,
         httpcore.ReadTimeout,
         httpcore.ConnectError,
         httpcore.ConnectTimeout,
+        httpcore.WriteError,
+        httpcore.WriteTimeout,
     )
     seen: set[int] = set()
     current: BaseException | None = exc
@@ -210,6 +233,10 @@ WELCOME_HINTS = ["/help help", "Ctrl+O debug", "Ctrl+T show tools", "Esc cancel"
 # overlay's single-page fetch silently dropped everything past
 # position 99.
 _LIST_ITEMS_PAGE_SIZE = 100
+
+# Full re-walks allowed when a page cursor's item is deleted mid-enumeration
+# before the overlay settles for whatever it managed to fetch.
+_LIST_ITEMS_MAX_RESTARTS = 3
 
 # Sub-agent tree (state badge + ``↓`` menu). The depth cap mirrors web's
 # ``MAX_TREE_DEPTH`` so the CLI tree matches the web Agents rail; the poll
@@ -493,8 +520,8 @@ def _render_startup_banner_ansi(
         ``None`` for the minimal banner.
     :returns: ANSI-styled string ready to be written to stdout.
     """
-    from omnigent.conversation_browser import display_server_url, is_workspace_hosted_url
     from omnigent.inner.banner import BannerLine, startup_banner_strings
+    from omnigent.util.server_url import display_server_url, is_workspace_hosted_url
 
     remote = _is_remote_server_url(server_url)
     # User-facing form of the URL: a Databricks workspace-hosted server is
@@ -745,6 +772,29 @@ def _parse_approval_input(text: str) -> _ApprovalVerdict:
     return _ApprovalVerdict.REFUSE
 
 
+# How another client's verdict settles the ASK this REPL is prompting for,
+# paired with the transcript line that reports it.
+_RESOLVED_ELSEWHERE: dict[str, tuple[_ApprovalVerdict, str]] = {
+    "accept": (_ApprovalVerdict.APPROVE_ONCE, "approved elsewhere"),
+    "decline": (_ApprovalVerdict.REFUSE, "declined elsewhere"),
+    "cancel": (_ApprovalVerdict.REFUSE, "cancelled elsewhere"),
+}
+
+
+def _resolved_elsewhere_verdict(action: str | None) -> _ApprovalVerdict:
+    """Verdict for an external resolution; anything but ``accept`` refuses."""
+    return _RESOLVED_ELSEWHERE.get(action or "", (_ApprovalVerdict.REFUSE, ""))[0]
+
+
+def _resolved_elsewhere_label(action: str | None, reason: str | None) -> str:
+    """Transcript line for an ASK another client settled, e.g. ``"declined elsewhere"``."""
+    if action in _RESOLVED_ELSEWHERE:
+        return _RESOLVED_ELSEWHERE[action][1]
+    if reason == "unanswered":
+        return "expired unanswered · refused"
+    return "resolved elsewhere · no verdict recorded · refused"
+
+
 class _ApprovalState:
     """
     Per-REPL holder for pending approvals and the session
@@ -779,6 +829,9 @@ class _ApprovalState:
         # ctx fields.
         self._current_policy: str | None = None
         self._current_phase: str | None = None
+        # Server id of the current ASK, so a resolved event from another
+        # client only settles the prompt when it is for this elicitation.
+        self._current_elicitation_id: str | None = None
         # When True, the current approval is URL-mode-only and
         # keyboard input (y/a/n) should be rejected.
         self._url_mode: bool = False
@@ -829,7 +882,12 @@ class _ApprovalState:
         self._always.add((policy_name, phase))
 
     def begin(
-        self, policy_name: str, phase: str, *, url_mode: bool = False
+        self,
+        policy_name: str,
+        phase: str,
+        *,
+        elicitation_id: str | None = None,
+        url_mode: bool = False,
     ) -> asyncio.Future[bool]:
         """
         Start a new approval — create the future the hook awaits.
@@ -837,7 +895,9 @@ class _ApprovalState:
         Records the identity of the ASK so
         :meth:`resolve_verdict` can cache an "always" decision
         against the right ``(policy_name, phase)`` pair
-        without the caller having to re-pass them.
+        without the caller having to re-pass them, and so
+        :meth:`resolve_elsewhere` can tell this elicitation's
+        resolved event apart from any other's.
 
         If a previous approval's future is still open (the user
         never answered before a new ASK arrived), refuse the
@@ -848,6 +908,9 @@ class _ApprovalState:
         :param policy_name: Deciding policy's name from the
             :class:`ElicitationRequestCtx`.
         :param phase: Phase string from the ctx.
+        :param elicitation_id: Server-assigned id of this ASK,
+            e.g. ``"elicit_abc123"``. ``None`` when unknown; the
+            prompt then only settles through keyboard input.
         :returns: The future to await. Resolves to ``True`` on
             approve (one or always) and ``False`` on refuse.
         """
@@ -855,6 +918,7 @@ class _ApprovalState:
             self._future.set_result(False)
         self._current_policy = policy_name
         self._current_phase = phase
+        self._current_elicitation_id = elicitation_id or None
         self._url_mode = url_mode
         self._future = asyncio.get_running_loop().create_future()
         return self._future
@@ -886,7 +950,29 @@ class _ApprovalState:
         self._future = None
         self._current_policy = None
         self._current_phase = None
+        self._current_elicitation_id = None
         return True
+
+    def resolve_elsewhere(self, elicitation_id: str, action: str | None) -> bool:
+        """
+        Settle the pending approval from another client's resolution of
+        the same elicitation.
+
+        The server publishes ``elicitation_resolved`` for every elicitation
+        in the session, so only an event carrying this ASK's id may release
+        the gate. ``accept`` approves once; a decline, cancel, or
+        verdict-less clear refuses fail-closed.
+
+        :param elicitation_id: Id carried by the resolved event.
+        :param action: MCP verdict carried by the event, or ``None``.
+        :returns: ``True`` iff the pending approval was for this
+            elicitation and has now been resolved.
+        """
+        if not self.pending or not elicitation_id:
+            return False
+        if elicitation_id != self._current_elicitation_id:
+            return False
+        return self.resolve_verdict(_resolved_elsewhere_verdict(action))
 
     def cancel(self) -> None:
         """
@@ -902,6 +988,7 @@ class _ApprovalState:
         self._future = None
         self._current_policy = None
         self._current_phase = None
+        self._current_elicitation_id = None
 
 
 class _FieldInputState:
@@ -1103,7 +1190,12 @@ def _make_elicitation_prompt(
                     f"n = refuse[/{fmt.accent}]",
                 ),
             )
-        future = state.begin(ctx.policy_name, ctx.phase, url_mode=bool(_is_external_url))
+        future = state.begin(
+            ctx.policy_name,
+            ctx.phase,
+            elicitation_id=ctx.elicitation_id,
+            url_mode=bool(_is_external_url),
+        )
         return await future
 
     return _on_elicitation_request
@@ -1196,7 +1288,7 @@ def _server_event_to_sdk_event(event: object) -> object | None:
     if isinstance(event, CompletedEvent):
         return ResponseCompleted(response=_resp(event))
     if isinstance(event, FailedEvent):
-        return ResponseFailed(response=_resp(event))
+        return ResponseFailed(response=_resp(event), source=event.source)
     if isinstance(event, CancelledEvent):
         return ResponseCancelled(response=_resp(event))
     if isinstance(event, IncompleteEvent):
@@ -1286,6 +1378,7 @@ class _SessionsChatReplAdapter:
         field_input_state: _FieldInputState | None = None,
         host: TerminalHost | None = None,
         fmt: RichBlockFormatter | None = None,
+        registered_agent: RegisteredAgent | None = None,
     ) -> None:
         """
         Wire the adapter; do NOT issue any HTTP calls.
@@ -1332,9 +1425,11 @@ class _SessionsChatReplAdapter:
             field values interactively via the main input loop.
         :param host: Terminal output channel for rendering field prompts.
         :param fmt: Formatter for styling field prompts.
+        :param registered_agent: Catalog identity selected for a new remote session.
         """
         self._client = client
         self._agent_id: str | None = None
+        self._registered_agent = registered_agent
         self._agent_name = agent_name
         self._tool_callables = tool_callables
         self._hooks = hooks or StreamHooks()
@@ -1375,6 +1470,8 @@ class _SessionsChatReplAdapter:
         # Set by run_repl() to the rendering callback.
         self._on_event: Callable[[object], None] | None = None
         self._stream_task: asyncio.Task[None] | None = None
+        # Set once the current stream subscription registers or its attempt ends.
+        self._stream_ready = asyncio.Event()
         self._recover_task: asyncio.Task[None] | None = None
         self._recover_lock = asyncio.Lock()
         self._bind_lock = asyncio.Lock()
@@ -1643,6 +1740,8 @@ class _SessionsChatReplAdapter:
             attributes.
         :returns: None.
         """
+        if self._session_id is not None:
+            set_session_host(self._session_id, getattr(session, "host_id", None))
         self._agent_id = session.agent_id
         # The agent name changes when the session is switched in place
         # to a different agent (web UI "Switch agent"). Don't clobber
@@ -1701,10 +1800,7 @@ class _SessionsChatReplAdapter:
                 self._hydrate_from_session_snapshot(session)
             await self._bind_runner_if_needed()
             if self._stream_task is None:
-                self._stream_task = asyncio.create_task(
-                    self._stream_pump(),
-                    name=f"sessions-adapter-stream-{self._session_id}",
-                )
+                await self._start_stream_pump()
             if self._runner_recover is not None and self._recover_task is None:
                 self._recover_task = asyncio.create_task(
                     self._runner_recover_watch(),
@@ -1718,11 +1814,11 @@ class _SessionsChatReplAdapter:
         """
         Create a session bound to an agent already registered server-side.
 
-        The remote-URL path: there is no local bundle to upload, so
-        resolve the picked name to its id and use the JSON create route.
-        A remote client also has no runner of its own, so adopt one the
-        server already has online — otherwise the first turn fails the
-        runner-binding precondition.
+        The remote-URL path: there is no local bundle to upload, so use
+        the selected catalog identity or resolve the name for direct callers.
+        Adopt a matching online runner, or ask the server to launch one
+        on this machine's connected host. Host-launched runners arrive
+        bound to the session and remain owned by the host lifecycle.
 
         :param pending_debug: Whether to emit adapter debug lines.
         :returns: None.
@@ -1733,22 +1829,35 @@ class _SessionsChatReplAdapter:
                 file=sys.stderr,
                 flush=True,
             )
-        # Skip the name lookup only when nothing needs it: we already know
-        # the id, and a bound runner means we don't need the harness either.
-        agent: RegisteredAgent | None = None
-        if self._agent_id is None or self._runner_id is None:
-            agent = await self._client.sessions.resolve_agent(self._agent_name)
-        agent_id = self._agent_id or (agent.id if agent is not None else None)
-        if agent_id is None:
-            raise RuntimeError(f"Could not resolve an agent id for {self._agent_name!r}")
+        # /new keeps the session's identity, including unnamed uploaded agents.
+        if self._agent_id is not None:
+            agent = RegisteredAgent(id=self._agent_id, harness=self._harness)
+            if self._runner_id is None and not agent.harness:
+                raise RuntimeError(
+                    "The previous session does not report its harness, so a compatible "
+                    "runner cannot be selected. Start a new session with --agent <name>."
+                )
+        else:
+            agent = self._registered_agent
+        if agent is None:
+            try:
+                agent = await self._client.sessions.resolve_agent(self._agent_name)
+            except LookupError as exc:
+                # The REPL renders this message; keep server-supplied names inert.
+                raise LookupError(printable(str(exc))) from exc
+        launch_host_id: str | None = None
         if self._runner_id is None:
-            from omnigent.harness_aliases import canonicalize_harness
-
             self._runner_id = await self._client.sessions.resolve_online_runner(
-                harness=agent.harness if agent is not None else None,
+                harness=agent.harness,
                 canonicalize=lambda name: canonicalize_harness(name) or name,
             )
-            if pending_debug:
+            if self._runner_id is None:
+                launch_host_id = await resolve_remote_launch_host(
+                    self._client.sessions, harness=agent.harness
+                )
+                if launch_host_id is None:
+                    raise RuntimeError(no_online_runner_message())
+            if pending_debug and self._runner_id is not None:
                 print(
                     f"[sessions-adapter] adopted server runner {self._runner_id!r}",
                     file=sys.stderr,
@@ -1757,13 +1866,23 @@ class _SessionsChatReplAdapter:
         # Snapshot the pre-create /model pick before hydration clobbers
         # it; applied after create since create has no such field.
         pending_model_override = self._model_override
-        session = await self._client.sessions.create_from_agent_id(
-            agent_id,
-            reasoning_effort=self._reasoning_effort,
-            workspace=os.getcwd(),
-        )
+        progress_host = self._host if launch_host_id is not None else None
+        if progress_host is not None:
+            progress_host.output(StreamLive(Text(REMOTE_LAUNCH_MESSAGE)))
+        try:
+            session = await self._client.sessions.create_from_agent_id(
+                agent.id,
+                reasoning_effort=self._reasoning_effort,
+                workspace=os.getcwd(),
+                host_id=launch_host_id,
+            )
+        finally:
+            if progress_host is not None:
+                progress_host.clear_streamed_text()
         self._session_id = session.id
         self._hydrate_from_session_snapshot(session)
+        if launch_host_id is not None:
+            set_session_host(session.id, launch_host_id)
         await self._apply_pending_model_override(pending_model_override, session)
         if pending_debug:
             print(
@@ -1888,14 +2007,10 @@ class _SessionsChatReplAdapter:
                 if self._session_bundle is None:
                     # Remote target: we tried to adopt one of the server's
                     # online runners at create time and found none.
-                    raise RuntimeError(
-                        "This server has no online runner to run the turn. Start one "
-                        "against it with `omnigent host --server <url>` (or run the "
-                        "agent locally with `omnigent run <agent.yaml>`), then retry."
-                    )
+                    raise RuntimeError(no_online_runner_message())
                 raise RuntimeError(
                     "Sessions API dispatch requires a registered runner id. "
-                    "Start through `omnigent run <agent>` or pass --server so the CLI "
+                    f"Start through `{cli_invocation()} run <agent>` or pass --server so the CLI "
                     "can launch and bind a runner."
                 )
             if self._bound_runner_id == self._runner_id:
@@ -1909,10 +2024,15 @@ class _SessionsChatReplAdapter:
                     file=sys.stderr,
                     flush=True,
                 )
-            session = await self._client.sessions.bind_runner(
-                self._session_id,
-                runner_id=self._runner_id,
-            )
+            try:
+                session = await self._client.sessions.bind_runner(
+                    self._session_id,
+                    runner_id=self._runner_id,
+                )
+            except OmnigentError as exc:
+                session = await self._reconcile_runner_after_bind_failure(exc)
+                if session is None:
+                    raise
             self._hydrate_from_session_snapshot(session)
             self._clear_runner_recovery_error()
             if _dbg:
@@ -1921,6 +2041,38 @@ class _SessionsChatReplAdapter:
                     file=sys.stderr,
                     flush=True,
                 )
+
+    async def _reconcile_runner_after_bind_failure(
+        self, exc: OmnigentError
+    ) -> _SessionSnapshot | None:
+        """
+        Adopt the server's live runner after a stale-runner bind failure.
+
+        A dead runner that the server has relaunched under a new id leaves
+        the cached ``_runner_id`` stale, so the bind 400s forever. Re-read
+        the snapshot and rebind onto the runner the server now reports.
+
+        Only when the server owns relaunch (``runner_recover is None``); a
+        client-owned runner is driven by ``_recover_runner_if_needed``.
+
+        :param exc: The bind failure to recover from.
+        :returns: The rebind snapshot, or ``None`` to re-raise *exc*.
+        """
+        if self._runner_recover is not None:
+            return None
+        if not self._is_terminal_runner_recovery_error(exc):
+            return None
+        if self._session_id is None:
+            return None
+        snapshot = await self._client.sessions.get(self._session_id)
+        live_runner_id = snapshot.runner_id
+        if not live_runner_id or live_runner_id == self._runner_id:
+            return None
+        self._runner_id = live_runner_id
+        return await self._client.sessions.bind_runner(
+            self._session_id,
+            runner_id=live_runner_id,
+        )
 
     def _clear_runner_recovery_error(self) -> None:
         """
@@ -1965,6 +2117,41 @@ class _SessionsChatReplAdapter:
                 error=RetryErrorDetail(
                     code=code or "runner_recovery_failed",
                     message=message,
+                ),
+            )
+        )
+
+    def _emit_elicitation_resolve_error(self, exc: Exception) -> None:
+        """
+        Render an undeliverable elicitation verdict in the error panel.
+
+        Bounded transport retries can still end with the verdict
+        undelivered, which leaves the elicitation parked server-side and
+        the turn waiting on an answer that will never arrive. Emitting the
+        same typed error event normal streams use lets the existing REPL
+        renderer show it, so the user learns to re-answer rather than
+        sitting at an apparently live prompt.
+
+        :param exc: Last transport failure raised by the resolve POST,
+            e.g. an ``httpx.ConnectError``.
+        :returns: None.
+        """
+        if self._on_event is None:
+            return
+
+        from omnigent.server.schemas import ErrorEvent, RetryErrorDetail
+
+        self._on_event(
+            ErrorEvent(
+                type="response.error",
+                source="execution",
+                error=RetryErrorDetail(
+                    code="elicitation_resolve_failed",
+                    message=(
+                        f"Could not deliver your answer to the server: {exc}. "
+                        "The request is still waiting for an answer, and this "
+                        "prompt is gone, so answer it from the web UI."
+                    ),
                 ),
             )
         )
@@ -2044,7 +2231,7 @@ class _SessionsChatReplAdapter:
         self._hydrate_from_session_snapshot(session)
         await self._bind_runner_if_needed()
 
-        self._stream_task = asyncio.create_task(self._stream_pump())
+        await self._start_stream_pump()
         return new_session_id
 
     async def view_session(
@@ -2093,7 +2280,7 @@ class _SessionsChatReplAdapter:
             self._stream_task = None
         session = await self._client.sessions.get(new_session_id)
         self._hydrate_from_session_snapshot(session)
-        self._stream_task = asyncio.create_task(self._stream_pump())
+        await self._start_stream_pump()
         return new_session_id
 
     async def aclose(self) -> None:
@@ -2120,6 +2307,28 @@ class _SessionsChatReplAdapter:
                 return_exceptions=True,
             )
             self._pending_local_tasks.clear()
+
+    async def _start_stream_pump(self) -> None:
+        """Start the persistent stream and wait until the server has registered it.
+
+        Events published before registration are never delivered, which would
+        lose e.g. the approval prompt for the message posted right after this.
+        """
+        self._stream_ready.clear()
+        self._stream_task = asyncio.create_task(
+            self._stream_pump(),
+            name=f"sessions-adapter-stream-{self._session_id}",
+        )
+        ready = asyncio.ensure_future(self._stream_ready.wait())
+        try:
+            # A pump that exits early will never register; stop waiting on it.
+            await asyncio.wait(
+                {ready, self._stream_task},
+                timeout=_STREAM_READY_TIMEOUT_S,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            ready.cancel()
 
     async def _stream_pump(self) -> None:
         """Subscribe to ``/v1/sessions/{id}/stream`` indefinitely.
@@ -2153,6 +2362,7 @@ class _SessionsChatReplAdapter:
                         flush=True,
                     )
                 async for event in self._client.sessions.stream(self._session_id):
+                    self._stream_ready.set()
                     if isinstance(event, _StatusEv) and event.status in (
                         "idle",
                         "waiting",
@@ -2164,11 +2374,14 @@ class _SessionsChatReplAdapter:
                     if self._on_event is not None:
                         self._on_event(event)
                 # Clean close (server sent [DONE]). Reopen.
+                self._stream_ready.set()
                 await asyncio.sleep(backoff)
                 backoff = 0.5
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 — reconnect on any error
+                # A failed attempt will not register; don't hold up the post.
+                self._stream_ready.set()
                 # Recoverable transport errors (peer closed mid-chunk,
                 # read timeout, transient network error) are normal
                 # background noise — the session continues server-side
@@ -2316,7 +2529,7 @@ class _SessionsChatReplAdapter:
                         self._turn_done.wait(),
                         timeout=1.0,
                     )
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     snap = await self._client.sessions.get(session_id)
                     if snap.status in ("idle", "failed"):
                         self._turn_done.set()
@@ -2396,7 +2609,7 @@ class _SessionsChatReplAdapter:
                         self._turn_done.wait(),
                         timeout=1.0,
                     )
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     snap = await self._client.sessions.get(session_id)
                     if snap.status in ("idle", "failed"):
                         self._turn_done.set()
@@ -2561,23 +2774,42 @@ class _SessionsChatReplAdapter:
                 else:
                     resolve_payload["action"] = "decline"
 
-        try:
-            # URL-based elicitation: deliver the verdict to the
-            # elicitation's dedicated resolve URL rather than as an
-            # in-band ``approval`` session event. Same server-side
-            # effect (both converge on ``_resolve_elicitation``).
-            await self._client.sessions.resolve_elicitation(
-                session_id,
-                elicitation_id,
-                resolve_payload,
-            )
-        except OmnigentError as exc:
-            if exc.code == "not_found":
-                # Elicitation already resolved by another client (e.g. web
-                # UI approved while the terminal prompt was still open).
-                # The harness already received the verdict — treat as no-op.
+        # URL-based elicitation: deliver the verdict to the elicitation's
+        # dedicated resolve URL rather than as an in-band ``approval`` event.
+        # A transport error can happen after the server accepted the POST but
+        # before the client received its response, so retrying is safe: the
+        # server either accepts the retry or reports the elicitation resolved.
+        for attempt in range(3):
+            try:
+                await self._client.sessions.resolve_elicitation(
+                    session_id,
+                    elicitation_id,
+                    resolve_payload,
+                )
                 return
-            raise
+            except OmnigentError as exc:
+                if exc.code == "not_found":
+                    # Another client may have resolved it while the terminal
+                    # prompt was open, or the first POST reached the server.
+                    return
+                raise
+            except Exception as exc:
+                if not _is_recoverable_sse_transport_error(exc):
+                    raise
+                if attempt == 2:
+                    # One line here, postmortem behind DEBUG: the REPL
+                    # configures no log handlers, so a WARNING carrying
+                    # exc_info falls through to ``logging.lastResort`` and
+                    # paints a traceback over the TUI frame. Same split
+                    # ``_stream_pump`` makes for the same reason.
+                    _log.warning("Could not resolve elicitation after transport retries")
+                    _log.debug("elicitation resolve failed", exc_info=exc)
+                    # The elicitation is still parked server-side, so the
+                    # turn waits on a verdict that will never arrive. Say so
+                    # instead of leaving an apparently live prompt.
+                    self._emit_elicitation_resolve_error(exc)
+                    return
+                await asyncio.sleep(0.1 * (2**attempt))
 
     async def _prompt_schema_fields(
         self,
@@ -3084,11 +3316,13 @@ async def run_repl(
     agent_description: str | None = None,
     used_families: list[str] | None = None,
     attach_only: bool = False,
+    registered_agent: RegisteredAgent | None = None,
 ) -> str | None:
     """The entire REPL — using the framework.
 
     :param client: Connected OmnigentClient.
     :param agent_name: Agent name (used for API calls).
+    :param registered_agent: Catalog identity selected for a new remote session.
     :param tool_handler: Optional client-side tool handler.
     :param initial_message: If set, auto-send this message on startup
         (e.g. a greeting prompt for onboarding).
@@ -3259,6 +3493,7 @@ async def run_repl(
     session = _SessionsChatReplAdapter(
         client=client,
         agent_name=agent_name,
+        registered_agent=registered_agent,
         tool_callables=tool_callables,
         hooks=hooks,
         session_id=resume_conversation_id,
@@ -3340,8 +3575,8 @@ async def run_repl(
         """
         Fire a background re-sync of session metadata from a snapshot.
 
-        Shared by the two triggers that can observe an in-place agent
-        switch: the ``session.agent_changed`` stream event (live, while
+        Shared by the two triggers that can observe an agent change: the
+        ``session.agent_changed`` stream event (live, while
         attached) and the turn-start catch-up in the ``running`` status
         branch. Both funnel into :func:`_refresh_session_metadata` so
         adapter state is always derived from a snapshot — never applied
@@ -3522,22 +3757,17 @@ async def run_repl(
                 _maybe_log_tape_entry(tape_entry)
             return
 
-        # When an elicitation is resolved externally (via the standalone
-        # approval page), the server publishes ``elicitation_resolved``.
-        # Wake the parked ``_ApprovalState`` future so the REPL unblocks.
-        # The ``elicitation_resolved`` event doesn't carry the verdict
-        # (accept/decline), but ``_handle_elicitation`` will POST a
-        # redundant resolve that the server silently ignores (already
-        # resolved). We approve here so the REPL unblocks; the actual
-        # outcome is whatever the user chose on the page.
+        # ``elicitation_resolved`` fans out for every elicitation in the
+        # session, from any client; release the parked approval only for the
+        # ASK this REPL is prompting for, with the verdict the event carries.
         from omnigent.server.schemas import ElicitationResolvedEvent
 
         if isinstance(event, ElicitationResolvedEvent):
-            if approval_state.pending:
-                approval_state.resolve_verdict(_ApprovalVerdict.APPROVE_ONCE)
+            if approval_state.resolve_elsewhere(event.elicitation_id, event.action):
+                label = _resolved_elsewhere_label(event.action, event.reason)
                 host.output(
                     Text.from_markup(
-                        f"   [{fmt.muted}]› resolved via approval page[/{fmt.muted}]",
+                        f"   [{fmt.muted}]› {label}[/{fmt.muted}]",
                     ),
                 )
             if tape_entry is not None:
@@ -3869,7 +4099,7 @@ async def run_repl(
                 fmt.format_error(
                     ErrorBlock(
                         message=msg,
-                        source="llm",
+                        source=sdk_ev.source,
                         ctx=BlockContext(agent=None, depth=0, turn=0),
                     ),
                 )
@@ -4512,7 +4742,7 @@ async def run_repl(
         #   - the server is a Databricks workspace mount — a workspace build
         #     reports no meaningful version string (its /api/version returns a
         #     placeholder like "source"), so showing it is noise.
-        from omnigent.conversation_browser import is_workspace_hosted_url
+        from omnigent.util.server_url import is_workspace_hosted_url
 
         _show_version = _header is not None and not (
             server_url is not None and is_workspace_hosted_url(server_url)
@@ -4813,7 +5043,7 @@ async def _cmd_theme(
     host.output(_build_preview(selected.name))
 
 
-_EFFORT_VALUES = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
+_EFFORT_VALUES = ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")
 _EFFORT_CLEAR_ALIASES = {"default", "off", "reset"}
 
 
@@ -4879,7 +5109,8 @@ async def _cmd_effort(
         host.output(
             Text.from_markup(
                 "  [bold red]Invalid effort: "
-                f"{value} · expected none, minimal, low, medium, high, xhigh, max, or default[/]"
+                f"{value} · expected none, minimal, low, medium, high, "
+                "xhigh, max, ultra, or default[/]"
             )
         )
         return
@@ -5023,7 +5254,8 @@ def _build_model_readout_lines(
         else:
             lines.append("Active:  None  ·  None")
             lines.append(
-                "no model configured — run `omnigent setup --no-internal-beta` to add one"
+                f"no model configured — run `{cli_invocation()} setup --no-internal-beta` "
+                "to add one"
             )
         lines.append("usage: /model <name> · /model default | off | reset to clear")
         return lines
@@ -5265,7 +5497,7 @@ async def _cmd_model(
         host.output(
             Text.from_markup(
                 f"  [{fmt.muted}]Active provider: {active_label}. To use {target_label}, run "
-                f"`omnigent setup --no-internal-beta` and select it as the "
+                f"`{cli_invocation()} setup --no-internal-beta` and select it as the "
                 f"default, then restart. "
                 f"(You can still change the model within {active_label}: /model <model-name>.)"
                 f"[/{fmt.muted}]"
@@ -5396,13 +5628,17 @@ async def _cmd_switch(
     host: TerminalHost,
     fmt: RichBlockFormatter,
 ) -> None:
-    from datetime import datetime, timezone
+    from datetime import datetime
 
     from rich.table import Table
     from rich.text import Text
 
+    # Switching binds an owner-only runner unless this is an attach/co-drive client.
+    visibility = (
+        "all" if isinstance(session, _SessionsChatReplAdapter) and session._attach_only else "mine"
+    )
     if not arg:
-        sessions_list = await client.sessions.list(limit=20)
+        sessions_list = await client.sessions.list(limit=20, visibility=visibility)
         if sessions_list:
             table = Table(title="Switch to…")
             table.add_column("#", style="bold " + fmt.accent)
@@ -5412,7 +5648,7 @@ async def _cmd_switch(
             table.add_column("Created", style="dim")
             for i, s in enumerate(sessions_list, 1):
                 when = (
-                    datetime.fromtimestamp(s.created_at, tz=timezone.utc)
+                    datetime.fromtimestamp(s.created_at, tz=UTC)
                     .astimezone()
                     .strftime("%b %d %H:%M")
                 )
@@ -5425,7 +5661,7 @@ async def _cmd_switch(
             host.output(Text.from_markup(f"  [{fmt.muted}]No sessions.[/{fmt.muted}]"))
     else:
         if arg.isdigit():
-            sessions_list = await client.sessions.list(limit=20)
+            sessions_list = await client.sessions.list(limit=20, visibility=visibility)
             index = int(arg) - 1
             if index < 0 or index >= len(sessions_list):
                 host.output(
@@ -5857,9 +6093,8 @@ async def _refresh_session_metadata(
     Fired in the background from two triggers. The session's bound
     agent — and with it ``llm_model`` / ``harness`` /
     ``context_window`` / ``model_override`` — can change between turns
-    when another client switches the agent in place
-    (``POST /v1/sessions/{id}/switch-agent``). The server publishes a
-    ``session.agent_changed`` stream event for the switch (the live
+    when another client edits it. The server publishes a
+    ``session.agent_changed`` stream event (the live
     trigger), but the event is transient SSE-only with no replay — one
     landing in a stream-pump reconnect gap or before this REPL attached
     is lost — so each turn start re-fires the refresh as the catch-up
@@ -6056,6 +6291,19 @@ async def _cmd_compact(
     """Request proactive context compaction for the current conversation."""
     from rich.text import Text
 
+    from omnigent.harness_aliases import is_native_harness
+
+    _harness = getattr(session, "harness", None)
+    if _harness is not None and not is_native_harness(_harness):
+        host.output(
+            Text.from_markup(
+                f"  [{fmt.muted}]/compact is only available for native-TUI sessions "
+                f"(claude, codex, cursor, …). This session uses the "
+                f"{_harness} harness, which manages its own "
+                f"context window.[/{fmt.muted}]"
+            )
+        )
+        return
     if session.is_streaming:
         host.output(
             Text.from_markup(
@@ -6175,7 +6423,7 @@ def _build_github_issue_url(
     from urllib.parse import quote
 
     session_line = f"`{session_id}`" if session_id else "not started"
-    timestamp = datetime.datetime.now(tz=datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    timestamp = datetime.datetime.now(tz=datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     what_happened = description if description else "<!-- Describe what went wrong -->"
 
     info_lines = [
@@ -6366,6 +6614,7 @@ async def _list_all_conversation_items(
     all_items: list[dict[str, object]] = []
     page_size = _LIST_ITEMS_PAGE_SIZE
     after: str | None = None
+    restarts = 0
     while True:
         try:
             raw_page = await client.sessions.list_items(
@@ -6374,9 +6623,21 @@ async def _list_all_conversation_items(
                 after=after,
                 order="asc",
             )
-        except Exception:  # noqa: BLE001 — overlay builder: any per-page error falls back to whatever was already fetched; partial sidebar beats no sidebar
+        except StaleCursorError:
+            # An item deleted mid-walk. Keeping the fetched prefix here is
+            # exactly the truncated-sidebar bug this walk exists to fix, so
+            # rebuild from the first page instead of settling for a partial
+            # list — unlike the broad fallback below, this failure is
+            # recoverable.
+            if restarts >= _LIST_ITEMS_MAX_RESTARTS:
+                break
+            restarts += 1
+            all_items = []
+            after = None
+            continue
+        except Exception:  # noqa: BLE001 — overlay builder: any other per-page error falls back to whatever was already fetched; partial sidebar beats no sidebar
             break
-        page: list[dict[str, object]] = list(raw_page) if raw_page else []
+        page: list[dict[str, object]] = raw_page.data
         if not page:
             break
         all_items.extend(page)
@@ -8329,6 +8590,10 @@ _SLASH_COMMAND_ALIASES: frozenset[str] = frozenset({"/?", "/exit"})
 # SLASH_COMMAND_RE so the terminal and the menu agree on what is a command.
 _SKILL_COMMAND_NAME_RE = re.compile(r"^[A-Za-z0-9][\w:-]*$")
 
+# Registered skill commands' display names, e.g. ``{"/asd-ste100": "Simplified
+# Technical English"}``; the completer matches these as well as the command.
+_SKILL_DISPLAY_NAMES: dict[str, str] = {}
+
 
 def register_skill_commands(skills: list[SkillSpec]) -> list[str]:
     """
@@ -8400,7 +8665,11 @@ def register_skill_commands(skills: list[SkillSpec]) -> list[str]:
             return _skill_handler
 
         handler = _make_handler(skill)
-        COMMANDS[cmd_name] = (skill.description, handler)
+        # Label the command with its display name, matching the web menu.
+        description = " — ".join(filter(None, (skill.display_name, skill.description)))
+        COMMANDS[cmd_name] = (description, handler)
+        if skill.display_name:
+            _SKILL_DISPLAY_NAMES[cmd_name] = skill.display_name
         registered.append(cmd_name)
         _log.debug("Registered skill slash command: %s", cmd_name)
 
@@ -8411,6 +8680,7 @@ def unregister_skill_commands(names: list[str]) -> None:
     """Remove previously registered skill commands from the global registry."""
     for name in names:
         COMMANDS.pop(name, None)
+        _SKILL_DISPLAY_NAMES.pop(name, None)
 
 
 class _SlashCommandCompleter(Completer):
@@ -8456,9 +8726,8 @@ class _SlashCommandCompleter(Completer):
         # SlashCommandMenu.tsx): a case-insensitive substring of the
         # command name (sans the leading "/"), so a namespaced skill is
         # reachable by its leaf name (``/using-superpowers`` ->
-        # ``/superpowers:using-superpowers``). Name only, not the
-        # description — kept identical to the web menu, which never shows
-        # descriptions inline.
+        # ``/superpowers:using-superpowers``). A skill's display name also
+        # matches, ranked after name hits; the description never does.
         #
         # Prefix matches rank ahead of mid-string matches (mirrors the web
         # menu's ``rankedSlashCommandNames``): ``/e`` surfaces ``/effort``
@@ -8469,6 +8738,7 @@ class _SlashCommandCompleter(Completer):
         query = text_before[1:].lower()
         prefix_hits: list[tuple[str, str]] = []
         substring_hits: list[tuple[str, str]] = []
+        label_hits: list[tuple[str, str]] = []
         for name, (desc, _) in COMMANDS.items():
             if name in _SLASH_COMMAND_ALIASES:
                 continue
@@ -8477,7 +8747,9 @@ class _SlashCommandCompleter(Completer):
                 prefix_hits.append((name, desc))
             elif query in body:
                 substring_hits.append((name, desc))
-        for name, desc in (*prefix_hits, *substring_hits):
+            elif query in _SKILL_DISPLAY_NAMES.get(name, "").lower():
+                label_hits.append((name, desc))
+        for name, desc in (*prefix_hits, *substring_hits, *label_hits):
             yield Completion(
                 text=name,
                 # Replace everything typed so far so the splice
@@ -8670,7 +8942,7 @@ async def _run_bang_command(
     timed_out = False
     try:
         out_b, err_b = await asyncio.wait_for(proc.communicate(), timeout=_BANG_TIMEOUT_S)
-    except asyncio.TimeoutError:
+    except TimeoutError:
         timed_out = True
         proc.kill()
         out_b, err_b = await proc.communicate()

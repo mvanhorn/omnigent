@@ -2,7 +2,7 @@
 
 The sidebar's session filter (the funnel: All / My sessions / Shared /
 Archived) used to live only in React state, so every reload snapped the list
-back to "All sessions" — a viewer who works out of "My sessions" had to
+back to the default — a viewer who picked a different slice had to
 re-pick it after each refresh. The pick is now persisted per-device
 (``omnigent:session-filter`` in ``localStorage``) and seeded back on mount.
 
@@ -22,7 +22,6 @@ observable (rows drop *out*, rather than merely staying put).
 
 from __future__ import annotations
 
-import json
 import uuid
 from collections.abc import Iterator
 
@@ -30,12 +29,13 @@ import httpx
 import pytest
 from playwright.sync_api import Browser, Locator, Page, expect
 
+from tests._helpers.browser import user_page
 from tests.e2e_ui.collaboration._multi_user_server import (
     ADMIN_EMAIL,
     MultiUserServer,
+    create_user_session,
     spawn_multi_user_server,
 )
-from tests.e2e_ui.conftest import _build_hello_world_bundle
 
 # Edit access (2): enough to share a session with a non-owner. Mirrors
 # LEVEL_EDIT in omnigent/server/auth.py.
@@ -48,30 +48,10 @@ _STORAGE_KEY = "omnigent:session-filter"
 
 
 def _create_session(server: MultiUserServer, *, owner_email: str, title: str) -> str:
-    """Create a session owned by *owner_email* and give it a unique *title*.
-
-    A multi-user header-auth server 401s headerless writes, so both the create
-    and the title PATCH carry the owner's ``X-Forwarded-Email``. The title makes
-    the row easy to spot among other tests' sessions on the shared server.
-    """
-    headers = {"X-Forwarded-Email": owner_email}
-    create = httpx.post(
-        f"{server.base_url}/v1/sessions",
-        data={"metadata": json.dumps({})},
-        files={"bundle": ("agent.tar.gz", _build_hello_world_bundle(), "application/gzip")},
-        headers=headers,
-        timeout=30.0,
+    """Seed a titled session owned by the explicit header identity."""
+    return create_user_session(
+        server.base_url, headers={"X-Forwarded-Email": owner_email}, metadata={"title": title}
     )
-    create.raise_for_status()
-    session_id = create.json()["session_id"]
-    resp = httpx.patch(
-        f"{server.base_url}/v1/sessions/{session_id}",
-        json={"title": title},
-        headers=headers,
-        timeout=10.0,
-    )
-    resp.raise_for_status()
-    return session_id
 
 
 def _grant(server: MultiUserServer, session_id: str, user_id: str, level: int) -> None:
@@ -119,20 +99,23 @@ def multi_user_server(
 
 
 @pytest.mark.flaky(reruns=2, reruns_delay=5)
-def test_my_sessions_filter_survives_a_reload(
+def test_all_sessions_filter_survives_a_reload(
     browser: Browser,
     multi_user_server: MultiUserServer,
 ) -> None:
-    """Picking "My sessions" still scopes the list after a full page reload.
+    """Picking "All sessions" still scopes the list after a full page reload.
 
-    Seeds a session the viewer owns and one the admin shared with them, picks
-    "My sessions" (dropping the shared row), then reloads. Before the fix the
-    filter reset to "All sessions" on load, so the shared row came back and the
-    viewer had to re-pick after every refresh.
+    The default filter is "My sessions", which hides sessions shared to the
+    viewer by others. Seeds a session the viewer owns and one the admin shared
+    with them, picks "All sessions" (bringing the shared row in), then reloads.
+    Without persistence the filter would snap back to the "My sessions" default
+    on load, dropping the shared row again.
 
-    Asserts both the visible effect (shared row stays out, owned row stays in)
-    and the menu state (the radio item reads checked), so a list that happened
-    to look right for another reason can't pass.
+    "All" is a non-default slice, so this genuinely exercises persistence: a
+    reload that landed on the default would fail here. Asserts both the visible
+    effect (shared row returns and stays) and the menu state (the radio item
+    reads checked), so a list that happened to look right for another reason
+    can't pass.
     """
     server = multi_user_server
     uniq = uuid.uuid4().hex[:6]
@@ -142,30 +125,26 @@ def test_my_sessions_filter_survives_a_reload(
     shared = _create_session(server, owner_email=ADMIN_EMAIL, title=f"e2e-filter-shared-{uniq}")
     _grant(server, shared, viewer_email, _LEVEL_EDIT)
 
-    ctx = browser.new_context(extra_http_headers={"X-Forwarded-Email": viewer_email})
-    try:
-        page = ctx.new_page()
+    with user_page(browser, headers={"X-Forwarded-Email": viewer_email}) as page:
         page.goto(f"{server.public_url}/c/{owned}")
         expect(page.locator(_FILTER)).to_be_visible(timeout=30_000)
 
-        # Default "All sessions": both rows visible, so the scoping below is a
-        # real change rather than a row that was never there.
+        # Default "My sessions": the owned row shows and the shared one is
+        # hidden, so picking "All" below is a real change rather than a no-op.
         expect(_row(page, owned)).to_be_visible(timeout=30_000)
-        expect(_row(page, shared)).to_be_visible(timeout=30_000)
+        expect(_row(page, shared)).to_have_count(0, timeout=30_000)
 
-        _set_filter(page, "mine")
-        expect(_row(page, shared)).to_have_count(0, timeout=15_000)
+        _set_filter(page, "all")
+        expect(_row(page, shared)).to_be_visible(timeout=15_000)
         expect(_row(page, owned)).to_be_visible()
 
         # The reload the fix is about: a fresh document, so the sidebar must
-        # re-seed the filter from storage rather than default to "All sessions".
+        # re-seed the filter from storage rather than snap back to "My sessions".
         page.reload()
         expect(page.locator(_FILTER)).to_be_visible(timeout=30_000)
         expect(_row(page, owned)).to_be_visible(timeout=30_000)
-        expect(_row(page, shared)).to_have_count(0)
-        _expect_checked_filter(page, "mine")
-    finally:
-        ctx.close()
+        expect(_row(page, shared)).to_be_visible(timeout=30_000)
+        _expect_checked_filter(page, "all")
 
 
 @pytest.mark.flaky(reruns=2, reruns_delay=5)
@@ -187,13 +166,11 @@ def test_shared_sessions_filter_survives_a_reload(
     shared = _create_session(server, owner_email=ADMIN_EMAIL, title=f"e2e-shared-shared-{uniq}")
     _grant(server, shared, viewer_email, _LEVEL_EDIT)
 
-    ctx = browser.new_context(extra_http_headers={"X-Forwarded-Email": viewer_email})
-    try:
-        page = ctx.new_page()
+    with user_page(browser, headers={"X-Forwarded-Email": viewer_email}) as page:
         page.goto(f"{server.public_url}/c/{owned}")
         expect(page.locator(_FILTER)).to_be_visible(timeout=30_000)
-        expect(_row(page, shared)).to_be_visible(timeout=30_000)
-
+        # Default "My sessions" hides the shared row; picking "Shared" brings it
+        # in and drops the owned one.
         _set_filter(page, "shared")
         expect(_row(page, shared)).to_be_visible(timeout=15_000)
         expect(_row(page, owned)).to_have_count(0, timeout=15_000)
@@ -203,8 +180,6 @@ def test_shared_sessions_filter_survives_a_reload(
         expect(_row(page, shared)).to_be_visible(timeout=30_000)
         expect(_row(page, owned)).to_have_count(0)
         _expect_checked_filter(page, "shared")
-    finally:
-        ctx.close()
 
 
 @pytest.mark.flaky(reruns=2, reruns_delay=5)
@@ -218,9 +193,9 @@ def test_stored_shared_filter_is_dropped_on_a_single_user_server(
     ``live_server`` is loopback-only, so the funnel drops "Shared sessions" —
     there's one user and the slice is meaningless. Seeding the stored value
     that a multi-user server would have written (or a hand-edited entry) must
-    therefore fall back to "All sessions": honoring it would scope the list to
-    a slice with no menu entry to leave it by, i.e. an empty list the viewer
-    can't escape.
+    therefore fall back to the "My sessions" default: honoring it would scope
+    the list to a slice with no menu entry to leave it by, i.e. an empty list
+    the viewer can't escape.
 
     Uses ``add_init_script`` so the value is in storage *before* any app script
     runs, which is what a returning viewer's first paint actually sees.
@@ -232,10 +207,11 @@ def test_stored_shared_filter_is_dropped_on_a_single_user_server(
     expect(page.locator(_FILTER)).to_be_visible(timeout=30_000)
 
     # The viewer's own session renders (an honored "shared" would hide it), and
-    # the menu shows All checked with no Shared option to have selected.
+    # the menu falls back to the "My sessions" default with no Shared option to
+    # have selected.
     expect(_row(page, session_id)).to_be_visible(timeout=30_000)
     page.locator(_FILTER).click()
-    expect(page.locator('[data-testid="session-filter-all"]')).to_have_attribute(
+    expect(page.locator('[data-testid="session-filter-mine"]')).to_have_attribute(
         "aria-checked", "true", timeout=15_000
     )
     expect(page.locator('[data-testid="session-filter-shared"]')).to_have_count(0)

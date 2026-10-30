@@ -8,12 +8,12 @@ and opening the new terminal as a rail tab (its xterm renders in the rail's
 content slot). None of this needs an LLM turn — the user, not the agent,
 launches the shell — so these tests never send a chat message.
 
-Three behaviors are covered:
+Five behaviors are covered:
 
 1. **"+" → Shell launches and opens a shell.** Picking Shell creates a
    ``zsh`` shell that opens as a rail tab (``zsh · u-…``): its xterm
    connects in the rail's content slot, the chat page is left undisturbed,
-   and the tab's "x" closes it back to the Shells list.
+   and the tab's "x" closes it (after a confirm) and kills the terminal.
 
 2. **The user can type a command into the shell.** We type ``pwd`` into
    the connected shell and assert it keeps running — the keystrokes are
@@ -28,20 +28,36 @@ Three behaviors are covered:
    beside the chat header at the 8px outer inset instead of clearing the
    header like the main-column surfaces.
 
-Both use the function-scoped ``terminal_session`` fixture (registers the
+4. **Terminal view startup vs. stopped states.** A starting terminal-first
+   session renders a passive "Starting up…" status with no actionable
+   control. A stopped one offers Resume after automatic recovery fails,
+   or when its host cannot be reached.
+
+5. **A program's terminal queries are answered once.** tmux answers a query
+   such as the cursor position itself; the browser terminal must not answer
+   the copy control mode forwards, or the extra reply reaches the program as
+   typed input.
+
+All use the function-scoped ``terminal_session`` fixture (registers the
 ``zsh``-declaring agent and a runner-bound session), so each test gets an
 independent session.
 """
 
 from __future__ import annotations
 
+import json
+import os
 import re
+import signal
 import time
+from collections.abc import Callable
 from pathlib import Path
 
+import httpx
 from playwright.sync_api import Page, expect
 
-from tests.e2e_ui.conftest import open_right_rail
+from tests._helpers.polling import poll_until
+from tests.e2e_ui.conftest import _server_state, open_right_rail
 
 
 def _open_new_shell(page: Page) -> None:
@@ -70,7 +86,7 @@ def test_new_shell_launches_and_opens(page: Page, terminal_session: tuple[str, s
     as a tab in the workspace rail's top strip (labeled ``zsh · u-…``) and
     its xterm renders inside the rail's content slot — the chat page is
     left undisturbed (no ``main-terminal-view`` takeover). The tab's "x"
-    closes it and drops back to the Shells list.
+    closes it (after confirming) and its xterm unmounts.
     """
     base_url, session_id = terminal_session
 
@@ -85,15 +101,22 @@ def test_new_shell_launches_and_opens(page: Page, terminal_session: tuple[str, s
 
     # The shell's xterm mounts INSIDE the rail (not the main column) and
     # connects. The chat surface is untouched — the composer stays visible.
+    # Assert no VISIBLE main terminal surface: terminal-first sessions keep
+    # a hidden pre-warmed surface mounted (data-visible="false"), which is
+    # not a takeover.
     terminal_view = rail.get_by_test_id("terminal-view")
     expect(terminal_view.last).to_be_visible(timeout=20_000)
     expect(terminal_view.last).to_have_attribute("data-state", "connected", timeout=20_000)
-    expect(page.get_by_test_id("main-terminal-view")).to_have_count(0)
-    expect(page.get_by_placeholder("Ask the agent anything…")).to_be_visible()
+    expect(page.locator('[data-testid="main-terminal-view"][data-visible="true"]')).to_have_count(
+        0
+    )
+    expect(page.get_by_placeholder("Send a message…")).to_be_visible()
 
-    # The tab's x closes the shell — its xterm unmounts and the rail falls
-    # back to the Shells list.
+    # The tab's x asks to confirm first (closing a tab kills the terminal);
+    # confirming unmounts the shell's xterm and the rail returns to its
+    # default view.
     close_tab.click()
+    page.get_by_role("button", name="Close shell").click()
     expect(terminal_view).to_have_count(0)
 
 
@@ -132,6 +155,393 @@ def test_new_shell_accepts_typed_command(page: Page, terminal_session: tuple[str
     # "terminal session ended". A regression that drops user input or kills
     # the PTY on first keystroke would flip this out of ``connected``.
     expect(terminal_view).to_have_attribute("data-state", "connected")
+
+
+def test_empty_terminal_view_remains_selectable_and_resumable(
+    page: Page,
+    terminal_session: tuple[str, str],
+    _recover_shared_runner: Callable[[], None],
+) -> None:
+    """A stopped terminal-first session is resumable, same mount and after reload.
+
+    Two phases, both inside the session's 45s cold-boot window:
+
+    1. Same mount: delete the real agent PTY through the resources API
+       (resource cleanup lands while the runner is still online, and the
+       live stream carries the removal). The view must flip to the
+       stopped-session UI with an enabled Resume action: the fresh-session
+       startup grace covers a PTY that has not arrived yet, never one
+       that was present and then removed.
+    2. Hard reload after a genuine stop (runner dropped, server observed
+       offline): a brand-new mount has no PTY observation, yet the stopped
+       UI — not the startup state — must own the view immediately.
+    """
+    base_url, session_id = terminal_session
+
+    terminal_first = httpx.patch(
+        f"{base_url}/v1/sessions/{session_id}",
+        json={"labels": {"omnigent.ui": "terminal"}},
+        timeout=10.0,
+    )
+    terminal_first.raise_for_status()
+
+    page.goto(f"{base_url}/c/{session_id}")
+
+    terminal_button = page.get_by_test_id("view-mode-terminal")
+    expect(terminal_button).to_be_enabled()
+    terminal_button.click()
+    expect(terminal_button).to_have_attribute("aria-pressed", "true")
+
+    # The real agent PTY connects before we remove it.
+    terminal_view = page.locator('[data-testid="main-terminal-view"][data-visible="true"]')
+    expect(terminal_view).to_be_visible()
+    expect(terminal_view.locator(".xterm")).to_be_visible()
+
+    # Delete the agent PTY the way a stop does: the resource goes away while
+    # the runner stays online, and the SSE delta prunes the client cache.
+    terminals = httpx.get(
+        f"{base_url}/v1/sessions/{session_id}/resources/terminals",
+        params={"order": "asc", "limit": 1000},
+        timeout=10.0,
+    )
+    terminals.raise_for_status()
+    agent_ids = [t["id"] for t in terminals.json()["data"] if t["id"].startswith("terminal_tui")]
+    assert agent_ids, f"no agent terminal in inventory: {terminals.json()['data']}"
+    for terminal_id in agent_ids:
+        deleted = httpx.delete(
+            f"{base_url}/v1/sessions/{session_id}/resources/terminals/{terminal_id}",
+            timeout=10.0,
+        )
+        deleted.raise_for_status()
+
+    # Stopped-session UI: no startup status, Resume offered and enabled.
+    expect(terminal_view.locator(".xterm")).to_have_count(0)
+    expect(terminal_view.get_by_role("status")).to_have_count(0)
+    expect(terminal_view).to_contain_text("The harness is not running.")
+    expect(terminal_view.get_by_role("button", name="Resume session")).to_be_enabled()
+
+    # Genuine stop + hard reload, still inside the 45s creation window:
+    # drop the runner, wait for the server to observe it offline, reload.
+    # The fresh-session startup grace must not mask the stopped UI.
+    os.kill(int(_server_state["runner_pid"]), signal.SIGKILL)
+    try:
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            health = httpx.get(
+                f"{base_url}/health", params={"session_ids": session_id}, timeout=5.0
+            )
+            if (
+                health.status_code == 200
+                and not health.json()["sessions"][session_id]["runner_online"]
+            ):
+                break
+            time.sleep(0.5)
+        else:
+            raise AssertionError("server never observed the runner offline")
+
+        page.reload()
+
+        expect(terminal_button).to_be_enabled()
+        if terminal_button.get_attribute("aria-pressed") != "true":
+            terminal_button.click()
+        expect(terminal_button).to_have_attribute("aria-pressed", "true")
+        expect(terminal_view).to_be_visible()
+        expect(terminal_view).to_contain_text("The harness is not running.")
+        expect(terminal_view.get_by_role("button", name="Resume session")).to_be_enabled()
+        expect(terminal_view.get_by_role("status")).to_have_count(0)
+    finally:
+        _recover_shared_runner()
+
+
+def test_starting_terminal_view_shows_loading_without_resume(
+    page: Page, terminal_session: tuple[str, str]
+) -> None:
+    """A starting terminal-first session shows a passive loading state, not Resume.
+
+    Models the cold boot of a brand-new terminal-first session: the PTY
+    inventory is still empty, the health poll reports the runner down
+    (the poll can beat the boot's registration), and the session snapshot
+    carries the runner's authoritative ``terminal_pending`` — the signal
+    that distinguishes a cold-booting session from a genuinely stopped
+    one (identical otherwise: fresh, runner down, empty inventory). The
+    view must render the passive startup status and must NOT offer the
+    stopped-session Resume action.
+    """
+    base_url, session_id = terminal_session
+
+    # Pin the cold-boot shape deterministically: freshly created (inside
+    # the startup grace) with the runner down on every liveness carrier.
+    created = int(time.time()) - 20
+
+    terminal_list = re.compile(rf"/v1/sessions/{re.escape(session_id)}/resources/terminals\?.*")
+    page.route(
+        terminal_list,
+        lambda route: route.fulfill(
+            status=200,
+            content_type="application/json",
+            body='{"data":[],"first_id":null,"last_id":null,"has_more":false}',
+        ),
+    )
+    page.route(
+        re.compile(r"/health\?session_ids="),
+        lambda route: route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps(
+                {"sessions": {session_id: {"runner_online": False, "host_online": True}}}
+            ),
+        ),
+    )
+    # Silence the two live channels (the real runner IS online with a real
+    # PTY): an open stream or socket push would leak it past the mocks.
+    page.route(f"**/v1/sessions/{session_id}/stream*", lambda route: route.abort())
+    page.route_web_socket(re.compile(r"/v1/sessions/updates"), lambda ws: None)
+
+    # The sidebar list's HTTP rows also carry runner_online; rewrite this
+    # session's row so every liveness source agrees the runner is down.
+    def _patch_conversation_rows(route):
+        resp = route.fetch()
+        body = resp.json()
+        for row in body.get("data", []):
+            if row.get("id") == session_id:
+                row["runner_online"] = False
+                row["created_at"] = created
+        route.fulfill(response=resp, json=body)
+
+    page.route(re.compile(r"/v1/sessions\?"), _patch_conversation_rows)
+
+    # The single-session snapshot (a directly-opened /c/{id}) carries the
+    # cold-boot timestamp AND the runner's authoritative terminal_pending —
+    # the creating-the-PTY signal a loading terminal view keys on.
+    def _patch_snapshot(route):
+        resp = route.fetch()
+        body = resp.json()
+        body["created_at"] = created
+        body["terminal_pending"] = True
+        route.fulfill(response=resp, json=body)
+
+    page.route(re.compile(rf"/v1/sessions/{re.escape(session_id)}(\?|$)"), _patch_snapshot)
+
+    terminal_first = httpx.patch(
+        f"{base_url}/v1/sessions/{session_id}",
+        json={"labels": {"omnigent.ui": "terminal"}},
+        timeout=10.0,
+    )
+    terminal_first.raise_for_status()
+
+    page.goto(f"{base_url}/c/{session_id}")
+
+    terminal_button = page.get_by_test_id("view-mode-terminal")
+    expect(terminal_button).to_be_enabled()
+    terminal_button.click()
+    expect(terminal_button).to_have_attribute("aria-pressed", "true")
+
+    terminal_view = page.locator('[data-testid="main-terminal-view"][data-visible="true"]')
+    expect(terminal_view).to_be_visible()
+    # The passive startup status is announced (role=status) and carries no
+    # actionable stopped-session UI: no "harness is not running", no Resume.
+    expect(terminal_view.get_by_role("status")).to_contain_text("Starting up…")
+    expect(terminal_view).not_to_contain_text("The harness is not running.")
+    expect(terminal_view.get_by_role("button", name="Resume session")).to_have_count(0)
+
+
+def test_stopped_terminal_view_keeps_resume(page: Page, terminal_session: tuple[str, str]) -> None:
+    """Failed automatic recovery leaves a stopped session's Resume action."""
+    base_url, session_id = terminal_session
+
+    # Outside the grace window (created an hour ago), runner down.
+    created = int(time.time()) - 3600
+
+    terminal_list = re.compile(rf"/v1/sessions/{re.escape(session_id)}/resources/terminals\?.*")
+    page.route(
+        terminal_list,
+        lambda route: route.fulfill(
+            status=200,
+            content_type="application/json",
+            body='{"data":[],"first_id":null,"last_id":null,"has_more":false}',
+        ),
+    )
+    page.route(
+        re.compile(r"/health\?session_ids="),
+        lambda route: route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps(
+                {"sessions": {session_id: {"runner_online": False, "host_online": True}}}
+            ),
+        ),
+    )
+    # Silence the same two live channels as the startup-gap test (see there
+    # for why each is needed).
+    page.route(f"**/v1/sessions/{session_id}/stream*", lambda route: route.abort())
+    page.route_web_socket(re.compile(r"/v1/sessions/updates"), lambda ws: None)
+
+    retry_payloads = []
+
+    def _fail_retry(route):
+        payload = route.request.post_data_json
+        if payload.get("type") != "retry_session":
+            route.continue_()
+            return
+        retry_payloads.append(payload)
+        route.fulfill(status=503, json={"detail": "Terminal reconnect failed"})
+
+    page.route(f"**/v1/sessions/{session_id}/events", _fail_retry)
+
+    # Every liveness carrier agrees: runner offline, created long past the
+    # cold-boot grace.
+    def _patch_conversation_rows(route):
+        resp = route.fetch()
+        body = resp.json()
+        for row in body.get("data", []):
+            if row.get("id") == session_id:
+                row["runner_online"] = False
+                row["created_at"] = created
+        route.fulfill(response=resp, json=body)
+
+    page.route(re.compile(r"/v1/sessions\?"), _patch_conversation_rows)
+
+    def _patch_snapshot(route):
+        resp = route.fetch()
+        body = resp.json()
+        body["created_at"] = created
+        route.fulfill(response=resp, json=body)
+
+    page.route(re.compile(rf"/v1/sessions/{re.escape(session_id)}(\?|$)"), _patch_snapshot)
+
+    terminal_first = httpx.patch(
+        f"{base_url}/v1/sessions/{session_id}",
+        json={"labels": {"omnigent.ui": "terminal"}},
+        timeout=10.0,
+    )
+    terminal_first.raise_for_status()
+
+    page.goto(f"{base_url}/c/{session_id}")
+
+    terminal_button = page.get_by_test_id("view-mode-terminal")
+    expect(terminal_button).to_be_enabled()
+    terminal_button.click()
+    expect(terminal_button).to_have_attribute("aria-pressed", "true")
+
+    terminal_view = page.locator('[data-testid="main-terminal-view"][data-visible="true"]')
+    expect(terminal_view).to_be_visible()
+    expect(terminal_view.get_by_role("alert")).to_have_text(
+        "Couldn't reconnect the terminal automatically."
+    )
+    expect(terminal_view).to_contain_text("The harness is not running.")
+    expect(terminal_view.get_by_role("button", name="Resume session")).to_be_enabled()
+    expect(terminal_view.get_by_role("status")).to_have_count(0)
+    assert retry_payloads == [{"type": "retry_session", "data": {}}]
+
+
+def test_failed_terminal_view_surfaces_runner_failure_cause(
+    page: Page, terminal_session: tuple[str, str]
+) -> None:
+    """A failed terminal-first session surfaces its failure cause on Terminal.
+
+    When the runner fails to start (``runner_failed_to_start`` recorded as a
+    session-level ``last_task_error`` with no transcript item), the Terminal
+    view must tell the user why — the same actionable cause the Chat view
+    surfaces via its error pill — so a user who defaults to Terminal can
+    tell the session failed and why.
+    """
+    base_url, session_id = terminal_session
+
+    # Outside the cold-boot grace, runner down — and the launch failed with a
+    # persisted, actionable cause (mirrors the Chat view's last_task_error).
+    created = int(time.time()) - 3600
+    failure = {
+        "code": "runner_failed_to_start",
+        "message": (
+            "runner process exited before connecting; "
+            "host authentication failed (run `omnigent login`)"
+        ),
+    }
+
+    terminal_list = re.compile(rf"/v1/sessions/{re.escape(session_id)}/resources/terminals\?.*")
+    page.route(
+        terminal_list,
+        lambda route: route.fulfill(
+            status=200,
+            content_type="application/json",
+            body='{"data":[],"first_id":null,"last_id":null,"has_more":false}',
+        ),
+    )
+    page.route(
+        re.compile(r"/health\?session_ids="),
+        lambda route: route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps(
+                {"sessions": {session_id: {"runner_online": False, "host_online": True}}}
+            ),
+        ),
+    )
+    # Silence the live channels so the real online runner never leaks past the
+    # mocks (same reason as the stopped-session test above).
+    page.route(f"**/v1/sessions/{session_id}/stream*", lambda route: route.abort())
+    page.route_web_socket(re.compile(r"/v1/sessions/updates"), lambda ws: None)
+
+    retry_payloads = []
+
+    def _fail_retry(route):
+        payload = route.request.post_data_json
+        if payload.get("type") != "retry_session":
+            route.continue_()
+            return
+        retry_payloads.append(payload)
+        route.fulfill(status=503, json={"detail": "Terminal reconnect failed"})
+
+    page.route(f"**/v1/sessions/{session_id}/events", _fail_retry)
+
+    def _patch_conversation_rows(route):
+        resp = route.fetch()
+        body = resp.json()
+        for row in body.get("data", []):
+            if row.get("id") == session_id:
+                row["runner_online"] = False
+                row["created_at"] = created
+                row["status"] = "failed"
+                row["last_task_error"] = failure
+        route.fulfill(response=resp, json=body)
+
+    page.route(re.compile(r"/v1/sessions\?"), _patch_conversation_rows)
+
+    def _patch_snapshot(route):
+        resp = route.fetch()
+        body = resp.json()
+        body["created_at"] = created
+        body["status"] = "failed"
+        body["last_task_error"] = failure
+        route.fulfill(response=resp, json=body)
+
+    page.route(re.compile(rf"/v1/sessions/{re.escape(session_id)}(\?|$)"), _patch_snapshot)
+
+    terminal_first = httpx.patch(
+        f"{base_url}/v1/sessions/{session_id}",
+        json={"labels": {"omnigent.ui": "terminal"}},
+        timeout=10.0,
+    )
+    terminal_first.raise_for_status()
+
+    page.goto(f"{base_url}/c/{session_id}")
+
+    terminal_button = page.get_by_test_id("view-mode-terminal")
+    expect(terminal_button).to_be_enabled()
+    terminal_button.click()
+    expect(terminal_button).to_have_attribute("aria-pressed", "true")
+
+    terminal_view = page.locator('[data-testid="main-terminal-view"][data-visible="true"]')
+    expect(terminal_view).to_be_visible()
+    expect(terminal_view.get_by_role("alert")).to_have_text(
+        "Couldn't reconnect the terminal automatically."
+    )
+    expect(terminal_view).to_contain_text("The harness is not running.")
+    expect(terminal_view.get_by_role("button", name="Resume session")).to_be_enabled()
+    assert retry_payloads == [{"type": "retry_session", "data": {}}]
+
+    # The persisted failure cause must be visible, mirroring the Chat error pill.
+    expect(terminal_view).to_contain_text("host authentication failed")
 
 
 def test_shell_wheel_scroll_reaches_mouse_tracking_program(
@@ -199,6 +609,50 @@ def test_shell_wheel_scroll_reaches_mouse_tracking_program(
     )
 
 
+_CURSOR_POSITION_REPORT = re.compile(rb"\x1b\[\d+;\d+R")
+
+
+def _cursor_position_reports(log: Path) -> int:
+    """Count the cursor position reports a shell program has read so far."""
+    return len(_CURSOR_POSITION_REPORT.findall(log.read_bytes())) if log.exists() else 0
+
+
+def test_shell_program_gets_one_reply_to_a_cursor_position_query(
+    page: Page, terminal_session: tuple[str, str], tmp_path: Path
+) -> None:
+    """A program's cursor position query gets exactly one answer.
+
+    PowerShell asks for the cursor position on every prompt. tmux answers, but
+    control mode also forwards the raw query to the browser's xterm, and a
+    second answer from there reaches the program as typed input: ``28;1R`` at
+    the prompt. Like the wheel test, a program writes the query from a raw tty
+    and records its stdin to an absolute ``tmp_path`` file. Which queries the
+    browser still answers is covered by ``TerminalQueryReplies.test.ts``.
+    """
+    base_url, session_id = terminal_session
+    log = tmp_path / "replies.log"
+
+    page.goto(f"{base_url}/c/{session_id}")
+    _open_new_shell(page)
+
+    terminal_view = page.get_by_test_id("terminal-view").last
+    expect(terminal_view).to_be_visible(timeout=60_000)
+    expect(terminal_view).to_have_attribute("data-state", "connected", timeout=20_000)
+
+    textarea = terminal_view.locator("textarea.xterm-helper-textarea")
+    textarea.focus()
+    page.keyboard.type(f"stty raw -echo; printf '\\e[6n'; cat > '{log}'")
+    page.keyboard.press("Enter")
+
+    poll_until(lambda: _cursor_position_reports(log) >= 1, timeout_s=15)
+    # A duplicate from the browser trails tmux's reply by a WebSocket round trip.
+    page.wait_for_timeout(1_500)  # custom-lint: disable=sleep-then-assert -- duplicate window
+    reports = _cursor_position_reports(log)
+    assert reports == 1, (
+        f"expected one cursor position report, got {reports} (log: {log.read_bytes()[:200]!r})"
+    )
+
+
 def test_workspace_rail_preserves_outer_top_inset(
     page: Page, terminal_session: tuple[str, str]
 ) -> None:
@@ -222,4 +676,69 @@ def test_workspace_rail_preserves_outer_top_inset(
     assert rail_top < header_bottom, (
         f"workspace rail top {rail_top}px vs header bottom {header_bottom}px "
         "— expected the rail to extend beside the header"
+    )
+
+
+def test_shell_inventory_refreshes_after_provisioning(
+    page: Page, terminal_session: tuple[str, str]
+) -> None:
+    """A cached server fallback must give way to the ready host's shell inventory."""
+    base_url, session_id = terminal_session
+    ready = False
+
+    def agent_inventory(route):
+        response = route.fetch()
+        body = response.json()
+        body["terminals"] = ["zsh"] if ready else ["bash"]
+        route.fulfill(response=response, json=body)
+
+    page.route(
+        re.compile(rf"/v1/sessions/{re.escape(session_id)}/agent(?:\?|$)"),
+        agent_inventory,
+    )
+    # Isolate the provisioning event from unrelated host-list notifications.
+    page.route_web_socket(re.compile(r"/v1/sessions/updates"), lambda ws: None)
+    page.add_init_script(
+        """
+        (() => {
+          const originalFetch = window.fetch.bind(window);
+          window.fetch = (input, init) => {
+            const url = typeof input === "string" ? input : input.url;
+            if (url.includes("/stream")) {
+              const stream = new ReadableStream({
+                start(controller) {
+                  window.emitSandboxReady = (id) => {
+                    const data = JSON.stringify({
+                      conversation_id: id, stage: "ready", error: null
+                    });
+                    controller.enqueue(new TextEncoder().encode(
+                      "event: session.sandbox_status\\ndata: " + data + "\\n\\n"
+                    ));
+                  };
+                }
+              });
+              return Promise.resolve(new Response(stream, {
+                headers: {"Content-Type": "text/event-stream"}
+              }));
+            }
+            return originalFetch(input, init);
+          };
+        })();
+        """
+    )
+    page.goto(f"{base_url}/c/{session_id}")
+    open_right_rail(page)
+    rail = page.get_by_role("complementary", name="Workspace")
+    rail.get_by_role("button", name="Open new").click()
+    expect(page.get_by_role("menuitem", name="Shell (bash)", exact=True)).to_be_visible()
+    page.keyboard.press("Escape")
+    page.wait_for_function("typeof window.emitSandboxReady === 'function'")
+
+    ready = True
+    page.evaluate("(id) => window.emitSandboxReady(id)", session_id)
+    rail.get_by_role("button", name="Open new").click()
+    expect(page.get_by_role("menuitem", name="Shell (zsh)", exact=True)).to_be_visible()
+    page.get_by_role("menuitem", name="Shell (zsh)", exact=True).click()
+    expect(rail.get_by_role("button", name=re.compile(r"^Close zsh · u-"))).to_be_visible(
+        timeout=60_000
     )

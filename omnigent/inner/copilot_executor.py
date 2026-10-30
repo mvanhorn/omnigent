@@ -66,7 +66,8 @@ from pathlib import Path
 from typing import Any, Protocol, TypeAlias
 
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
-from omnigent.reasoning_effort import COPILOT_EFFORTS, validate_effort
+from omnigent.runtime.mcp_tool_result import decode_mcp_image_result
+from omnigent.util.reasoning_effort import COPILOT_EFFORTS, validate_effort
 
 from .datamodel import OSEnvSpec
 from .executor import (
@@ -97,6 +98,15 @@ ToolExecutor: TypeAlias = Callable[[str, dict[str, Any]], Awaitable[Any]]  # typ
 # honors (``copilot login --help``): a fine-grained PAT with the "Copilot
 # Requests" permission, or an OAuth token from the gh / Copilot CLI app.
 GITHUB_TOKEN_ENV_VARS = ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN")
+
+# The Copilot CLI's GHE hostname override (``copilot help environment``). Spelled
+# here rather than imported from ``omnigent.onboarding.copilot_auth``: onboarding
+# pulls in the secret store / keyring, which this path imports lazily. A test
+# pins the two spellings equal.
+COPILOT_HOST_ENV_VAR = "COPILOT_GH_HOST"
+
+# The user's ambient host, captured before we ever write the var ourselves.
+_AMBIENT_HOST = os.environ.get(COPILOT_HOST_ENV_VAR) or None
 
 # Upper bound (seconds) on one ``send_and_wait``. The SDK default is 60s, far
 # too short for an agentic turn (sub-agent dispatches, long tool calls), so we
@@ -236,15 +246,18 @@ def _build_copilot_prompt(messages: list[Message], *, is_first_turn: bool) -> st
 def _encode_tool_result(result: object) -> object:
     """Encode a bridged-tool result as a :class:`copilot.ToolResult`.
 
-    A dict carrying a truthy ``error`` or ``blocked`` is a dispatch failure or a
-    policy block (the shapes ``_bridge_one_dispatch`` / the policy layer return):
-    surface it as a ``failure`` result so the Copilot model sees the failure —
-    parity with the claude-sdk / cursor handlers. Everything else is a success:
-    a ``str`` is passed through; anything else is JSON-encoded.
+    Top-level dispatch failures, policy blocks, and errored image envelopes
+    surface as failures. Payloads remain text-only: strings pass through and
+    other values are JSON-encoded, preserving the complete tool evidence.
     """
     from copilot import ToolResult  # lazy: optional dependency
 
-    if isinstance(result, dict) and (result.get("error") or result.get("blocked")):
+    image_result = decode_mcp_image_result(result)
+    if isinstance(result, dict) and (
+        result.get("error")
+        or result.get("blocked")
+        or (image_result is not None and image_result.is_error)
+    ):
         text = json.dumps(result, default=str)
         return ToolResult(text_result_for_llm=text, result_type="failure", error=text)
     if isinstance(result, str):
@@ -300,6 +313,7 @@ class CopilotExecutor(Executor):
         os_env: OSEnvSpec | None = None,
         model: str | None = None,
         github_token: str | None = None,
+        github_host: str | None = None,
         bundle_dir: Path | None = None,
         agent_name: str | None = None,
         skills_filter: str | list[str] = "all",
@@ -314,7 +328,10 @@ class CopilotExecutor(Executor):
             gateway-routed id or ``None`` falls back to Copilot's auto-select.
         :param github_token: GitHub token carrying Copilot access. ``None``
             falls back to ``COPILOT_GITHUB_TOKEN`` / ``GH_TOKEN`` /
-            ``GITHUB_TOKEN`` in the environment.
+            ``GITHUB_TOKEN`` in the environment, then the ``gh`` CLI login.
+        :param github_host: GitHub Enterprise hostname (e.g. ``"acme.ghe.com"``)
+            to authenticate against. ``None`` falls back to the configured
+            ``copilot.github_host``, then Copilot's default ``github.com``.
         :param bundle_dir: Reserved for future skill wiring; unused in v1.
         :param agent_name: Optional agent name (reserved for parity).
         :param skills_filter: Accepted for parity; copilot has no skill
@@ -323,7 +340,9 @@ class CopilotExecutor(Executor):
         self._cwd = cwd or (os_env.cwd if os_env is not None else None)
         self._os_env_spec = os_env
         self._model_override = model
-        self._github_token = github_token or _ambient_github_token()
+        # Resolved before the token: a GHE user's token must come from that host.
+        self._github_host = github_host or _configured_github_host()
+        self._github_token = github_token or _ambient_github_token(self._github_host)
         self._bundle_dir = bundle_dir
         self._agent_name = agent_name
         self._skills_filter = skills_filter
@@ -519,6 +538,16 @@ class CopilotExecutor(Executor):
         # must be absolute"), and a spec / os_env can hand us a relative cwd
         # (e.g. ``.``), so always resolve to an absolute path.
         cwd = os.path.abspath(self._cwd or os.getcwd())
+        # A GHE hostname reaches the bundled CLI only as an env var; the SDK has
+        # no host parameter. Set it in our own environment rather than passing
+        # ``env=`` — the SDK inherits ``os.environ`` only when ``env`` is None,
+        # so handing it a dict would strip everything else from the subprocess.
+        # Assign both ways so a hostless executor can't inherit a host another
+        # one left behind.
+        if self._github_host:
+            os.environ[COPILOT_HOST_ENV_VAR] = self._github_host
+        else:
+            os.environ.pop(COPILOT_HOST_ENV_VAR, None)
         client = CopilotClient(
             github_token=self._github_token,
             working_directory=cwd,
@@ -749,7 +778,8 @@ class CopilotExecutor(Executor):
             final_event = send_task.result()
         except asyncio.CancelledError:
             raise
-        except Exception as exc:  # noqa: BLE001 — the SDK turn failed mid-stream
+        except Exception as exc:
+            logger.exception("copilot-sdk turn failed mid-stream")
             await self.close_session(session_key)
             yield ExecutorError(message=f"copilot-sdk turn failed: {exc}", retryable=True)
             return
@@ -846,13 +876,38 @@ class CopilotExecutor(Executor):
 # ---------------------------------------------------------------------------
 
 
-def _ambient_github_token() -> str | None:
-    """Return the first set ambient GitHub token, in CLI precedence order."""
+def _ambient_github_token(host: str | None = None) -> str | None:
+    """Return an ambient GitHub token: env vars first, then the ``gh`` CLI login.
+
+    The env vars come first because the Copilot CLI honors them in this same
+    precedence. The ``gh`` fallback covers the common "I ran ``gh auth login``"
+    case: Copilot only picks a ``gh`` login up by reading ``oauth_token`` from
+    ``~/.config/gh/hosts.yml``, which is absent whenever ``gh`` stores the token
+    in an OS keychain instead (the default on macOS).
+
+    :param host: GHE hostname whose ``gh`` token to fetch; ``None`` resolves the
+        configured host, so a GHE user's token comes from their own instance.
+    """
     for var in GITHUB_TOKEN_ENV_VARS:
         value = os.environ.get(var)
         if value:
             return value
-    return None
+    from omnigent.onboarding.copilot_auth import gh_cli_github_token
+
+    return gh_cli_github_token(host if host is not None else _configured_github_host())
+
+
+def _configured_github_host() -> str | None:
+    """Return the configured GHE hostname: env var first, then the config block.
+
+    Reads the *ambient* env var captured at import, not the live one — the
+    executor writes ``COPILOT_HOST_ENV_VAR`` to hand the host to the bundled CLI,
+    and reading that back would let one executor's host leak into a later
+    hostless one.
+    """
+    from omnigent.onboarding.copilot_auth import copilot_github_host
+
+    return _AMBIENT_HOST or copilot_github_host()
 
 
 def _coerce_args(raw: Any) -> dict[str, Any]:  # type: ignore[explicit-any]

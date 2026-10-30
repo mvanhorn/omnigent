@@ -10,7 +10,7 @@ single source of truth). See ``tests/e2e_ui/visual/README.md`` for how to update
 the baseline (label the PR, or regenerate locally with Docker).
 
 The test is marked ``@pytest.mark.visual`` so the main e2e_ui suite (which runs
-on the unpinned ``ubuntu-latest``) excludes it via ``-m 'not visual'``; only the
+on the standard runner image) excludes it via ``-m 'not visual'``; only the
 dedicated pinned gate runs it.
 
 Determinism strategy -- mock every HTTP call the landing makes:
@@ -106,6 +106,10 @@ def test_empty_landing_matches_baseline(
     # Wait for the async-populated regions to settle into their loaded state: the
     # agent picker (catalog resolved) and the sidebar session list.
     expect(page.get_by_test_id("new-chat-landing-agent-select")).to_be_visible(timeout=30_000)
+    expect(page.get_by_test_id("new-chat-landing-agent-select")).to_have_attribute(
+        "aria-label", "Claude Code, unavailable", timeout=30_000
+    )
+    expect(page.get_by_test_id("new-chat-landing-workspace-chip")).to_be_visible()
     # `.first`: an expanded project with no chats renders the same empty-state
     # copy, so don't depend on this being the only match.
     expect(page.get_by_text("No sessions").first).to_be_visible(timeout=30_000)

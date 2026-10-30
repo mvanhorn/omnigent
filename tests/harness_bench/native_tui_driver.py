@@ -27,7 +27,7 @@ from omnigent.host.daemon_launch import (
     wait_for_host_online,
     wait_for_runner_online,
 )
-from omnigent.native_terminal import bind_session_runner
+from omnigent.native.native_terminal import bind_session_runner
 from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
 from tests._helpers.compat import apply_runner_env, compat_runner_cwd, runner_executable
 from tests._helpers.live_server import find_free_port
@@ -191,6 +191,27 @@ def native_vendor(harness: str) -> NativeVendor | None:
     )
 
 
+def requires_gateway(profile: BenchProfile) -> bool:
+    """
+    Whether running *profile* needs OpenAI-compatible gateway credentials.
+
+    An own_auth vendor logs its own model in through its CLI, so the resolved
+    creds are never consumed — ``_provision`` only routes a model through the
+    gateway ``when not vendor.own_auth``. Requiring them anyway skips every
+    own_auth native for a contributor with no Databricks or OpenAI account.
+
+    Callers outside this module use it too, so the rule lives in one place: a
+    second copy is a second thing to update when a vendor's auth model changes.
+
+    :param profile: The harness under test.
+    :returns: ``True`` unless the profile is a native-tui harness whose vendor
+        authenticates itself. Anything this module does not recognise needs the
+        gateway, since that is the safe answer.
+    """
+    vendor = native_vendor(profile.harness)
+    return vendor is None or not vendor.own_auth
+
+
 class NativeTuiDriver:
     """Drive a native-tui harness through a live server + host daemon.
 
@@ -199,9 +220,13 @@ class NativeTuiDriver:
     to come online, and creates a native session bound to that host. The
     ``run_*`` methods drive turns over the same HTTP surface the full-server
     driver uses; the runner mirrors them into the tmux vendor TUI.
+
+    This transport does not accept a model override: ``_provision`` creates
+    the session without one, and the vendor CLI keeps its own model.
     """
 
     transport = "native-tui"
+    applied_model_override = False
 
     def __init__(self, profile: BenchProfile, *, databricks_profile: str | None) -> None:
         self._profile = profile
@@ -223,7 +248,9 @@ class NativeTuiDriver:
         vendor = native_vendor(profile.harness)
         if vendor is None:
             return f"{profile.harness!r} is not a native-tui harness"
-        creds_skip = bench_creds_skip_reason(databricks_profile)
+        creds_skip = bench_creds_skip_reason(
+            databricks_profile, require_gateway=requires_gateway(profile)
+        )
         if creds_skip is not None:
             return creds_skip
         binary = profile.cli_binary
@@ -275,7 +302,9 @@ class NativeTuiDriver:
         self._base_url = f"http://localhost:{port}"
         binding_token = uuid.uuid4().hex
 
-        self._resolved_env = resolve_bench_env(self._db_profile)
+        self._resolved_env = resolve_bench_env(
+            self._db_profile, require_gateway=not self._vendor.own_auth
+        )
         base_env = {
             **self._resolved_env.base_env,
             "OMNIGENT_RUNNER_TUNNEL_TOKEN": binding_token,

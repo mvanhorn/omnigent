@@ -8,7 +8,13 @@ loops, no file I/O.
 The expression receives the full ``PolicyEvent`` dict as an
 ``event`` variable and must return a map with a ``result`` key
 (``"DENY"``, ``"ASK"``, or ``"ALLOW"``) and an optional
-``"reason"`` key. Non-map returns abstain.
+``"reason"`` and/or ``"state_updates"`` key. Non-map returns abstain.
+``state_updates`` must be a list of maps shaped
+``{"key": string, "action": "set"|"increment"|"delete"|"append", "value": any}``.
+``value`` is required for ``set``, ``increment``, and ``append``, and ignored
+for ``delete``.
+Keys beginning with ``_policy_`` belong to the runtime and cannot be changed
+by CEL expressions.
 
 Register statically in an agent's YAML, or dynamically on a running
 session via the policy API.
@@ -57,11 +63,14 @@ CEL reference: https://cel.dev/overview/cel-overview
 
 from __future__ import annotations
 
+import functools
 import logging
+from collections.abc import Mapping, Sequence
 
 try:
     import celpy
     import celpy.celtypes
+    from celpy import Environment, Runner
     from celpy.adapter import json_to_cel
     from celpy.celparser import CELParseError
     from celpy.evaluation import CELEvalError
@@ -72,10 +81,15 @@ from omnigent.policies.schema import (
     PolicyCallable,
     PolicyEvent,
     PolicyResponse,
+    is_reserved_state_key,
     request_user_text,
 )
 
 _log = logging.getLogger(__name__)
+
+# Engines are rebuilt for every evaluation, so compiled programs are reused
+# across builds from a bounded cache. A multi-KB expression's AST is up to ~1 MB.
+_PROGRAM_CACHE_SIZE = 64
 
 
 def cel_policy(
@@ -87,8 +101,12 @@ def cel_policy(
 
     The expression must return a map with a ``result`` key
     (``"DENY"``, ``"ASK"``, or ``"ALLOW"``) and an optional
-    ``"reason"`` key. Returning ``None`` or a map without a
-    valid ``result`` abstains (ALLOW).
+    ``"reason"`` and/or ``"state_updates"`` key. Returning ``None``
+    or a map without a valid ``result`` abstains (ALLOW).
+    ``state_updates`` must be a list of maps shaped
+    ``{"key": string, "action": "set"|"increment"|"delete"|"append", "value": any}``.
+    ``value`` is required for ``set``, ``increment``, and ``append``,
+    and ignored for ``delete``.
 
     :param expression: CEL expression evaluated per policy event.
         The ``event`` variable is the full
@@ -98,6 +116,11 @@ def cel_policy(
             event.type == "tool_call"
               ? {"result": "ASK", "reason": "Approve?"}
               : {"result": "ALLOW"}
+
+            {"result": "ALLOW",
+             "state_updates": [
+                 {"key": "call_count", "action": "increment", "value": 1}
+             ]}
 
     :param reason: Fallback reason for DENY/ASK results when
         the map omits a ``"reason"`` key, e.g.
@@ -112,16 +135,18 @@ def cel_policy(
             "Install it with: pip install cel-python"
         )
 
-    env = celpy.Environment()
+    # Environment() raises the recursion limit deep expressions need; cache
+    # hits skip it, so keep that side effect on every build.
+    Environment()
     try:
-        ast = env.compile(expression)
+        prog = _compile(expression)
     except CELParseError as exc:
         _log.warning("CEL compile error: %s", exc)
         raise ValueError(f"CEL policy: compile error in expression: {exc}") from exc
 
-    prog = env.program(ast)
     _result_key = celpy.celtypes.StringType("result")
     _reason_key = celpy.celtypes.StringType("reason")
+    _state_updates_key = celpy.celtypes.StringType("state_updates")
 
     def evaluate(event: PolicyEvent) -> PolicyResponse | None:
         # llm_client is a live object used by Python policy callables;
@@ -160,9 +185,69 @@ def cel_policy(
             out["reason"] = str(result[_reason_key])
         elif verdict != "ALLOW":
             out["reason"] = reason
+        if _state_updates_key in result:
+            state_updates = _plain_cel_value(result[_state_updates_key])
+            if not isinstance(state_updates, list):
+                raise TypeError("CEL policy: state_updates must be a list of maps.")
+            # Approval checkpoints may only be written by trusted runtime policies.
+            for update in state_updates:
+                if isinstance(update, dict):
+                    key = update.get("key")
+                    if isinstance(key, str) and is_reserved_state_key(key):
+                        raise ValueError("CEL policy: state_updates cannot change reserved keys.")
+            out["state_updates"] = state_updates  # type: ignore[typeddict-item]
         return out
 
     return evaluate
+
+
+@functools.lru_cache(maxsize=_PROGRAM_CACHE_SIZE)
+def _compile(expression: str) -> Runner:
+    """
+    Parse and program a CEL expression, memoised per process.
+
+    The interpreted runner is reentrant: each ``evaluate`` call builds its
+    own evaluator and activation and only reads the shared AST. Parse
+    errors are not cached, so invalid expressions raise on every call.
+
+    :param expression: CEL source text.
+    :returns: A runner ready to evaluate.
+    :raises CELParseError: If the expression has syntax errors.
+    """
+    env = Environment()
+    return env.program(env.compile(expression))
+
+
+def _plain_cel_value(value: object) -> object:
+    """
+    Convert CEL wrapper values back to JSON-like Python values.
+
+    :param value: A value returned from ``celpy`` evaluation.
+    :returns: A plain ``dict``/``list``/scalar value suitable for
+        :class:`FunctionPolicy` response coercion.
+    """
+    if celpy is not None:
+        if isinstance(value, celpy.celtypes.BoolType):
+            return bool(value)
+        if isinstance(value, celpy.celtypes.NullType):
+            return None
+        if isinstance(value, celpy.celtypes.StringType):
+            return str(value)
+        if isinstance(value, celpy.celtypes.BytesType):
+            return bytes(value)
+        if isinstance(value, (celpy.celtypes.IntType, celpy.celtypes.UintType)):
+            return int(value)
+        if isinstance(value, celpy.celtypes.DoubleType):
+            return float(value)
+    if isinstance(value, Mapping):
+        return {str(_plain_cel_value(k)): _plain_cel_value(v) for k, v in value.items()}
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value)
+    if isinstance(value, Sequence):
+        return [_plain_cel_value(item) for item in value]
+    return value
 
 
 # ── Registry ─────────────────────────────────────────────────────────────────
@@ -179,7 +264,10 @@ POLICY_REGISTRY: list[dict[str, object]] = (
                 "Evaluate a CEL (Common Expression Language) expression against "
                 "every policy event. The expression receives the full event as "
                 '`event` and must return a map with `result` ("DENY", "ASK", or '
-                '"ALLOW") and optional `reason` keys. '
+                '"ALLOW") plus optional `reason` and/or `state_updates` keys. '
+                "`state_updates` must be a list of maps with `key`, `action`, "
+                'and `value`; valid actions are "set", "increment", "delete", '
+                'and "append". `value` is ignored for "delete". '
                 "CEL is non-Turing-complete and side-effect-free."
             ),
             "params_schema": {
@@ -190,7 +278,16 @@ POLICY_REGISTRY: list[dict[str, object]] = (
                         "description": (
                             "CEL expression. The `event` variable holds the PolicyEvent dict. "
                             "Must return a map: "
-                            '{"result": "DENY"|"ASK"|"ALLOW", "reason": "..."}. '
+                            '{"result": "DENY"|"ASK"|"ALLOW", "reason": "...", '
+                            '"state_updates": [...]}. '
+                            "`state_updates` must be a list of maps shaped "
+                            '{"key": string, "action": '
+                            '"set"|"increment"|"delete"|"append", "value": any}; '
+                            "`value` is required for set/increment/append and ignored "
+                            "for delete. "
+                            "Keys beginning with `_policy_` are reserved for the runtime. "
+                            "Attempting to update one denies the event and discards this "
+                            "CEL result's entire state-update list. "
                             "Event fields: "
                             'event.type ("request"|"tool_call"|"tool_result"|'
                             '"response"|"llm_request"|"llm_response"|"output_logged"); '

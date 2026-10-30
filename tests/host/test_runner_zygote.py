@@ -9,23 +9,40 @@ daemon's Popen fallback are all covered.
 
 from __future__ import annotations
 
+import contextlib
+import importlib.util
 import json
 import os
+import signal
+import socket
 import subprocess
 import sys
+import threading
 import time
+from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import pytest
 
+import omnigent
 from omnigent.host.runner_zygote import (
     _ZYGOTE_LOST_EXIT_CODE,
     ZygoteManager,
     ZygoteRunnerProc,
     ZygoteUnavailable,
 )
+from omnigent.inner import _proc
+from omnigent.runner import _zygote
 from omnigent.runner._zygote import (
     _ZYGOTE_TEST_CHILD_EXIT_ENV_VAR,
     _ZYGOTE_TEST_CHILD_SLEEP_ENV_VAR,
+    _disk_build_stamp,
+    _GraphStamp,
+    _package_source_stamps,
+    _source_file_stamps,
+    _source_files_match,
+    _ZygoteServer,
 )
 
 # The zygote is POSIX-only: these tests exercise os.fork() and pass_fds, which
@@ -77,6 +94,72 @@ def _wait_exit(proc: ZygoteRunnerProc, timeout: float = 10.0) -> int:
     raise AssertionError("forked runner did not exit in time")
 
 
+@pytest.mark.parametrize("pong", [True, False], ids=["ready", "failed-start"])
+def test_concurrent_start_waits_for_initial_ping(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pong: bool
+) -> None:
+    """Prewarming and launching must agree on whether startup actually succeeded."""
+    # A scripted subprocess covers a refused ping without importing the runner.
+    executable = tmp_path / "delayed-zygote"
+    executable.write_text(
+        f"#!{sys.executable}\n"
+        "import os, socket\n"
+        "sock = socket.socket(fileno=int(os.environ['OMNIGENT_RUNNER_ZYGOTE_CONTROL_FD']))\n"
+        "sock.recv(4096)\n"
+        f"sock.sendall({(json.dumps({'pong': pong}) + chr(10)).encode()!r})\n"
+        "while sock.recv(4096):\n"
+        "    pass\n"
+    )
+    executable.chmod(0o700)
+    manager = ZygoteManager(python_executable=str(executable), log_path=tmp_path / "zygote.log")
+    first_unlock = threading.Event()
+    continue_start = threading.Event()
+    control_lock = manager._lock
+
+    class PauseFirstUnlock:
+        """Force the competing start into the first control-lock release window."""
+
+        paused = False
+
+        def __enter__(self):
+            control_lock.acquire()
+
+        def __exit__(self, *_exc):
+            pause = not self.paused
+            self.paused = True
+            control_lock.release()
+            if pause:
+                first_unlock.set()
+                assert continue_start.wait(timeout=10)
+
+    monkeypatch.setattr(manager, "_lock", PauseFirstUnlock())
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(manager.start)
+        try:
+            assert first_unlock.wait(timeout=5)
+            second_entered = threading.Event()
+
+            def start_again() -> None:
+                second_entered.set()
+                manager.start()
+
+            second = pool.submit(start_again)
+            assert second_entered.wait(timeout=5)
+            with pytest.raises(TimeoutError):
+                second.result(timeout=0.05)
+            continue_start.set()
+            for started in (first, second):
+                if pong:
+                    started.result(timeout=5)
+                else:
+                    with pytest.raises(ZygoteUnavailable, match="did not answer ping"):
+                        started.result(timeout=5)
+            assert manager.is_running() is pong
+        finally:
+            continue_start.set()
+            manager.stop()
+
+
 def test_import_graph_is_single_threaded() -> None:
     """The runner import graph starts no threads — the fork-safety invariant.
 
@@ -88,10 +171,16 @@ def test_import_graph_is_single_threaded() -> None:
     probe = "\n".join(
         [
             "from omnigent.runner._zygote import _import_runner_graph",
+            "import sys",
             "import threading",
             "_import_runner_graph()",
             "print(threading.active_count())",
             "print([t.name for t in threading.enumerate()])",
+            "print(all(name in sys.modules for name in (",
+            "    'omnigent.runner.background_titles.claude_native',",
+            "    'omnigent.runner.background_titles.codex_native',",
+            "    'omnigent.runner.background_titles.sdk',",
+            ")))",
         ]
     )
     result = subprocess.run(
@@ -101,8 +190,196 @@ def test_import_graph_is_single_threaded() -> None:
         timeout=120,
     )
     assert result.returncode == 0, result.stderr
-    first_line = result.stdout.strip().splitlines()[0]
-    assert first_line == "1", result.stdout
+    lines = result.stdout.strip().splitlines()
+    assert lines[0] == "1", result.stdout
+    assert lines[-1] == "True", result.stdout
+
+
+def test_deferred_graph_keeps_the_zygote_single_threaded() -> None:
+    """The deferred graph (optional Databricks SDK) also starts no threads.
+
+    The zygote loads it after it starts serving, then keeps forking, so the
+    same fork-safety invariant applies. Checked in a fresh interpreter like
+    the eager graph above.
+    """
+    probe = "\n".join(
+        [
+            "import importlib.util",
+            "import sys",
+            "import threading",
+            "from omnigent.runner._zygote import _import_deferred_graph, _import_runner_graph",
+            "_import_runner_graph()",
+            "_import_deferred_graph()",
+            "print(threading.active_count())",
+            "has_sdk = importlib.util.find_spec('databricks.sdk') is not None",
+            "print(not has_sdk or 'databricks.sdk.config' in sys.modules)",
+        ]
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", probe],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stderr
+    lines = result.stdout.strip().splitlines()
+    assert lines[0] == "1", result.stdout
+    assert lines[-1] == "True", result.stdout
+
+
+def test_zygote_loads_the_deferred_graph_once_nothing_is_pending(monkeypatch) -> None:
+    """A request already waiting is answered first; the deferred import runs once after."""
+    order: list[str] = []
+    real_send = _zygote._send
+
+    def _record_send(conn: socket.socket, payload: dict) -> None:
+        order.append("reply")
+        real_send(conn, payload)
+
+    imported = threading.Event()
+
+    def _record_import() -> None:
+        order.append("import")
+
+    monkeypatch.setattr(_zygote, "_send", _record_send)
+    monkeypatch.setattr(_zygote, "_import_deferred_graph", _record_import)
+
+    def _record_thread_check() -> None:
+        order.append("thread-check")
+        imported.set()
+
+    monkeypatch.setattr(_zygote, "_exit_unless_single_threaded", _record_thread_check)
+    monkeypatch.setattr(_zygote.gc, "freeze", lambda: order.append("freeze"))
+
+    daemon_side, zygote_side = socket.socketpair()
+    daemon_side.sendall(b'{"cmd": "ping"}\n')
+    server = _ZygoteServer(zygote_side)
+    thread = threading.Thread(target=server.serve, daemon=True)
+    thread.start()
+    replies = daemon_side.makefile("r")
+    try:
+        assert json.loads(replies.readline()) == {"pong": True}
+        # A ping sent before the import finishes is (correctly) served first;
+        # wait so the second request deterministically lands after it.
+        assert imported.wait(timeout=5)
+        daemon_side.sendall(b'{"cmd": "ping"}\n')
+        assert json.loads(replies.readline()) == {"pong": True}
+    finally:
+        replies.close()
+        daemon_side.close()
+        thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    # The refreeze and fork-safety check run after the import, before any later fork.
+    assert order == ["reply", "import", "freeze", "thread-check", "reply"]
+
+
+def test_failed_deferred_preload_does_not_stop_the_zygote(monkeypatch) -> None:
+    """An optional preload that raises (e.g. an SDK OSError) leaves the zygote serving."""
+    import builtins
+
+    real_import = builtins.__import__
+
+    def _failing_import(name: str, *args, **kwargs):
+        if name == "databricks.sdk.config":
+            raise OSError("credential probe failed")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _failing_import)
+
+    _zygote._import_deferred_graph()  # must not raise
+
+
+def test_threaded_deferred_preload_preserves_children_and_refuses_new_forks(
+    tmp_path: Path,
+) -> None:
+    """Optional preload must not orphan existing runners when it becomes unsafe to fork."""
+    marker = tmp_path / "preloaded"
+    script = "\n".join(
+        [
+            "import os, socket, threading",
+            "from pathlib import Path",
+            "from omnigent.runner import _zygote as z",
+            "z._import_runner_graph()",
+            "z._exit_unless_single_threaded()",
+            "def preload_with_thread():",
+            "    stop = threading.Event()",
+            "    threading.Thread(target=stop.wait, name='optional-preload-worker', "
+            "daemon=True).start()",
+            f"    Path({str(marker)!r}).write_text(str(next(iter(server._live))))",
+            # The real server is the subject; the optional import is the fault boundary.
+            "z._import_deferred_graph = preload_with_thread",
+            "sock = socket.socket(fileno=int(os.environ[z.ZYGOTE_CONTROL_FD_ENV_VAR]))",
+            "server = z._ZygoteServer(sock)",
+            "server.serve()",
+        ]
+    )
+    client, server = socket.socketpair()
+    client.settimeout(10)
+    requests = [
+        {"cmd": "ping"},
+        {
+            "cmd": "fork",
+            "env": _sleep_env(60),
+            "cwd": str(tmp_path),
+            "log_path": str(tmp_path / "runner.log"),
+        },
+    ]
+    # Queue both requests before startup so a child exists before deferred loading.
+    client.sendall(b"".join(json.dumps(r).encode() + b"\n" for r in requests))
+    parent = subprocess.Popen(
+        [sys.executable, "-c", script],
+        env={**os.environ, _zygote.ZYGOTE_CONTROL_FD_ENV_VAR: str(server.fileno())},
+        pass_fds=(server.fileno(),),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    server.close()
+    replies = client.makefile("rb")
+    child_pid = None
+    child_reaped = False
+
+    def exchange(request: dict) -> dict:
+        client.sendall(json.dumps(request).encode() + b"\n")
+        line = replies.readline()
+        assert line, "forkserver exited while an existing runner still depended on it"
+        return json.loads(line)
+
+    try:
+        assert json.loads(replies.readline()) == {"pong": True}
+        child_pid = json.loads(replies.readline())["pid"]
+        deadline = time.monotonic() + 10
+        while not marker.exists():
+            assert time.monotonic() < deadline, "optional preload did not run"
+            time.sleep(0.01)
+        assert exchange({"cmd": "ping"}) == {"pong": True}
+        assert parent.poll() is None
+        assert exchange({"cmd": "poll", "pid": child_pid}) == {"returncode": None}
+        for command in ["fork", "fork_harness"]:
+            reply = exchange({"cmd": command, "env": _fork_env(0), "cwd": str(tmp_path)})
+            assert "single-threaded" in reply["error"]
+            assert "pid" not in reply
+        os.kill(child_pid, signal.SIGKILL)
+        deadline = time.monotonic() + 10
+        while (reply := exchange({"cmd": "poll", "pid": child_pid}))["returncode"] is None:
+            assert time.monotonic() < deadline, "existing child was not reaped"
+            time.sleep(0.01)
+        child_reaped = True
+        assert reply == {"returncode": -signal.SIGKILL}
+    finally:
+        if not child_reaped and child_pid is None and marker.exists():
+            child_pid = int(marker.read_text())
+        if not child_reaped and child_pid is not None:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(child_pid, signal.SIGKILL)
+        replies.close()
+        client.close()
+        try:
+            parent.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            parent.kill()
+            parent.wait(timeout=5)
 
 
 def test_manager_starts_and_pings(manager: ZygoteManager) -> None:
@@ -112,6 +389,89 @@ def test_manager_starts_and_pings(manager: ZygoteManager) -> None:
     """
     assert manager.is_running()
     assert isinstance(manager.pid, int)
+
+
+@pytest.fixture
+def managed_child() -> Iterator[tuple[ZygoteManager, subprocess.Popen[bytes]]]:
+    """A manager with a tiny direct child that exits when its stdin closes."""
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "import sys; sys.stdin.buffer.read(); sys.exit(7)"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    mgr = ZygoteManager()
+    mgr._proc = proc
+    try:
+        yield mgr, proc
+    finally:
+        assert proc.stdin is not None
+        proc.stdin.close()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
+
+
+def test_unreaped_pid_is_none_before_start() -> None:
+    """An unstarted manager has no child exit status to protect."""
+    mgr = ZygoteManager()
+    assert mgr.unreaped_pid is None
+    assert mgr.pid is None
+
+
+def test_unreaped_pid_collects_exit_and_preserves_status(managed_child) -> None:
+    """Polling stops protecting an exited child without losing its exit code."""
+    mgr, proc = managed_child
+    assert mgr.unreaped_pid == proc.pid
+    assert proc.returncode is None
+    assert proc.stdin is not None
+    proc.stdin.close()
+
+    deadline = time.monotonic() + 5
+    while mgr.unreaped_pid is not None:
+        assert time.monotonic() < deadline, "child did not exit in time"
+        time.sleep(0.01)
+
+    assert proc.returncode == 7
+    assert mgr.pid == proc.pid
+    assert mgr.unreaped_pid is None
+    assert proc.wait(timeout=0) == 7
+    with pytest.raises(ChildProcessError):
+        os.waitpid(proc.pid, os.WNOHANG)
+
+
+def test_unreaped_pid_does_not_use_control_lock_or_socket(managed_child, monkeypatch) -> None:
+    """The host can collect zygote exits even while its control channel is busy."""
+    mgr, proc = managed_child
+
+    class ForbiddenLock:
+        def __enter__(self):
+            pytest.fail("unreaped_pid must not acquire the control lock")
+
+        def __exit__(self, *_args):
+            pass
+
+    monkeypatch.setattr(mgr, "_lock", ForbiddenLock())
+    monkeypatch.setattr(
+        mgr, "_exchange", lambda _request: pytest.fail("unreaped_pid must not use the socket")
+    )
+    assert mgr.unreaped_pid == proc.pid
+
+
+def test_unreaped_pid_snapshots_process_during_stop(managed_child, monkeypatch) -> None:
+    """Concurrent shutdown cannot replace the Popen between its poll and pid read."""
+    mgr, proc = managed_child
+    original_poll = proc.poll
+
+    def poll_during_stop():
+        mgr._proc = None
+        return original_poll()
+
+    monkeypatch.setattr(proc, "poll", poll_during_stop)
+    assert mgr.unreaped_pid == proc.pid
+    assert mgr.pid is None
 
 
 def test_fork_runner_reports_pid_and_exit_code(manager: ZygoteManager, tmp_path) -> None:
@@ -196,6 +556,42 @@ def test_poll_after_stop_reports_live_runner_as_none(manager: ZygoteManager, tmp
         assert proc.poll() is None  # pid still alive -> honestly "still live"
     finally:
         proc.kill()
+
+
+@pytest.mark.parametrize("exit_before_restart", [False, True])
+def test_old_runner_exit_is_detected_after_zygote_restart(
+    manager: ZygoteManager, tmp_path: Path, exit_before_restart: bool
+) -> None:
+    """A new forkserver cannot supply exit status for the old one's children."""
+    proc = manager.fork_runner(_sleep_env(30), str(tmp_path / "old.log"), str(tmp_path))
+    manager.stop()
+    try:
+        if exit_before_restart:
+            proc.kill()
+        manager.start()
+        if not exit_before_restart:
+            assert proc.poll() is None
+            proc.kill()
+
+        deadline = time.monotonic() + 10
+        while _proc.process_alive(proc.pid):
+            assert time.monotonic() < deadline, "old runner did not exit"
+            time.sleep(0.01)
+        assert proc.poll() == _ZYGOTE_LOST_EXIT_CODE
+        assert proc.wait(timeout=1) == _ZYGOTE_LOST_EXIT_CODE
+
+        fresh = manager.fork_runner(_fork_env(7), str(tmp_path / "new.log"), str(tmp_path))
+        assert _wait_exit(fresh) == 7
+    finally:
+        proc.kill()
+
+
+def test_cached_runner_exit_survives_zygote_restart(manager: ZygoteManager, tmp_path) -> None:
+    proc = manager.fork_runner(_fork_env(3), str(tmp_path / "old.log"), str(tmp_path))
+    assert _wait_exit(proc) == 3
+    manager.stop()
+    manager.start()
+    assert proc.poll() == 3
 
 
 def test_fork_after_stop_raises_unavailable(manager: ZygoteManager, tmp_path) -> None:
@@ -334,6 +730,30 @@ def test_operator_malloc_override_wins_at_the_zygote_exec(monkeypatch, tmp_path)
     assert captured["MALLOC_ARENA_MAX"] == "16"
 
 
+def test_zygote_boots_from_inside_an_omnigent_checkout(monkeypatch, tmp_path) -> None:
+    """A daemon whose cwd holds an ``omnigent/`` package still starts a zygote.
+
+    The zygote inherits the daemon's cwd, which ``python -m`` would prepend to
+    ``sys.path``, so a daemon started inside an omnigent checkout would import
+    that checkout instead of the installed package. Booting against a poisoned
+    package proves the spawn keeps cwd off ``sys.path``.
+
+    :param monkeypatch: Fixture used to run from the poisoned directory.
+    :param tmp_path: Temp dir holding the poisoned package and the zygote log.
+    """
+    package = tmp_path / "omnigent"
+    package.mkdir()
+    (package / "__init__.py").write_text('raise ImportError("poisoned omnigent")\n')
+    monkeypatch.chdir(tmp_path)
+
+    mgr = ZygoteManager(log_path=tmp_path / "zygote.log")
+    mgr.start()
+    try:
+        assert mgr.is_running()
+    finally:
+        mgr.stop()
+
+
 # ── Harness-fork path (fork_harness) ──────────────────────────────
 #
 # The zygote also forks HARNESS children on request, sharing the harness import
@@ -434,6 +854,269 @@ def test_fork_harness_argv_round_trips_to_child(manager: ZygoteManager, tmp_path
     reply = _control_exchange(manager, {"cmd": "fork_harness", "argv": argv, "env": env})
     assert _wait_harness_exit(manager, reply["pid"]) == 0
     assert f"harness_argv={' '.join(argv)}" in log.read_text()
+
+
+def test_forked_harness_runs_in_the_session_workspace(manager: ZygoteManager, tmp_path) -> None:
+    """A harness fork chdirs to the session workspace, not the zygote's cwd.
+
+    The zygote inherits the daemon's start cwd — possibly a since-deleted
+    transient worktree — so a harness child that kept it would root every
+    ``os.getcwd()`` fallback in its executors at the FIRST dispatch's
+    directory. The payload env carries the session workspace; the child must
+    chdir there, matching what a directly-exec'd harness inherits from its
+    runner.
+
+    :param manager: The started manager fixture (cwd = the pytest process's).
+    :param tmp_path: Temp dir for the workspace and the harness child's log.
+    """
+    workspace = tmp_path / "session-workspace"
+    workspace.mkdir()
+    log = tmp_path / "harness.log"
+    env = {
+        "PATH": os.environ.get("PATH", ""),
+        _ZYGOTE_TEST_CHILD_EXIT_ENV_VAR: "0",
+        "OMNIGENT_PROCESS_LOG_FILE": str(log),
+        "OMNIGENT_RUNNER_WORKSPACE": str(workspace),
+    }
+    reply = _control_exchange(manager, {"cmd": "fork_harness", "argv": [], "env": env})
+    assert _wait_harness_exit(manager, reply["pid"]) == 0
+    assert f"harness_cwd={workspace.resolve()}\n" in log.read_text()
+
+
+def test_forked_harness_survives_a_missing_workspace(manager: ZygoteManager, tmp_path) -> None:
+    """A workspace that vanished between launch and fork must not kill the fork.
+
+    The chdir is best-effort, matching direct exec (which never validates the
+    workspace either): a deleted workspace leaves the child in the zygote's
+    cwd rather than crashing the harness, and the failure is surfaced in the
+    harness log so a wrong-cwd session is diagnosable.
+
+    :param manager: The started manager fixture.
+    :param tmp_path: Temp dir for the harness child's log.
+    """
+    log = tmp_path / "harness.log"
+    gone = tmp_path / "gone"
+    env = {
+        "PATH": os.environ.get("PATH", ""),
+        _ZYGOTE_TEST_CHILD_EXIT_ENV_VAR: "0",
+        "OMNIGENT_PROCESS_LOG_FILE": str(log),
+        "OMNIGENT_RUNNER_WORKSPACE": str(gone),
+    }
+    reply = _control_exchange(manager, {"cmd": "fork_harness", "argv": [], "env": env})
+    assert _wait_harness_exit(manager, reply["pid"]) == 0
+    text = log.read_text()
+    # The child stayed alive in the zygote's cwd — never the vanished one —
+    # and logged why.
+    assert "harness_cwd=" in text
+    assert f"harness_cwd={gone}\n" not in text
+    assert "cannot chdir to workspace" in text
+
+
+@pytest.mark.parametrize(
+    ("content", "expected"),
+    [
+        pytest.param(
+            'BUILD_TIME_EPOCH = 1754848860\nCOMMIT_SHA = "b703a28b"\n',
+            (1754848860.0, "b703a28b"),
+            id="generated",
+        ),
+        pytest.param(None, None, id="missing"),
+        pytest.param("BUILD_TIME_EPOCH = (\n", None, id="half-written"),
+        pytest.param('COMMIT_SHA = "b703a28b"\n', None, id="field-missing"),
+    ],
+)
+def test_disk_build_stamp_reads_the_on_disk_file(tmp_path, content, expected) -> None:
+    """``_disk_build_stamp`` parses the generated file; any failure reads as unknown.
+
+    :param tmp_path: Directory standing in for the installed package dir.
+    :param content: ``_build_info.py`` body, or ``None`` to leave it absent.
+    :param expected: The stamp the probe must return.
+    """
+    if content is not None:
+        (tmp_path / "_build_info.py").write_text(content)
+    assert _disk_build_stamp(package_dir=tmp_path) == expected
+
+
+def test_disk_build_stamp_resolves_package_dir_without_top_level_file(monkeypatch) -> None:
+    """The probe finds ``_build_info.py`` even when ``omnigent.__file__`` is None.
+
+    The zygote is spawned as ``python -m``, which puts the daemon's cwd on
+    sys.path, so a daemon started from a directory that holds an ``omnigent``
+    checkout binds the top-level name to a namespace package with no
+    ``__file__``. Reading it raised ``TypeError`` and killed the zygote at boot
+    before it served a single fork, so the probe keys off its own module path.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    probed: list[Path] = []
+    monkeypatch.setattr(omnigent, "__file__", None)
+    monkeypatch.setattr(
+        importlib.util,
+        "spec_from_file_location",
+        lambda name, location: probed.append(Path(location)),
+    )
+    assert _disk_build_stamp() is None
+    assert probed == [Path(_zygote.__file__).resolve().parents[1] / "_build_info.py"]
+
+
+def test_package_source_stamps_include_lazy_modules(tmp_path) -> None:
+    """The source baseline covers modules that the imported graph has not loaded."""
+    package_dir = tmp_path / "omnigent"
+    lazy_module = package_dir / "provider" / "lazy.py"
+    lazy_module.parent.mkdir(parents=True)
+    lazy_module.write_text("VALUE = 1\n")
+
+    stamps = _package_source_stamps(package_dir)
+
+    assert stamps is not None
+    assert [stamp.path for stamp in stamps] == [lazy_module]
+
+
+def test_source_stamps_ignore_metadata_only_changes(tmp_path) -> None:
+    """Permission changes do not force direct spawning when source is unchanged."""
+    source = tmp_path / "module.py"
+    source.write_text("VALUE = 1\n")
+    stamps = _source_file_stamps([source])
+    assert stamps is not None
+
+    source.chmod(source.stat().st_mode ^ 0o100)
+
+    assert _source_files_match(stamps)
+
+
+def test_source_stamp_capture_fails_closed_for_missing_file(tmp_path) -> None:
+    """An unreadable baseline is represented as incomplete rather than omitted."""
+    assert _source_file_stamps([tmp_path / "missing.py"]) is None
+
+
+def _dispatch_fork(
+    server: _ZygoteServer, conn: socket.socket, peer: socket.socket, cmd: str
+) -> dict:
+    """Dispatch one in-process fork request and return the reply.
+
+    :param server: The server under test.
+    :param conn: The socket end handed to the dispatcher.
+    :param peer: The other end, read for the reply.
+    :param cmd: ``"fork"`` (runner) or ``"fork_harness"``.
+    :returns: The decoded reply.
+    """
+    request = {"cmd": cmd, "argv": [], "env": {}}
+    server._dispatch(conn, json.dumps(request).encode("utf-8"))
+    return json.loads(peer.recv(65536).decode("utf-8"))
+
+
+@pytest.mark.parametrize(("cmd", "kind"), [("fork", "runner"), ("fork_harness", "harness")])
+def test_fork_refused_after_in_place_upgrade(monkeypatch, cmd, kind) -> None:
+    """A disk stamp differing from the boot stamp refuses the fork.
+
+    The child resolves its lazily-imported modules from the NEW on-disk files
+    against the OLD pre-imported graph. Both observed failures are this: a
+    harness missing ``describe_exception`` from an in-memory
+    ``omnigent.inner.executor`` that predates it, and a runner whose
+    ``create_app`` cannot import ``omnigent.cli_auth`` from the swapped-out
+    package directory. Refusing makes the caller fall back to a fresh
+    interpreter, which runs the new code coherently.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param cmd: The fork command under test.
+    :param kind: Child kind the error message must name.
+    """
+    daemon, daemon_peer = socket.socketpair()
+    conn, peer = socket.socketpair()
+    server = _ZygoteServer(
+        daemon,
+        graph_stamp=_GraphStamp(build=(1000.0, "oldsha"), sources=()),
+    )
+    monkeypatch.setattr(_zygote, "_disk_build_stamp", lambda: (2000.0, "newsha"))
+    monkeypatch.setattr(os, "fork", lambda: pytest.fail(f"must not fork a mixed-version {kind}"))
+    try:
+        reply = _dispatch_fork(server, conn, peer, cmd)
+        assert "changed on disk" in reply["error"]
+        assert kind in reply["error"]
+        assert server._live == set()
+    finally:
+        server._sel.close()
+        for sock in (daemon, daemon_peer, conn, peer):
+            sock.close()
+
+
+@pytest.mark.parametrize("cmd", ["fork", "fork_harness"])
+def test_fork_proceeds_while_disk_stamp_matches(monkeypatch, cmd) -> None:
+    """An unchanged disk stamp forks exactly as before the gate existed.
+
+    ``os.fork`` is faked to a pid so the assertion is purely about the gate
+    letting the request through to the fork path.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param cmd: The fork command under test.
+    """
+    daemon, daemon_peer = socket.socketpair()
+    conn, peer = socket.socketpair()
+    server = _ZygoteServer(
+        daemon,
+        graph_stamp=_GraphStamp(build=(1000.0, "sha"), sources=()),
+    )
+    monkeypatch.setattr(_zygote, "_disk_build_stamp", lambda: (1000.0, "sha"))
+    monkeypatch.setattr(os, "fork", lambda: 4242)
+    try:
+        reply = _dispatch_fork(server, conn, peer, cmd)
+        assert reply == {"pid": 4242}
+        assert 4242 in server._live
+    finally:
+        server._sel.close()
+        for sock in (daemon, daemon_peer, conn, peer):
+            sock.close()
+
+
+@pytest.mark.parametrize(("cmd", "kind"), [("fork", "runner"), ("fork_harness", "harness")])
+def test_fork_refused_after_source_change_with_stale_build_info(
+    monkeypatch, tmp_path, cmd, kind
+) -> None:
+    """Changed package source refuses a fork even when build metadata is stale."""
+    source = tmp_path / "service.py"
+    source.write_text("old = True\n")
+    graph_stamp = _GraphStamp(
+        build=(1000.0, "stale-sha"),
+        sources=_source_file_stamps([source]),
+    )
+    source.write_text("new = True\n")
+
+    daemon, daemon_peer = socket.socketpair()
+    conn, peer = socket.socketpair()
+    server = _ZygoteServer(daemon, graph_stamp=graph_stamp)
+    monkeypatch.setattr(_zygote, "_disk_build_stamp", lambda: (1000.0, "stale-sha"))
+    monkeypatch.setattr(os, "fork", lambda: pytest.fail(f"must not fork a mixed-version {kind}"))
+    try:
+        reply = _dispatch_fork(server, conn, peer, cmd)
+        assert "changed on disk" in reply["error"]
+        assert kind in reply["error"]
+        assert server._live == set()
+    finally:
+        server._sel.close()
+        for sock in (daemon, daemon_peer, conn, peer):
+            sock.close()
+
+
+@pytest.mark.parametrize(("cmd", "kind"), [("fork", "runner"), ("fork_harness", "harness")])
+def test_fork_refused_when_source_baseline_is_incomplete(monkeypatch, cmd, kind) -> None:
+    """An incomplete initial source baseline fails closed onto direct spawning."""
+    daemon, daemon_peer = socket.socketpair()
+    conn, peer = socket.socketpair()
+    server = _ZygoteServer(
+        daemon,
+        graph_stamp=_GraphStamp(build=(1000.0, "sha"), sources=None),
+    )
+    monkeypatch.setattr(_zygote, "_disk_build_stamp", lambda: (1000.0, "sha"))
+    monkeypatch.setattr(os, "fork", lambda: pytest.fail(f"must not fork a mixed-version {kind}"))
+    try:
+        reply = _dispatch_fork(server, conn, peer, cmd)
+        assert "changed on disk" in reply["error"]
+        assert kind in reply["error"]
+        assert server._live == set()
+    finally:
+        server._sel.close()
+        for sock in (daemon, daemon_peer, conn, peer):
+            sock.close()
 
 
 def test_zygote_still_serves_daemon_after_harness_fork(manager: ZygoteManager, tmp_path) -> None:
@@ -654,3 +1337,145 @@ def test_polled_harness_pid_is_released_from_its_owner(manager: ZygoteManager, t
     # Re-polling is None (code popped) and the zygote is still healthy.
     assert _control_exchange(manager, {"cmd": "poll", "pid": pid})["returncode"] is None
     assert _control_exchange(manager, {"cmd": "ping"}).get("pong") is True
+
+
+class _ChildExited(Exception):
+    """Raised by the stubbed ``os._exit`` so the guard can be driven in-process."""
+
+    def __init__(self, code: int) -> None:
+        super().__init__(code)
+        self.code = code
+
+
+@pytest.fixture
+def child_sink(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[dict[str, object]]]:
+    """Attach a capturing debug-log sink to the runner logger, as a child would.
+
+    Delivery is slowed to model a real upload in flight, so rows only arrive
+    by the time the guard returns if it drained the sink before ``os._exit``.
+
+    :param monkeypatch: Restores the process-wide sink and excepthook.
+    :returns: Rows delivered by the sink.
+    """
+    import logging
+
+    from omnigent import debug_logging as dl
+    from omnigent.runner._entry import _install_crash_logging
+
+    rows: list[dict[str, object]] = []
+
+    def _slow_send(batch: list[dict[str, object]]) -> None:
+        time.sleep(0.2)
+        rows.extend(batch)
+
+    monkeypatch.setattr(dl, "_active_sink", None)
+    monkeypatch.setattr(sys, "excepthook", sys.__excepthook__)
+    monkeypatch.setattr(_zygote.os, "_exit", _raise_child_exited)
+    runner_logger = logging.getLogger("omnigent.runner._entry")
+    dl.attach_debug_log_sink([runner_logger], source="runner", level=logging.INFO, send=_slow_send)
+    sink = dl._active_sink
+    assert sink is not None
+    _install_crash_logging()
+    try:
+        yield rows
+    finally:
+        sink.close()
+        for name in ("omnigent.runner._entry", dl.SSE_LOGGER_NAME, dl.AUDIT_LOGGER_NAME):
+            logging.getLogger(name).removeHandler(sink)
+
+
+def _raise_child_exited(code: int) -> None:
+    """Stand-in for ``os._exit`` that unwinds instead of killing the test.
+
+    :param code: Exit code the guard requested.
+    :raises _ChildExited: Always.
+    """
+    raise _ChildExited(code)
+
+
+def test_child_guard_logs_uncaught_exception_before_exit(
+    child_sink: list[dict[str, object]],
+) -> None:
+    """An uncaught runner exception reaches the crash hook and its row ships.
+
+    The guard previously printed the traceback itself and hard-exited, so the
+    runner's excepthook never ran and no crash row reached the table.
+
+    :param child_sink: Rows delivered by the child's debug-log sink.
+    """
+
+    def _crash() -> None:
+        raise RuntimeError("boom")
+
+    with pytest.raises(_ChildExited) as exited:
+        _ZygoteServer._exit_child(_crash)
+
+    assert exited.value.code == 1
+    crash_rows = [row for row in child_sink if row.get("level") == "CRITICAL"]
+    assert [row["message"] for row in crash_rows] == [
+        "runner exiting: uncaught RuntimeError: boom"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("body_exit", "expected_code"),
+    [(None, 0), (SystemExit(3), 3)],
+    ids=["normal-return", "system-exit"],
+)
+def test_child_guard_drains_final_rows_before_exit(
+    child_sink: list[dict[str, object]],
+    body_exit: SystemExit | None,
+    expected_code: int,
+) -> None:
+    """Rows logged just before the child exits are drained, not dropped.
+
+    :param child_sink: Rows delivered by the child's debug-log sink.
+    :param body_exit: Exception the body ends with, or ``None`` to return.
+    :param expected_code: Exit code the guard must preserve.
+    """
+    import logging
+
+    def _body() -> None:
+        logging.getLogger("omnigent.runner._entry").info("runner exiting: idle timeout reached")
+        if body_exit is not None:
+            raise body_exit
+
+    with pytest.raises(_ChildExited) as exited:
+        _ZygoteServer._exit_child(_body)
+
+    assert exited.value.code == expected_code
+    assert [row["message"] for row in child_sink] == ["runner exiting: idle timeout reached"]
+
+
+def test_child_guard_exits_even_if_flush_is_interrupted(
+    child_sink: list[dict[str, object]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An interrupted flush must not let the child return into the zygote loop.
+
+    :param child_sink: Installs the stubbed ``os._exit``.
+    :param monkeypatch: Replaces the flush with one that is interrupted.
+    """
+
+    def _interrupted_flush() -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(_zygote, "_flush_child_telemetry", _interrupted_flush)
+
+    with pytest.raises(_ChildExited) as exited:
+        _ZygoteServer._exit_child(lambda: None)
+
+    assert exited.value.code == 0
+
+
+def test_child_telemetry_flush_swallows_interrupts(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The flush helper absorbs BaseException so the guard reaches os._exit.
+
+    :param monkeypatch: Makes the sink drain raise KeyboardInterrupt.
+    """
+    from omnigent import debug_logging as dl
+
+    def _interrupted_close(timeout: float = 5.0) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(dl, "close_debug_log_sink", _interrupted_close)
+    _zygote._flush_child_telemetry()

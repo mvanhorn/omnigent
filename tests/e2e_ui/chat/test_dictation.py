@@ -8,11 +8,9 @@ textarea. The fake engine reveals one word of its script per 100 ms of
 audio received, so a second of fake-mic streaming produces the full
 sentence, finalized by the engine, without any ASR model.
 
-The test pins the *no-Web-Speech* entry into server mode by stripping the
-SpeechRecognition constructors before the app boots (Playwright's Chromium
-exposes them, but its cloud backend is dead in automation). The other
-entry — Web Speech present but failing at runtime with a ``network`` error
-— is pinned in ``web/src/components/ComposerMicButton.test.tsx``.
+The tests exercise missing Web Speech support and a denied browser speech
+service with microphone access still granted. Audio capture and the server
+transport stay real; only the speech recognition service is replaced.
 
 A failure here means one of:
 
@@ -30,6 +28,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
+import pytest
 from playwright.sync_api import Browser, BrowserContext, Page, expect
 
 from omnigent.server.dictation import FAKE_SCRIPT as _FAKE_SCRIPT
@@ -78,7 +77,7 @@ def test_dictation_streams_transcript_into_composer(
         browser, browser_context_args, base_url, session_id
     )
     try:
-        composer = page.get_by_placeholder("Ask the agent anything…")
+        composer = page.get_by_placeholder("Send a message…")
         expect(composer).to_be_visible()
 
         # The button only renders once /v1/info reports dictation_available,
@@ -104,6 +103,57 @@ def test_dictation_streams_transcript_into_composer(
         context.close()
 
 
+@pytest.mark.parametrize("surface", ["session", "landing", "side-chat"])
+def test_speech_service_denial_falls_back_to_client_audio(
+    page: Page,
+    seeded_session: tuple[str, str],
+    surface: str,
+) -> None:
+    """A denied speech service can still transcribe the browser's microphone."""
+    base_url, session_id = seeded_session
+    page.context.grant_permissions(["microphone"])
+    page.add_init_script(
+        """window.speechRecognitionStarts = 0;
+        class UnavailableSpeechRecognition extends EventTarget {
+            start() {
+                window.speechRecognitionStarts += 1;
+                this.dispatchEvent(Object.assign(new Event("error"), {
+                    error: "service-not-allowed",
+                }));
+                this.dispatchEvent(new Event("end"));
+            }
+            stop() { this.dispatchEvent(new Event("end")); }
+        }
+        window.SpeechRecognition = UnavailableSpeechRecognition;
+        window.webkitSpeechRecognition = UnavailableSpeechRecognition;
+        """
+    )
+    with page.expect_response("**/v1/info") as server_info:
+        page.goto(f"{base_url}/" if surface == "landing" else f"{base_url}/c/{session_id}")
+    assert server_info.value.json()["dictation_available"] is True
+    composer = page.get_by_placeholder(
+        "Describe a task to start a new session…" if surface == "landing" else "Send a message…"
+    )
+    expect(composer).to_be_visible()
+    mic = page.get_by_role("button", name="Voice dictation")
+    if surface == "side-chat":
+        page.get_by_test_id("composer-attach").click()
+        page.get_by_role("menuitem", name="Start a new side chat").click()
+        composer = page.get_by_placeholder("Ask a side question...")
+        mic = page.get_by_role("complementary", name="Workspace").get_by_role(
+            "button", name="Voice dictation"
+        )
+    expect(mic).to_have_attribute("data-server-dictation-available", "true")
+    mic.click()
+
+    assert page.evaluate("window.speechRecognitionStarts") == 1
+    expect(composer).to_have_value(_FAKE_SCRIPT, timeout=_TRANSCRIPT_TIMEOUT_MS)
+    expect(mic).to_have_attribute("aria-pressed", "true")
+    page.keyboard.press("Enter")
+    expect(mic).to_have_attribute("aria-pressed", "false")
+    expect(composer).to_have_value(_FAKE_SCRIPT)
+
+
 def test_hotkey_toggles_dictation(
     browser: Browser,
     browser_context_args: dict[str, Any],
@@ -121,7 +171,7 @@ def test_hotkey_toggles_dictation(
         browser, browser_context_args, base_url, session_id
     )
     try:
-        expect(page.get_by_placeholder("Ask the agent anything…")).to_be_visible()
+        expect(page.get_by_placeholder("Send a message…")).to_be_visible()
         mic = page.get_by_role("button", name="Voice dictation")
         expect(mic).to_be_visible()
         expect(mic).to_have_attribute("aria-pressed", "false")
@@ -149,7 +199,7 @@ def test_enter_while_listening_commits_text(
         browser, browser_context_args, base_url, session_id
     )
     try:
-        composer = page.get_by_placeholder("Ask the agent anything…")
+        composer = page.get_by_placeholder("Send a message…")
         expect(composer).to_be_visible()
         # Normalize the starting draft so the assertions are exact.
         composer.fill("")
@@ -190,7 +240,7 @@ def test_transcript_lands_at_the_caret(
         browser, browser_context_args, base_url, session_id
     )
     try:
-        composer = page.get_by_placeholder("Ask the agent anything…")
+        composer = page.get_by_placeholder("Send a message…")
         expect(composer).to_be_visible()
 
         # Paste a block of context, then put the caret at the very top.
@@ -242,7 +292,7 @@ def test_escape_while_listening_discards_text(
         browser, browser_context_args, base_url, session_id
     )
     try:
-        composer = page.get_by_placeholder("Ask the agent anything…")
+        composer = page.get_by_placeholder("Send a message…")
         expect(composer).to_be_visible()
         # Empty snapshot at voice start, so a correct discard empties it again.
         composer.fill("")

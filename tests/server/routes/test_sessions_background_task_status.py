@@ -6,18 +6,23 @@ in-chat "N background tasks still running" indicator survives the trailing
 PTY-activity ``idle`` (which carries no count) and a reload.
 
 The tally must clear on an authoritative ``Stop``-hook ``0`` (the shell
-finished), on a new turn (``running``), and on a failure — but NOT on the
-countless trailing ``idle`` edges that carry no count. It must never make
+finished) and on a failure — but NOT on the countless trailing ``idle`` edges
+that carry no count, and NOT on a new ``running`` turn (background shells
+outlive turn boundaries, so the composer pill stays lit alongside the working
+shimmer until the next authoritative count). It must never make
 ``_session_status_with_child_rollup`` report ``running``: the turn is over
 and the session takes a new message immediately.
 """
 
 from __future__ import annotations
 
+import logging
 import types
 
 import pytest
 
+from omnigent.debug_logging import record_to_row
+from omnigent.runtime import session_stream
 from omnigent.server.routes import sessions as _sessions_mod
 from omnigent.server.routes.sessions import (
     _CLAUDE_NATIVE_WRAPPER_LABEL_KEY,
@@ -26,8 +31,15 @@ from omnigent.server.routes.sessions import (
     _publish_status,
     _session_status_with_child_rollup,
 )
+from omnigent.server.schemas import BackgroundTaskInfo, ErrorDetail
+from tests.debug_log_helpers import capture_debug_rows
 
 _SID = "conv_bg_test"
+
+
+def _tasks(*descriptions: str) -> list[BackgroundTaskInfo]:
+    """Detail entries for the given shell descriptions."""
+    return [BackgroundTaskInfo(status="running", description=d) for d in descriptions]
 
 
 def _conv(kind: str, *, labels: dict[str, str] | None = None) -> object:
@@ -40,10 +52,12 @@ def _clear_caches() -> None:
     """Isolate each case from leaked module-level cache state."""
     _sessions_mod._session_status_cache.pop(_SID, None)
     _sessions_mod._session_background_task_count_cache.pop(_SID, None)
+    _sessions_mod._session_background_tasks_cache.pop(_SID, None)
     _sessions_mod._session_active_response_cache.pop(_SID, None)
     yield
     _sessions_mod._session_status_cache.pop(_SID, None)
     _sessions_mod._session_background_task_count_cache.pop(_SID, None)
+    _sessions_mod._session_background_tasks_cache.pop(_SID, None)
     _sessions_mod._session_active_response_cache.pop(_SID, None)
 
 
@@ -85,10 +99,55 @@ def test_authoritative_zero_clears_tally_and_list_drops_to_idle() -> None:
     assert _session_status_with_child_rollup(_SID, []) == "idle"
 
 
-def test_new_turn_running_clears_tally() -> None:
+def test_background_task_debug_rows_preserve_known_counts_without_content(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rows: list[dict[str, object]] = []
+
+    class Capture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            rows.append(record_to_row(record, source="server"))
+
+    monkeypatch.setattr(session_stream, "sse_logging_enabled", lambda: True)
+    logger = session_stream.sse_event_logger()
+    previous_level = logger.level
+    handler = Capture()
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    try:
+        for count in (2, None, 0):
+            _publish_status(
+                _SID,
+                "idle",
+                response_id="resp_bg",
+                background_task_count=count,
+                background_tasks=_tasks("private shell command", "private task detail")
+                if count == 2
+                else None,
+                blocked_on="private approval detail",
+            )
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(previous_level)
+
+    assert [row["event_name"] for row in rows] == ["session.status"] * 3
+    assert [row["session_id"] for row in rows] == [_SID] * 3
+    assert [row["attributes"] for row in rows] == [
+        {"status": "idle", "response_id": "resp_bg", "background_task_count": "2"},
+        {"status": "idle", "response_id": "resp_bg"},
+        {"status": "idle", "response_id": "resp_bg", "background_task_count": "0"},
+    ]
+    assert "private" not in repr(rows)
+
+
+def test_new_turn_running_keeps_tally() -> None:
+    # A new ``running`` turn does NOT clear the tally: background shells outlive
+    # turn boundaries, so the composer pill stays lit alongside the working
+    # shimmer until the next authoritative count (the trailing ``running`` edge
+    # carries none).
     _publish_status(_SID, "idle", background_task_count=2)
     _publish_status(_SID, "running")
-    assert _SID not in _sessions_mod._session_background_task_count_cache
+    assert _sessions_mod._session_background_task_count_cache.get(_SID) == 2
 
 
 def test_failure_clears_tally_and_wins_over_count() -> None:
@@ -97,6 +156,95 @@ def test_failure_clears_tally_and_wins_over_count() -> None:
     assert _SID not in _sessions_mod._session_background_task_count_cache
     # ``failed`` is authoritative for the list row, never masked by a tally.
     assert _session_status_with_child_rollup(_SID, []) == "failed"
+
+
+@pytest.mark.parametrize("count", [2, 0, None], ids=["positive", "cleared", "unknown"])
+@pytest.mark.parametrize(
+    ("code", "origin"),
+    [
+        ("runner_disconnected", "runner_disconnected_mid_turn"),
+        ("native_turn_error", "external_session_status"),
+    ],
+)
+def test_failure_debug_row_preserves_background_count_before_cleanup(
+    count: int | None,
+    code: str,
+    origin: str,
+) -> None:
+    if count is not None:
+        _publish_status(
+            _SID, "idle", background_task_count=2, background_tasks=_tasks("private shell task")
+        )
+        if count == 0:
+            _publish_status(_SID, "idle", background_task_count=0)
+    _publish_status(_SID, "running", response_id="resp_bg")
+
+    with capture_debug_rows("server") as rows:
+        _publish_status(
+            _SID,
+            "failed",
+            ErrorDetail(code=code, message="Synthetic failure"),
+            response_id="resp_bg",
+            failure_origin=origin,
+        )
+
+    failed = [row for row in rows if row["event_name"] == "session_turn_failed"]
+    assert len(failed) == 1
+    assert failed[0]["session_id"] == _SID
+    expected = {
+        "code": code,
+        "origin": origin,
+        "previous_status": "running",
+        "response_id": "resp_bg",
+        "active_response_id_at_failure": "resp_bg",
+    }
+    if count == 2:
+        expected["cached_background_task_count"] = "2"
+    assert failed[0]["attributes"] == expected
+    assert "private shell task" not in repr(failed)
+    assert _SID not in _sessions_mod._session_background_task_count_cache
+    assert _SID not in _sessions_mod._session_background_tasks_cache
+
+
+# ── background-task detail rides with the tally ─────────────────────────────
+
+
+def test_background_tasks_detail_stored_with_positive_count() -> None:
+    # The per-shell detail is cached in lockstep with the count so a
+    # reload/reconnect can restore the individual shells.
+    tasks = _tasks("Wait for CI", "Build check")
+    _publish_status(_SID, "idle", background_task_count=2, background_tasks=tasks)
+    assert _sessions_mod._session_background_task_count_cache.get(_SID) == 2
+    assert _sessions_mod._session_background_tasks_cache.get(_SID) == tasks
+
+
+def test_background_tasks_detail_empty_when_count_only() -> None:
+    # An older runner posts the count with no detail: the tally sticks and the
+    # detail cache holds [] (pill shows the number, no per-shell detail).
+    _publish_status(_SID, "idle", background_task_count=1, background_tasks=None)
+    assert _sessions_mod._session_background_task_count_cache.get(_SID) == 1
+    assert _sessions_mod._session_background_tasks_cache.get(_SID) == []
+
+
+def test_background_tasks_detail_sticky_on_trailing_idle() -> None:
+    # The trailing PTY-activity idle carries no count: it must not wipe the
+    # detail the Stop hook just set (same rule as the count).
+    tasks = _tasks("Wait for CI")
+    _publish_status(_SID, "idle", background_task_count=1, background_tasks=tasks)
+    _publish_status(_SID, "idle", background_task_count=None)
+    assert _sessions_mod._session_background_tasks_cache.get(_SID) == tasks
+
+
+def test_background_tasks_detail_cleared_on_authoritative_zero() -> None:
+    _publish_status(_SID, "idle", background_task_count=1, background_tasks=_tasks("Wait for CI"))
+    _publish_status(_SID, "idle", background_task_count=0)
+    assert _SID not in _sessions_mod._session_background_tasks_cache
+
+
+def test_background_tasks_detail_cleared_on_failure() -> None:
+    _publish_status(_SID, "idle", background_task_count=1, background_tasks=_tasks("Wait for CI"))
+    _publish_status(_SID, "failed")
+    assert _SID not in _sessions_mod._session_background_tasks_cache
 
 
 # ── background-task delivery status (ended-turn collapse) ───────────────────

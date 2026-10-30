@@ -5,54 +5,117 @@ Pytest fixtures shared across ``tests/inner/`` test files.
 from __future__ import annotations
 
 import asyncio
-import faulthandler
 import gc
 import inspect
 import json
 import logging
 import os
 import pathlib
+import shutil
 import sys
+import tempfile
+import threading
 import time
+import traceback
+from collections.abc import Iterator
 from types import SimpleNamespace
+from typing import TextIO
 
 import pytest
 import pytest_asyncio
 
 from tests import _model_pools
+from tests.inner.git_ssh_fixture import ssh_git_server as ssh_git_server
+
+
+@pytest.fixture
+def short_tmp_parent() -> Iterator[pathlib.Path]:
+    """A short-pathed temp dir under ``/tmp`` for Unix-socket-binding tests.
+
+    macOS caps an ``AF_UNIX`` path at ~103 bytes and its ``$TMPDIR`` is already
+    ~48 bytes, so pytest's ``tmp_path`` (which embeds the test name) overflows
+    before a socket filename is appended (issue #4279). Tests that bind a real
+    Unix socket — the private tmux server, the egress proxy — must place it
+    under a short parent. Production sockets already live under a short
+    ``$TMPDIR/omnigent-...`` path, so this is a test-path artifact only.
+    """
+    parent = pathlib.Path(tempfile.mkdtemp(prefix="omni-inner-", dir="/tmp"))
+    try:
+        yield parent
+    finally:
+        shutil.rmtree(parent, ignore_errors=True)
 
 
 @pytest.fixture(autouse=True)
 def _stub_executor_catalog_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Keep executor unit tests deterministic without catalog network access."""
+    """Keep executor unit tests deterministic without catalog auth or network access."""
+
+    from omnigent.models.model_catalog import ModelListing
 
     def _resolve(provider_name: str, *, family: str, **kwargs: object) -> SimpleNamespace:
         return SimpleNamespace(model_id=f"catalog-{provider_name}-{family}-default")
 
-    monkeypatch.setattr("omnigent.model_catalog.resolve_catalog_model", _resolve)
+    def _listing(_provider: object) -> ModelListing:
+        return ModelListing(
+            source="none",
+            verified=False,
+            models=(),
+            note="stubbed for executor unit tests",
+        )
+
+    monkeypatch.setattr("omnigent.models.model_catalog.resolve_catalog_model", _resolve)
+    monkeypatch.setattr("omnigent.models.model_catalog.listing_for_provider", _listing)
 
 
 # Diagnostic: dump every thread's stack every 90s. The dispatcher's
 # stderr lands in the workflow log directly, but xdist workers route
-# their stderr through execnet -- faulthandler writing to sys.stderr
-# in a worker silently disappears. Route worker dumps to a file in
+# their stderr through execnet -- writing to sys.stderr in a worker
+# silently disappears. Route worker dumps to a file in
 # PYTEST_PROGRESS_LOG_DIR (uploaded as an artifact by integration.yml)
 # so each gw{N}'s stack frames are recoverable post-mortem.
 _worker = os.environ.get("PYTEST_XDIST_WORKER", "main")
 _log_dir_env = os.environ.get("PYTEST_PROGRESS_LOG_DIR")
+_stack_dump_file: TextIO
 if _log_dir_env:
     _log_dir = pathlib.Path(_log_dir_env)
     _log_dir.mkdir(parents=True, exist_ok=True)
-    _faulthandler_file = open(  # noqa: SIM115  -- kept open for the process lifetime
-        _log_dir / f"faulthandler-{_worker}.log", "w", buffering=1
+    _stack_dump_file = open(  # noqa: SIM115  -- kept open for the process lifetime
+        _log_dir / f"thread-stacks-{_worker}.log", "w", buffering=1
     )
 else:
-    _faulthandler_file = sys.stderr
-faulthandler.dump_traceback_later(90, repeat=True, file=_faulthandler_file)
+    _stack_dump_file = sys.stderr
+
+
+def _dump_thread_stacks_forever(interval: float, out: TextIO) -> None:
+    """Write every thread's Python stack to *out* every *interval* seconds.
+
+    Not ``faulthandler.dump_traceback_later``: its watchdog thread walks
+    other threads' frames without the GIL and can segfault the worker.
+    """
+    while True:
+        time.sleep(interval)
+        try:
+            names = {thread.ident: thread.name for thread in threading.enumerate()}
+            lines = [f"\n--- thread stacks at {time.time():.3f} ---\n"]
+            for ident, frame in sys._current_frames().items():
+                lines.append(f"\nThread {ident:#x} ({names.get(ident, '?')}):\n")
+                lines.extend(traceback.format_stack(frame))
+            out.write("".join(lines))
+            out.flush()
+        except Exception:
+            continue
+
+
+threading.Thread(
+    target=_dump_thread_stacks_forever,
+    args=(90.0, _stack_dump_file),
+    name="omnigent-test-stack-dump",
+    daemon=True,
+).start()
 
 
 # Diagnostic: dump asyncio.all_tasks() every 60s during async tests.
-# faulthandler shows C frames for live threads, but async coroutines
+# The thread-stack dump shows live threads, but async coroutines
 # that have yielded sit in the loop's task list without any C frame --
 # the main thread's stack just shows ``select()``. To see which awaits
 # are stuck, schedule a periodic ``loop.call_later`` from inside an

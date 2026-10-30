@@ -1,4 +1,4 @@
-import { act, renderHook } from "@testing-library/react";
+import { act, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { readSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import { resetWidthStoreForTesting, useResizableInlinePanel } from "./useResizableInlinePanel";
@@ -57,17 +57,18 @@ describe("useResizableInlinePanel persistence", () => {
     restored.unmount();
   });
 
-  it("scopes the saved width to its session: a different session uses the default", () => {
-    const first = renderHook(() => useResizableInlinePanel(SESSION));
+  it("scopes the saved width to its root-tree key: a different tree uses the default", () => {
+    const rootTreeKey = "conv_root";
+    const first = renderHook(() => useResizableInlinePanel(rootTreeKey));
     expect(nudgeWiderOnce(first.result)).toBe(620);
-    expect(readSessionWorkspaceState(SESSION).widthPx).toBe(620);
+    expect(readSessionWorkspaceState(rootTreeKey).widthPx).toBe(620);
     first.unmount();
 
-    // A second conversation has no saved width, so it falls back to the
+    // A second root tree has no saved width, so it falls back to the
     // viewport-derived default (600) rather than inheriting the first's 620.
-    const second = renderHook(() => useResizableInlinePanel("conv_other"));
+    const second = renderHook(() => useResizableInlinePanel("conv_other_root"));
     expect(second.result.current.panelWidth).toBe(600);
-    expect(readSessionWorkspaceState("conv_other").widthPx).toBeUndefined();
+    expect(readSessionWorkspaceState("conv_other_root").widthPx).toBeUndefined();
     second.unmount();
   });
 
@@ -95,6 +96,21 @@ describe("useResizableInlinePanel persistence", () => {
 });
 
 describe("useResizableInlinePanel reserved width (sidebar)", () => {
+  it("fits beside a Canvas conversation without losing the preferred panel width", () => {
+    setInnerWidth(1440);
+    const { result, rerender } = renderHook(
+      ({ reserved }) => useResizableInlinePanel(SESSION, undefined, reserved, true, 380),
+      { initialProps: { reserved: 0 } },
+    );
+    const preferred = nudgeWiderOnce(result);
+    rerender({ reserved: 750 });
+    expect(result.current.panelWidth).toBe(302);
+    expect(result.current.preferredContentWidth).toBe(preferred + 380 + 8);
+    expect(readSessionWorkspaceState(SESSION).widthPx).toBe(preferred);
+    rerender({ reserved: 0 });
+    expect(result.current.panelWidth).toBe(preferred);
+  });
+
   // `reservedPx` is the open sidebar's width. It must tighten the ceiling
   // (keeping the chat at its 480px minimum) without overwriting the user's
   // preferred width, so collapsing the sidebar gives the width straight back.
@@ -182,6 +198,53 @@ describe("useResizableInlinePanel drag overlay", () => {
         c instanceof HTMLElement && c.style.position === "fixed" && c.style.zIndex === "2147483647",
     ) ?? null;
 
+  it("ignores drag input while persistence is disabled for a tentative key", () => {
+    const sessionId = "conv_tentative";
+    const { result, unmount } = renderHook(() =>
+      useResizableInlinePanel(sessionId, undefined, 0, false),
+    );
+    const initialWidth = result.current.panelWidth;
+    expect(result.current.handleProps["aria-disabled"]).toBe(true);
+    expect(result.current.handleProps.tabIndex).toBe(-1);
+
+    act(() =>
+      result.current.handleProps.onMouseDown({ preventDefault: () => {} } as React.MouseEvent),
+    );
+    expect(overlaySelector()).toBeNull();
+
+    act(() => {
+      window.dispatchEvent(new MouseEvent("mousemove", { clientX: 100 }));
+      window.dispatchEvent(new MouseEvent("mouseup"));
+    });
+    expect(result.current.panelWidth).toBe(initialWidth);
+    expect(readSessionWorkspaceState(sessionId).widthPx).toBeUndefined();
+    unmount();
+  });
+
+  it("freezes and does not persist a drag when its key becomes tentative", async () => {
+    const sessionId = "conv_mid_drag";
+    const { result, rerender, unmount } = renderHook(
+      ({ persistEnabled }) => useResizableInlinePanel(sessionId, undefined, 0, persistEnabled),
+      { initialProps: { persistEnabled: true } },
+    );
+
+    act(() =>
+      result.current.handleProps.onMouseDown({ preventDefault: () => {} } as React.MouseEvent),
+    );
+    act(() => window.dispatchEvent(new MouseEvent("mousemove", { clientX: 1200 })));
+    await waitFor(() => expect(result.current.panelWidth).toBe(800));
+    expect(readSessionWorkspaceState(sessionId).widthPx).toBeUndefined();
+
+    rerender({ persistEnabled: false });
+    act(() => {
+      window.dispatchEvent(new MouseEvent("mousemove", { clientX: 1000 }));
+      window.dispatchEvent(new MouseEvent("mouseup"));
+    });
+    expect(result.current.panelWidth).toBe(800);
+    expect(readSessionWorkspaceState(sessionId).widthPx).toBeUndefined();
+    unmount();
+  });
+
   it("mounts a full-window overlay during a drag so mouseup isn't lost to an iframe", () => {
     // The panel sits beside the sandboxed HTML-preview iframe. Without an
     // overlay, dragging over the frame routes mousemove/mouseup into it and the
@@ -192,11 +255,13 @@ describe("useResizableInlinePanel drag overlay", () => {
     act(() =>
       result.current.handleProps.onMouseDown({ preventDefault: () => {} } as React.MouseEvent),
     );
+    expect(result.current.isDragging).toBe(true);
     const overlay = overlaySelector();
     expect(overlay).not.toBeNull();
     expect(overlay?.style.cursor).toBe("col-resize");
 
     act(() => window.dispatchEvent(new MouseEvent("mouseup")));
+    expect(result.current.isDragging).toBe(false);
     expect(overlaySelector()).toBeNull();
     unmount();
   });

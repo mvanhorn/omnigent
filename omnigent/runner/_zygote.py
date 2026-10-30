@@ -14,6 +14,10 @@ multithreaded async process would deadlock the child). It is single-threaded,
 holds no event loop and no network sockets, and blocks on one ``AF_UNIX``
 control socket handed to it by the daemon.
 
+If optional deferred preload starts a thread, the zygote refuses new forks
+while preserving existing children's parent and poll/reap service. New
+launches use the callers' direct-exec fallback.
+
 Protocol (newline-delimited JSON, one request → one response):
 
   {"cmd": "ping"}                          -> {"pong": true}
@@ -44,15 +48,21 @@ from __future__ import annotations
 
 import contextlib
 import gc
+import importlib.util
 import json
 import os
 import selectors
+import signal
 import socket
 import sys
 import threading
+from collections.abc import Iterable
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, cast
 
 from omnigent.process_logging import LOG_TTY_FD_ENV_VAR, env_truthy
+from omnigent.runner.identity import RUNNER_WORKSPACE_ENV_VAR
 
 # Env var the daemon sets to the inherited control-socket fd number.
 ZYGOTE_CONTROL_FD_ENV_VAR = "OMNIGENT_RUNNER_ZYGOTE_CONTROL_FD"
@@ -79,6 +89,100 @@ _ZYGOTE_TEST_CHILD_RAISE_ENV_VAR = "OMNIGENT_RUNNER_ZYGOTE_TEST_CHILD_RAISE"
 # under a live child and assert the crash-recovery path. Never set in prod.
 _ZYGOTE_TEST_CHILD_SLEEP_ENV_VAR = "OMNIGENT_RUNNER_ZYGOTE_TEST_CHILD_SLEEP"
 
+# Upper bound on draining a forked child's debug-log sink before os._exit.
+_CHILD_TELEMETRY_FLUSH_TIMEOUT_S = 2.0
+
+
+@dataclass(frozen=True)
+class _SourceFileStamp:
+    """Metadata identifying one package source file."""
+
+    path: Path
+    modified_ns: int
+    size: int
+    inode: int
+
+
+@dataclass(frozen=True)
+class _GraphStamp:
+    """Build and source state backing the zygote's imported graph."""
+
+    build: tuple[float, str] | None
+    sources: tuple[_SourceFileStamp, ...] | None
+
+
+def _disk_build_stamp(package_dir: Path | None = None) -> tuple[float, str] | None:
+    """Read ``(BUILD_TIME_EPOCH, COMMIT_SHA)`` from the on-disk ``_build_info.py``.
+
+    Loaded fresh from the file every call — never via ``sys.modules`` — so the
+    value tracks what an in-place ``omnigent`` upgrade rewrote on disk, not
+    what this process imported at boot.
+
+    :param package_dir: Directory holding ``_build_info.py``; defaults to the
+        ``omnigent`` package directory this module was loaded from.
+    :returns: The stamp, or ``None`` when the file is missing or unreadable
+        (e.g. an unbuilt source checkout, or a package mid-rewrite).
+    """
+    if package_dir is None:
+        # Derived from this module's own location rather than the top-level
+        # ``omnigent.__file__``: the zygote runs as ``python -m``, which puts
+        # its cwd on sys.path, so a daemon started from a directory that holds
+        # an ``omnigent`` checkout binds the top-level name to a namespace
+        # package (``__file__`` is None) while this module still loads from the
+        # real package.
+        package_dir = Path(__file__).resolve().parents[1]
+    spec = importlib.util.spec_from_file_location(
+        "_omnigent_zygote_build_probe", package_dir / "_build_info.py"
+    )
+    if spec is None or spec.loader is None:
+        return None
+    module = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(module)
+        return float(module.BUILD_TIME_EPOCH), str(module.COMMIT_SHA)
+    except Exception:  # noqa: BLE001 — any failure means "stamp unknown"
+        return None
+
+
+def _source_file_stamps(paths: Iterable[Path]) -> tuple[_SourceFileStamp, ...] | None:
+    """Capture file metadata, returning ``None`` if the baseline is incomplete."""
+    stamps: list[_SourceFileStamp] = []
+    try:
+        unique_paths = sorted(set(paths))
+    except OSError:
+        return None
+    for path in unique_paths:
+        try:
+            stat = path.stat()
+        except OSError:
+            return None
+        stamps.append(
+            _SourceFileStamp(
+                path=path,
+                modified_ns=stat.st_mtime_ns,
+                size=stat.st_size,
+                inode=stat.st_ino,
+            )
+        )
+    return tuple(stamps)
+
+
+def _package_source_stamps(
+    package_dir: Path | None = None,
+) -> tuple[_SourceFileStamp, ...] | None:
+    """Fingerprint all Python sources, including modules imported lazily later."""
+    package_root = (package_dir or Path(__file__).resolve().parents[1]).resolve()
+    return _source_file_stamps(package_root.rglob("*.py"))
+
+
+def _source_files_match(stamps: tuple[_SourceFileStamp, ...] | None) -> bool:
+    """Return whether every package source still matches its boot metadata."""
+    if stamps is None:
+        return False
+    if not stamps:
+        return True
+    return _source_file_stamps(stamp.path for stamp in stamps) == stamps
+
 
 def _import_runner_graph() -> None:
     """Eagerly import the heavy runner graph so the ~120MB lands once.
@@ -93,7 +197,49 @@ def _import_runner_graph() -> None:
     already holds, so this adds little resident cost).
     """
     from omnigent.runner import _entry, app, native  # noqa: F401
+    from omnigent.runner.background_titles import (  # noqa: F401
+        claude_native,
+        codex_native,
+        sdk,
+    )
     from omnigent.runtime.harnesses import _runner as _harness_runner  # noqa: F401
+
+
+def _import_deferred_graph() -> None:
+    """Import what only some runner boots need, once the zygote is serving.
+
+    A runner whose server declines to mint its token (no auth provider,
+    header/proxy mode) falls through to Databricks credential discovery, which
+    imports the SDK (~0.45s) on every launch. Loading it once the zygote is
+    serving, after any request already waiting (a cold host's first fork),
+    keeps it out of each later fork. ``databricks-sdk`` is an optional
+    dependency.
+    """
+    try:
+        import databricks.sdk.config  # noqa: F401
+
+        from omnigent.inner import databricks_executor  # noqa: F401
+    except ImportError:
+        pass  # SDK not installed: runners never pay for it either.
+    except Exception as exc:  # noqa: BLE001 — an optional preload must not kill the forkserver
+        # The SDK can raise OSError probing credentials at import; forks then
+        # import it themselves.
+        sys.stderr.write(f"zygote: deferred Databricks SDK preload failed: {exc!r}\n")
+        sys.stderr.flush()
+
+
+def _exit_unless_single_threaded() -> None:
+    """Exit with status 2 if an import started a thread (fork-safety invariant)."""
+    if threading.active_count() != 1:  # pragma: no cover — defense in depth
+        # Forking from a multithreaded process risks child deadlocks. The graph
+        # is audited to start no import-time threads; if that ever regresses,
+        # fail loud here rather than ship silent deadlocks.
+        names = [t.name for t in threading.enumerate()]
+        print(
+            f"error: runner zygote must be single-threaded before forking; saw {names}",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
 
 
 def _wire_child_stdio(log_path: str | None) -> None:
@@ -188,6 +334,23 @@ def _run_child(request: dict[str, Any], harness_fd: int) -> None:
     main()
 
 
+def _flush_child_telemetry() -> None:
+    """Drain the child's debug-log sink and stdio before ``os._exit``.
+
+    ``os._exit`` skips ``atexit``, where the sink would otherwise send its last
+    batch. Bounded so a slow upload cannot keep a dying child alive.
+    """
+    # BaseException too: this runs in a dying child, where nothing may stop the
+    # caller's os._exit (e.g. a KeyboardInterrupt during the drain join).
+    with contextlib.suppress(BaseException):
+        from omnigent.debug_logging import close_debug_log_sink
+
+        close_debug_log_sink(timeout=_CHILD_TELEMETRY_FLUSH_TIMEOUT_S)
+    for stream in (sys.stdout, sys.stderr):
+        with contextlib.suppress(BaseException):
+            stream.flush()
+
+
 def _maybe_run_test_seam() -> None:
     """Honor the fork-payload test seams (exit / raise / sleep). Never in prod.
 
@@ -234,6 +397,23 @@ def _run_harness_child(request: dict[str, Any]) -> None:
 
     _wire_child_stdio(os.environ.get(PROCESS_LOG_FILE_ENV_VAR))
 
+    # Match direct exec by running the harness in its session workspace.
+    workspace = os.environ.get(RUNNER_WORKSPACE_ENV_VAR)
+    if workspace:
+        try:
+            os.chdir(workspace)
+        except OSError as exc:
+            # The workspace may disappear after launch; keep the stable zygote cwd.
+            sys.stderr.write(
+                f"zygote harness fork: cannot chdir to workspace {workspace!r}: {exc}\n"
+            )
+            sys.stderr.flush()
+    else:
+        sys.stderr.write(
+            "zygote harness fork: no workspace in payload env; staying in zygote cwd\n"
+        )
+        sys.stderr.flush()
+
     # Test seam: a sleep seam keeps the harness genuinely alive (crash-recovery
     # tests); the exit seam echoes argv so a test can assert the payload
     # round-tripped. Never set in production.
@@ -246,6 +426,7 @@ def _run_harness_child(request: dict[str, Any]) -> None:
     test_exit = os.environ.get(_ZYGOTE_TEST_CHILD_EXIT_ENV_VAR)
     if test_exit is not None:
         sys.stdout.write(f"harness_argv={' '.join(request.get('argv') or [])}\n")
+        sys.stdout.write(f"harness_cwd={os.getcwd()}\n")
         sys.stdout.flush()
         os._exit(int(test_exit))
 
@@ -267,9 +448,18 @@ class _ZygoteServer:
     thread per connection.
 
     :param control_sock: The daemon control socket (role ``"daemon"``).
+    :param graph_stamp: Build and package-source state captured before the
+        zygote imports its graph. Both runner and harness forks are refused
+        once either changes on disk: the child would otherwise resolve lazy
+        imports from new files against the old in-memory graph.
     """
 
-    def __init__(self, control_sock: socket.socket) -> None:
+    def __init__(
+        self,
+        control_sock: socket.socket,
+        graph_stamp: _GraphStamp | None = None,
+    ) -> None:
+        self._graph_stamp = graph_stamp
         self._sel = selectors.DefaultSelector()
         # Exit codes of reaped children, held until the requester polls; the
         # daemon/runner are not these children's parents and cannot waitpid().
@@ -289,6 +479,8 @@ class _ZygoteServer:
         # close (the daemon socket + all runner sockets).
         self._control_socks: set[socket.socket] = {control_sock}
         self._buffers: dict[int, bytearray] = {}
+        self._deferred_imported = False
+        self._forking_disabled = False
         self._sel.register(control_sock, selectors.EVENT_READ, "daemon")
         self._buffers[control_sock.fileno()] = bytearray()
 
@@ -298,13 +490,33 @@ class _ZygoteServer:
             while True:
                 self._reap()
                 # Timeout so idle periods still reap exited children promptly.
-                for key, _mask in self._sel.select(timeout=1.0):
+                # Until the deferred graph is loaded, only peek: pending requests
+                # are served first, and the import runs once nothing is waiting.
+                events = self._sel.select(timeout=1.0 if self._deferred_imported else 0)
+                if not events and not self._deferred_imported:
+                    self._import_deferred()
+                    continue
+                for key, _mask in events:
                     # Only sockets are ever registered, so key.fileobj (typed
                     # HasFileno | int by selectors) is always a socket here.
                     if not self._on_readable(cast("socket.socket", key.fileobj), key.data):
                         return
         finally:
             self._sel.close()
+
+    def _import_deferred(self) -> None:
+        """Load :func:`_import_deferred_graph` once, when no request is pending."""
+        self._deferred_imported = True
+        _import_deferred_graph()
+        gc.freeze()
+        try:
+            _exit_unless_single_threaded()
+        except SystemExit as exc:
+            if exc.code != 2:
+                raise
+            # Children may already depend on this parent. Keep their status
+            # service alive and send new launches through the exec fallback.
+            self._forking_disabled = True
 
     def _reap(self) -> None:
         """Non-blocking reap of any exited children into ``exit_codes``.
@@ -447,12 +659,49 @@ class _ZygoteServer:
             with contextlib.suppress(OSError):
                 sock.close()
 
+    def _refuse_if_upgraded(self, conn: socket.socket, kind: str) -> bool:
+        """Answer with an error when the package changed under this zygote.
+
+        A forked child inherits the graph imported at boot but resolves every
+        lazily-imported module from disk. Once an in-place upgrade rewrites the
+        package, those two disagree — the child either misses a name its old
+        in-memory modules gained, or fails to import a module the swapped-out
+        directory no longer offers. Both callers' fallbacks re-launch through a
+        fresh interpreter, which reads everything from disk coherently.
+
+        :param conn: The socket to answer on.
+        :param kind: Child being forked (``"runner"`` / ``"harness"``), named
+            in the error so operator logs say which launch fell back.
+        :returns: ``True`` when the request was refused (caller must return).
+        """
+        stamp = self._graph_stamp
+        if stamp is None:
+            return False
+        build_matches = stamp.build is None or _disk_build_stamp() == stamp.build
+        if build_matches and _source_files_match(stamp.sources):
+            return False
+        _send(
+            conn,
+            {
+                "error": (
+                    "omnigent changed on disk after the zygote imported its "
+                    f"graph; refusing to fork a mixed-version {kind}"
+                )
+            },
+        )
+        return True
+
     def _handle_fork(self, conn: socket.socket, request: dict[str, Any]) -> None:
         """Fork a runner, giving it its own control socket back to the zygote.
 
         :param conn: The daemon socket to answer on.
         :param request: The ``fork`` request (``env`` + optional ``log_path``).
         """
+        if self._forking_disabled:
+            _send(conn, {"error": "zygote is not single-threaded; refusing to fork a runner"})
+            return
+        if self._refuse_if_upgraded(conn, "runner"):
+            return
         try:
             z_end, r_end = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
         except OSError as exc:
@@ -488,6 +737,11 @@ class _ZygoteServer:
         :param conn: The runner socket to answer on.
         :param request: The ``fork_harness`` request (``argv`` + ``env``).
         """
+        if self._forking_disabled:
+            _send(conn, {"error": "zygote is not single-threaded; refusing to fork a harness"})
+            return
+        if self._refuse_if_upgraded(conn, "harness"):
+            return
         try:
             pid = os.fork()
         except OSError as exc:
@@ -510,29 +764,43 @@ class _ZygoteServer:
 
         :param body: Zero-arg callable running the child's real work.
         """
+        exit_code = 0
         try:
             body()
         except SystemExit as exc:
             # Preserve the exec'd entrypoint's exit code (main() raises
             # SystemExit) rather than flattening it to a traceback + code 1.
             code = exc.code
-            os._exit(code if isinstance(code, int) else (0 if code is None else 1))
-        except BaseException:  # noqa: BLE001 — last-resort child guard
-            import traceback
-
-            traceback.print_exc()
-            os._exit(1)
-        os._exit(0)
+            exit_code = code if isinstance(code, int) else (0 if code is None else 1)
+        except BaseException as exc:  # noqa: BLE001 — last-resort child guard
+            # Route through sys.excepthook so the runner's crash hook (installed
+            # by its main()) records the cause; it chains to the default print.
+            with contextlib.suppress(BaseException):
+                sys.excepthook(type(exc), exc, exc.__traceback__)
+            exit_code = 1
+        # The child must never fall back into the zygote's serve loop, even if
+        # the flush is interrupted.
+        try:
+            _flush_child_telemetry()
+        finally:
+            os._exit(exit_code)
 
     def _drop_runner(self, conn: socket.socket) -> None:
         """Forget a runner whose control socket closed (the runner exited).
 
-        Its harness children self-terminate via their own watchdog (which
-        probes the runner pid). With the runner gone, nothing will ever poll
-        their exit codes, so mark them orphaned: _reap still waitpid's them (no
-        zombies) but discards the code instead of leaking it in _exit_codes —
-        which would otherwise grow unbounded and risk pid-reuse misattribution.
-        Any already-reaped codes for this runner's harnesses are dropped too.
+        Its harness children are SIGTERM'd here. They also self-terminate via
+        their own watchdog (a 1 Hz probe of the runner pid), but that probe is
+        their ONLY death signal on macOS — PR_SET_PDEATHSIG is Linux-only and is
+        skipped for zygote-forked harnesses regardless — so a wedged harness or
+        a starved watchdog thread would otherwise survive for the zygote's whole
+        life. We are these children's real OS parent and already track their
+        pids, so an explicit signal is both cheap and correct.
+
+        With the runner gone, nothing will ever poll their exit codes, so mark
+        them orphaned: _reap still waitpid's them (no zombies) but discards the
+        code instead of leaking it in _exit_codes — which would otherwise grow
+        unbounded and risk pid-reuse misattribution. Any already-reaped codes
+        for this runner's harnesses are dropped too.
 
         :param conn: The closed runner socket.
         """
@@ -545,6 +813,10 @@ class _ZygoteServer:
             self._exit_codes.pop(harness_pid, None)
             if harness_pid in self._live:
                 self._orphaned.add(harness_pid)
+                # Signal the pid, never the group: everything the zygote forks
+                # shares the daemon's group, so a killpg would take it down too.
+                with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+                    os.kill(harness_pid, signal.SIGTERM)
         with contextlib.suppress(OSError):
             conn.close()
 
@@ -583,6 +855,11 @@ def main() -> None:
 
     control_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM, fileno=control_fd)
 
+    # A source update during graph import must make later forks fail closed.
+    graph_stamp = _GraphStamp(
+        build=_disk_build_stamp(),
+        sources=_package_source_stamps(),
+    )
     _import_runner_graph()
     # The import graph is now static; move it out of GC's tracked set so cyclic
     # collections stay cheap and don't dirty shared pages in forked children.
@@ -593,20 +870,11 @@ def main() -> None:
     # registered handlers; adding another that blindly releases the lock raises
     # "cannot release un-acquired lock" in the child.
 
-    if threading.active_count() != 1:  # pragma: no cover — defense in depth
-        # Forking from a multithreaded process risks child deadlocks. The graph
-        # is audited to start no import-time threads; if that ever regresses,
-        # fail loud here rather than ship silent deadlocks.
-        names = [t.name for t in threading.enumerate()]
-        print(
-            f"error: runner zygote must be single-threaded before forking; saw {names}",
-            file=sys.stderr,
-        )
-        raise SystemExit(2)
+    _exit_unless_single_threaded()
 
     # Ctrl+C is a normal operator-driven shutdown; exit quietly without a traceback.
     with contextlib.suppress(KeyboardInterrupt):
-        _ZygoteServer(control_sock).serve()
+        _ZygoteServer(control_sock, graph_stamp=graph_stamp).serve()
 
 
 if __name__ == "__main__":

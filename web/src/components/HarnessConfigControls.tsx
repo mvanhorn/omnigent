@@ -3,12 +3,18 @@ import { type ReactNode, useState } from "react";
 import {
   Select,
   SelectContent,
+  SelectGroup,
   SelectItem,
+  SelectLabel,
   SelectSeparator,
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
 import { SMART_ROUTING_LABEL } from "@/lib/agentLabels";
+import { codexEffortLevelsForModel } from "@/lib/codexNativeModels";
+import { normalizeEffortLabel } from "@/lib/composerModelLabel";
+import { MODEL_CATALOG_BROWSE_MIN, groupByModelCreator } from "@/lib/modelCreators";
+import type { NativeModelOption } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 // Sentinel Select values for the Model row. Radix requires a non-empty value,
@@ -29,6 +35,13 @@ export interface RoutingModelOption {
   label: string;
 }
 
+// The model-label helpers are canonical in the shared leaf module so the
+// landing dialog, the chat status line, and this file all format a model the
+// same way. Re-exported here so callers that import them from
+// HarnessConfigControls keep working.
+export { defaultModelLabel, nativeModelLabel } from "@/lib/composerModelLabel";
+export type { NativeModelLabelFields } from "@/lib/composerModelLabel";
+
 /**
  * The Model row's Select: the Smart Routing sentinel (when offered), the
  * harness's own "Default", then the harness's models. Shared by the landing
@@ -42,8 +55,9 @@ export interface RoutingModelOption {
  * @param testId Trigger test id.
  * @param ariaLabel Accessible name for the trigger (the visible ConfigRow label
  *   is visual-only, so pass it here to name the control for AT).
- * @param models Harness models, listed after "Default". Empty when the harness
- *   resolves its own catalog and only the two sentinels are expressible.
+ * @param models Harness models, listed after "Default" and headed by creator
+ *   once a long catalog spans several. Empty when the harness resolves its own
+ *   catalog and only the two sentinels are expressible.
  * @param defaultLabel Label for the "no explicit model" row. Defaults to
  *   "Default"; pass the resolved form (e.g. `Default (gpt-5.5)`) where the
  *   catalog names which model that is.
@@ -61,6 +75,8 @@ export function RoutingModelSelect({
   defaultLabel = "Default",
   activeModelId,
   contentClassName,
+  triggerClassName,
+  componentId,
   children,
 }: {
   value: string;
@@ -72,11 +88,36 @@ export function RoutingModelSelect({
   defaultLabel?: string;
   activeModelId?: string | null;
   contentClassName?: string;
+  // Extra classes for the trigger, e.g. a caller that wants a smaller font.
+  triggerClassName?: string;
+  // Opt-in analytics id. Model values are a bounded catalog + the "smart"/
+  // "default" sentinels, so the value is reported (valueHasNoPii) for pattern
+  // analysis of model choice.
+  componentId?: string;
   children?: ReactNode;
 }) {
+  const modelItem = (m: RoutingModelOption) => (
+    <SelectItem
+      key={m.id}
+      value={m.id}
+      data-model-id={m.id}
+      data-active={activeModelId === m.id ? "true" : undefined}
+    >
+      {m.label}
+    </SelectItem>
+  );
+  const groups =
+    models && models.length >= MODEL_CATALOG_BROWSE_MIN
+      ? groupByModelCreator(models, (m) => ({ id: m.id, displayName: m.label }))
+      : [];
   return (
-    <Select value={value} onValueChange={onValueChange}>
-      <SelectTrigger className="w-full" data-testid={testId} aria-label={ariaLabel}>
+    // valueHasNoPii assumes a bounded catalog; drop it if reused for typed values.
+    <Select value={value} onValueChange={onValueChange} componentId={componentId} valueHasNoPii>
+      <SelectTrigger
+        className={cn("w-full", triggerClassName)}
+        data-testid={testId}
+        aria-label={ariaLabel}
+      >
         <SelectValue />
       </SelectTrigger>
       <SelectContent
@@ -88,16 +129,14 @@ export function RoutingModelSelect({
           <SelectItem value={MODEL_SELECT_SMART}>{SMART_ROUTING_LABEL}</SelectItem>
         )}
         <SelectItem value={MODEL_SELECT_DEFAULT}>{defaultLabel}</SelectItem>
-        {(models ?? []).map((m) => (
-          <SelectItem
-            key={m.id}
-            value={m.id}
-            data-model-id={m.id}
-            data-active={activeModelId === m.id ? "true" : undefined}
-          >
-            {m.label}
-          </SelectItem>
-        ))}
+        {groups.length > 1
+          ? groups.map(({ creator, items }) => (
+              <SelectGroup key={creator.id}>
+                <SelectLabel>{creator.label}</SelectLabel>
+                {items.map(modelItem)}
+              </SelectGroup>
+            ))
+          : (models ?? []).map(modelItem)}
         {children}
       </SelectContent>
     </Select>
@@ -111,6 +150,9 @@ export function RoutingModelSelect({
 // picker's `null` state uses. Mirrors ANTHROPIC_EFFORTS server-side. Lives here
 // (a leaf module, no heavy imports) so both NewChatDialog and the scheduled-task
 // dialog can share the single source of truth.
+// Also Devin's ladder: Devin encodes effort as a model-variant suffix
+// (`<family>-<rung>`) over exactly this rung set, so devin-native shares this
+// list rather than duplicating it.
 export const CLAUDE_NATIVE_EFFORTS: { value: string; label: string }[] = [
   { value: "low", label: "Low" },
   { value: "medium", label: "Medium" },
@@ -118,6 +160,36 @@ export const CLAUDE_NATIVE_EFFORTS: { value: string; label: string }[] = [
   { value: "xhigh", label: "xHigh" },
   { value: "max", label: "Max" },
 ];
+
+/** Pi thinking level options for the new-session picker. Mirrors PI_EFFORTS server-side. */
+export const PI_NATIVE_EFFORTS: { value: string; label: string }[] = [
+  { value: "none", label: "None" },
+  { value: "minimal", label: "Minimal" },
+  { value: "low", label: "Low" },
+  { value: "medium", label: "Medium" },
+  { value: "high", label: "High" },
+  { value: "xhigh", label: "xHigh" },
+  { value: "max", label: "Max" },
+];
+
+/**
+ * Create-time effort ladder for a native harness (`null` = none). Codex uses
+ * `model` or the catalog default; Devin is omitted (no project model default).
+ */
+export function nativeEffortOptions(
+  harness: string | null | undefined,
+  modelOptions: readonly NativeModelOption[],
+  model: string | null | undefined,
+): { value: string; label: string }[] | null {
+  if (harness === "claude-native") return CLAUDE_NATIVE_EFFORTS;
+  if (harness === "pi-native") return PI_NATIVE_EFFORTS;
+  if (harness !== "codex-native") return null;
+  const effortModel = model || modelOptions.find((option) => option.isDefault)?.id;
+  return codexEffortLevelsForModel(modelOptions, effortModel).map((value) => ({
+    value,
+    label: normalizeEffortLabel(value),
+  }));
+}
 
 /**
  * A labeled configuration row: bold label + muted sub-description on the left,
@@ -127,10 +199,12 @@ export function ConfigRow({
   label,
   description,
   children,
+  controlClassName,
 }: {
   label: string;
   description?: string;
   children: ReactNode;
+  controlClassName?: string;
 }) {
   return (
     // Stacked on mobile (label above a full-width control) so the label never
@@ -141,7 +215,7 @@ export function ConfigRow({
         <div className="text-ui font-medium">{label}</div>
         {description && <div className="text-sm text-muted-foreground">{description}</div>}
       </div>
-      <div className="w-full sm:w-52 sm:shrink-0">{children}</div>
+      <div className={cn("w-full sm:w-52 sm:shrink-0", controlClassName)}>{children}</div>
     </div>
   );
 }
@@ -169,6 +243,9 @@ export function DescribedSelect({
   testId,
   ariaLabel,
   disabled,
+  triggerClassName,
+  contentClassName,
+  componentId,
 }: {
   value: string;
   onValueChange: (value: string) => void;
@@ -176,6 +253,13 @@ export function DescribedSelect({
   testId: string;
   ariaLabel: string;
   disabled?: boolean;
+  // Extra classes for the trigger, e.g. a caller that wants a smaller font.
+  triggerClassName?: string;
+  // Extra classes for the dropdown content, e.g. to shrink the option font.
+  contentClassName?: string;
+  // Opt-in analytics id. Options are a fixed enum (permission / approval modes),
+  // so the selected value is reported (valueHasNoPii).
+  componentId?: string;
 }) {
   const [previewed, setPreviewed] = useState<string | null>(null);
   const detail = options.find((o) => o.value === (previewed ?? value))?.description;
@@ -183,6 +267,9 @@ export function DescribedSelect({
     <Select
       value={value}
       onValueChange={onValueChange}
+      componentId={componentId}
+      // valueHasNoPii assumes fixed option enums; drop it if reused for free text.
+      valueHasNoPii
       disabled={disabled}
       // Reset the preview when the list closes so the next open starts on the
       // selected option's blurb.
@@ -190,7 +277,11 @@ export function DescribedSelect({
         if (!next) setPreviewed(null);
       }}
     >
-      <SelectTrigger className="w-full" data-testid={testId} aria-label={ariaLabel}>
+      <SelectTrigger
+        className={cn("w-full", triggerClassName)}
+        data-testid={testId}
+        aria-label={ariaLabel}
+      >
         <SelectValue />
       </SelectTrigger>
       {/* Pin the popup to the trigger width so a long blurb wraps in the footer
@@ -198,7 +289,10 @@ export function DescribedSelect({
       <SelectContent
         position="popper"
         align="start"
-        className="w-(--radix-select-trigger-width) [&_[data-slot=select-item]]:pl-2.5"
+        className={cn(
+          "w-(--radix-select-trigger-width) [&_[data-slot=select-item]]:pl-2.5",
+          contentClassName,
+        )}
       >
         {options.map((o) => (
           <SelectItem

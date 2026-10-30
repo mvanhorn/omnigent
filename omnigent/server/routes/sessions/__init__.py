@@ -50,10 +50,6 @@ from fastapi.responses import Response, StreamingResponse
 from pydantic import ValidationError
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
-from omnigent.codex_native_elicitation import codex_elicitation_id
-from omnigent.cost_plan import (
-    reserved_cost_control_keys,
-)
 from omnigent.db.utils import generate_agent_id
 from omnigent.entities import (
     Agent,
@@ -70,17 +66,13 @@ from omnigent.entities.conversation import (
 from omnigent.entities.permission import SessionPermission
 from omnigent.entities.session_resources import session_resource_view_to_dict
 from omnigent.errors import ElicitationDeclinedError, ErrorCode, OmnigentError
+from omnigent.harnesses.codex_native.elicitation import codex_elicitation_id
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE as _HARNESS_NOT_CONFIGURED_ERROR_CODE,
 )
-from omnigent.model_override import validate_model_override
-from omnigent.native_coding_agents import (
+from omnigent.models.model_override import validate_model_override
+from omnigent.native.native_coding_agents import (
     native_coding_agent_for_terminal_name,
-)
-from omnigent.reasoning_effort import (
-    EFFORT_CLEAR_VALUES,
-    EFFORT_VALUES,
-    validate_effort,
 )
 from omnigent.runner.identity import (
     RUNNER_TUNNEL_TOKEN_HEADER,
@@ -168,17 +160,29 @@ from omnigent.server.routes._content_type import (
 )
 from omnigent.server.routes._errors import session_not_found as _session_not_found
 from omnigent.server.routes._origin import require_trusted_origin
+from omnigent.server.session_pull_requests import PullRequestRefresher
+from omnigent.util.cost_plan import (
+    reserved_cost_control_keys,
+)
+from omnigent.util.reasoning_effort import (
+    EFFORT_CLEAR_VALUES,
+    EFFORT_VALUES,
+    validate_effort,
+)
 
 # Shared constants, state, and small dataclasses live in the _sessions.common
 # leaf module; import them here so this module and its re-exporters see the same
 # objects. The mutable caches are shared by reference across the package.
 # isort: off
 from omnigent.server.routes._sessions.common import (
+    CLIENT_SESSION_EVENT_TYPES as CLIENT_SESSION_EVENT_TYPES,
     COST_CONTROL_OVERRIDE_VALUES as COST_CONTROL_OVERRIDE_VALUES,
     _ALLOWED_EVENT_TYPES as _ALLOWED_EVENT_TYPES,
     _ANTIGRAVITY_NATIVE_ELICITATION_HOOK_TIMEOUT_S as _ANTIGRAVITY_NATIVE_ELICITATION_HOOK_TIMEOUT_S,
     _APPROVAL_TYPE as _APPROVAL_TYPE,
     _BROWSER_ACTION_AWAIT_S as _BROWSER_ACTION_AWAIT_S,
+    _BROWSER_ACTION_CLAIM_GRACE_S as _BROWSER_ACTION_CLAIM_GRACE_S,
+    _BROWSER_ACTION_NO_RENDERER_RESULT as _BROWSER_ACTION_NO_RENDERER_RESULT,
     _BROWSER_ACTION_TIMEOUT_RESULT as _BROWSER_ACTION_TIMEOUT_RESULT,
     _CHILD_PREVIEW_LIMIT as _CHILD_PREVIEW_LIMIT,
     _CLAUDE_NATIVE_DESCRIPTION_LABEL_KEY as _CLAUDE_NATIVE_DESCRIPTION_LABEL_KEY,
@@ -187,6 +191,8 @@ from omnigent.server.routes._sessions.common import (
     _CLAUDE_NATIVE_MESSAGE_TIMEOUT_S as _CLAUDE_NATIVE_MESSAGE_TIMEOUT_S,
     _CLAUDE_NATIVE_MODEL as _CLAUDE_NATIVE_MODEL,
     _CLAUDE_NATIVE_PERMISSION_HOOK_TIMEOUT_S as _CLAUDE_NATIVE_PERMISSION_HOOK_TIMEOUT_S,
+    _CLAUDE_NATIVE_PERMISSION_MODES as _CLAUDE_NATIVE_PERMISSION_MODES,
+    _CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY as _CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY,
     _CLAUDE_NATIVE_REMEMBER_INELIGIBLE_TOOLS as _CLAUDE_NATIVE_REMEMBER_INELIGIBLE_TOOLS,
     _CLAUDE_NATIVE_SUBAGENT_ID_LABEL_KEY as _CLAUDE_NATIVE_SUBAGENT_ID_LABEL_KEY,
     _CLAUDE_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE as _CLAUDE_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE,
@@ -209,7 +215,7 @@ from omnigent.server.routes._sessions.common import (
     _CODEX_NATIVE_SUBAGENT_TOOL_CALL_ID_LABEL_KEY as _CODEX_NATIVE_SUBAGENT_TOOL_CALL_ID_LABEL_KEY,
     _CODEX_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE as _CODEX_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE,
     _CODEX_NATIVE_WRAPPER_LABEL_VALUE as _CODEX_NATIVE_WRAPPER_LABEL_VALUE,
-    _COMPACT_LOCKS as _COMPACT_LOCKS,
+    _CLEAR_TYPE as _CLEAR_TYPE,
     _COMPACT_TYPE as _COMPACT_TYPE,
     _CURSOR_FORK_HISTORY_HARNESSES as _CURSOR_FORK_HISTORY_HARNESSES,
     _CURSOR_NATIVE_HARNESS as _CURSOR_NATIVE_HARNESS,
@@ -236,6 +242,9 @@ from omnigent.server.routes._sessions.common import (
     _EXTERNAL_SESSION_STATUS_TYPE as _EXTERNAL_SESSION_STATUS_TYPE,
     _EXTERNAL_SESSION_STATUS_VALUES as _EXTERNAL_SESSION_STATUS_VALUES,
     _EXTERNAL_SESSION_SUPERSEDED_TYPE as _EXTERNAL_SESSION_SUPERSEDED_TYPE,
+    _EXTERNAL_BTW_SIDECHAT_TYPE as _EXTERNAL_BTW_SIDECHAT_TYPE,
+    _EXTERNAL_BTW_DISMISS_TYPE as _EXTERNAL_BTW_DISMISS_TYPE,
+    _EXTERNAL_SESSION_TITLE_TYPE as _EXTERNAL_SESSION_TITLE_TYPE,
     _EXTERNAL_SESSION_TODOS_TYPE as _EXTERNAL_SESSION_TODOS_TYPE,
     _EXTERNAL_SESSION_USAGE_TYPE as _EXTERNAL_SESSION_USAGE_TYPE,
     _EXTERNAL_STATUS_ASSISTANT_SCAN_LIMIT as _EXTERNAL_STATUS_ASSISTANT_SCAN_LIMIT,
@@ -243,15 +252,18 @@ from omnigent.server.routes._sessions.common import (
     _EXTERNAL_TOOL_OUTPUT_DELTA_TYPE as _EXTERNAL_TOOL_OUTPUT_DELTA_TYPE,
     _FENCE_EXEMPT_EVENT_TYPES as _FENCE_EXEMPT_EVENT_TYPES,
     _FORK_HISTORY_NATIVE_HARNESSES as _FORK_HISTORY_NATIVE_HARNESSES,
+    _ARCHIVE_STOP_UNDO_GRACE_S as _ARCHIVE_STOP_UNDO_GRACE_S,
     _HARNESS_ELICITATION_REPARK_GRACE_S as _HARNESS_ELICITATION_REPARK_GRACE_S,
     _HARNESS_PRE_RESOLVED_ELICITATION_MAX_ENTRIES as _HARNESS_PRE_RESOLVED_ELICITATION_MAX_ENTRIES,
     _HARNESS_PRE_RESOLVED_ELICITATION_TTL_S as _HARNESS_PRE_RESOLVED_ELICITATION_TTL_S,
     _HOOK_ELICITATION_ID_RE as _HOOK_ELICITATION_ID_RE,
     _HOST_BOUND_RUNNER_CONNECT_GRACE_S as _HOST_BOUND_RUNNER_CONNECT_GRACE_S,
     _HOST_LAUNCH_RESULT_TIMEOUT_S as _HOST_LAUNCH_RESULT_TIMEOUT_S,
+    _HOST_RECONNECT_GRACE_S as _HOST_RECONNECT_GRACE_S,
     _HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S as _HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S,
     _HOST_RUNNER_STATUS_TIMEOUT_S as _HOST_RUNNER_STATUS_TIMEOUT_S,
     _INTERRUPT_TYPE as _INTERRUPT_TYPE,
+    _DEVIN_NATIVE_WRAPPER_LABEL_VALUE as _DEVIN_NATIVE_WRAPPER_LABEL_VALUE,
     _KIRO_NATIVE_WRAPPER_LABEL_VALUE as _KIRO_NATIVE_WRAPPER_LABEL_VALUE,
     _LABEL_VALUE_MAX_LEN as _LABEL_VALUE_MAX_LEN,
     _LAST_CONTEXT_TOKENS_LABEL_KEY as _LAST_CONTEXT_TOKENS_LABEL_KEY,
@@ -270,8 +282,11 @@ from omnigent.server.routes._sessions.common import (
     _NATIVE_TERMINAL_ENSURE_FAILED_CODE as _NATIVE_TERMINAL_ENSURE_FAILED_CODE,
     _NATIVE_TERMINAL_START_FAILED_CODE as _NATIVE_TERMINAL_START_FAILED_CODE,
     _OPENCODE_NATIVE_WRAPPER_LABEL_VALUE as _OPENCODE_NATIVE_WRAPPER_LABEL_VALUE,
+    _PI_EXTENSION_UI_HOOK_TIMEOUT_S as _PI_EXTENSION_UI_HOOK_TIMEOUT_S,
     _PI_NATIVE_WRAPPER_LABEL_VALUE as _PI_NATIVE_WRAPPER_LABEL_VALUE,
     _RACE_TASK_REAP_TIMEOUT_S as _RACE_TASK_REAP_TIMEOUT_S,
+    _RUNNER_CLIENT_RESOLVE_ATTEMPTS as _RUNNER_CLIENT_RESOLVE_ATTEMPTS,
+    _RUNNER_CLIENT_RESOLVE_RETRY_S as _RUNNER_CLIENT_RESOLVE_RETRY_S,
     _RUNNER_CONVICTION_POLL_S as _RUNNER_CONVICTION_POLL_S,
     _RUNNER_FORWARD_TIMEOUT as _RUNNER_FORWARD_TIMEOUT,
     _RUNNER_RELAY_READY_TIMEOUT_S as _RUNNER_RELAY_READY_TIMEOUT_S,
@@ -286,6 +301,7 @@ from omnigent.server.routes._sessions.common import (
     _SNAPSHOT_RUNNER_TIMEOUT_S as _SNAPSHOT_RUNNER_TIMEOUT_S,
     _STOP_RUNNER_RESULT_TIMEOUT_S as _STOP_RUNNER_RESULT_TIMEOUT_S,
     _STOP_SESSION_TYPE as _STOP_SESSION_TYPE,
+    _RETRY_SESSION_TYPE as _RETRY_SESSION_TYPE,
     _SUBAGENT_FORWARD_RECONNECT_WAIT_S as _SUBAGENT_FORWARD_RECONNECT_WAIT_S,
     _TERMINAL_RESPONSE_EVENT_TYPES as _TERMINAL_RESPONSE_EVENT_TYPES,
     _TURN_ACTOR_LABEL as _TURN_ACTOR_LABEL,
@@ -295,6 +311,7 @@ from omnigent.server.routes._sessions.common import (
     _MirroredToolCall as _MirroredToolCall,
     _PendingPolicyAskWrites as _PendingPolicyAskWrites,
     _RelayHandle as _RelayHandle,
+    _browser_action_claim_events as _browser_action_claim_events,
     _browser_action_claims as _browser_action_claims,
     _browser_action_owners as _browser_action_owners,
     _browser_action_registry as _browser_action_registry,
@@ -314,17 +331,17 @@ from omnigent.server.routes._sessions.common import (
     _read_last_seen as _read_last_seen,
     _recent_mirrored_tool_calls as _recent_mirrored_tool_calls,
     _runner_relay_tasks as _runner_relay_tasks,
-    _runner_skills_cache as _runner_skills_cache,
-    _runner_skills_inflight as _runner_skills_inflight,
+    _runner_status_probe_backoff as _runner_status_probe_backoff,
+    _runner_status_probe_inflight as _runner_status_probe_inflight,
     _server_host_registry as _server_host_registry,
     _server_runner_router as _server_runner_router,
     _session_active_response_cache as _session_active_response_cache,
     _session_background_task_count_cache as _session_background_task_count_cache,
+    _session_background_tasks_cache as _session_background_tasks_cache,
     _session_mcp_startup_cache as _session_mcp_startup_cache,
     _session_sandbox_status_cache as _session_sandbox_status_cache,
     _session_status_cache as _session_status_cache,
     _session_terminal_pending_cache as _session_terminal_pending_cache,
-    _session_todos_cache as _session_todos_cache,
     get_server_host_registry as get_server_host_registry,
     get_server_runner_router as get_server_runner_router,
     set_server_host_registry as set_server_host_registry,
@@ -363,6 +380,7 @@ from omnigent.server.routes._sessions.helpers import (
     _child_session_current_task_status_from_cached_status as _child_session_current_task_status_from_cached_status,
     _child_session_summary_from_conversation as _child_session_summary_from_conversation,
     _claude_native_remember_host as _claude_native_remember_host,
+    _claude_subagent_display_tool as _claude_subagent_display_tool,
     _client_supplied_hook_elicitation_id as _client_supplied_hook_elicitation_id,
     _codex_plan_mode_enabled as _codex_plan_mode_enabled,
     _codex_subagent_display_tool as _codex_subagent_display_tool,
@@ -398,14 +416,15 @@ from omnigent.server.routes._sessions.helpers import (
     _host_model_options_via_registry as _host_model_options_via_registry,
     _if_none_match_matches as _if_none_match_matches,
     _invalidate_runner_backed_snapshot_state as _invalidate_runner_backed_snapshot_state,
+    _is_claude_native_subagent as _is_claude_native_subagent,
     _is_codex_native_subagent as _is_codex_native_subagent,
+    _is_devin_native_subagent as _is_devin_native_subagent,
     _is_kiro_native_session as _is_kiro_native_session,
     _last_task_error_from_labels as _last_task_error_from_labels,
     _latest_assistant_text_from_store as _latest_assistant_text_from_store,
     _latest_message_preview as _latest_message_preview,
     _load_model_options as _load_model_options,
     _load_model_options_from_host as _load_model_options_from_host,
-    _load_runner_skills as _load_runner_skills,
     _mcp_error_response as _mcp_error_response,
     _mcp_input_required_response as _mcp_input_required_response,
     _mcp_ok_response as _mcp_ok_response,
@@ -436,6 +455,7 @@ from omnigent.server.routes._sessions.helpers import (
     _persist_external_model_change as _persist_external_model_change,
     _persist_external_model_options as _persist_external_model_options,
     _persist_external_reasoning_effort_change as _persist_external_reasoning_effort_change,
+    _persist_external_session_title as _persist_external_session_title,
     _persist_external_subagent_start as _persist_external_subagent_start,
     _persist_native_policy_notice as _persist_native_policy_notice,
     _persist_policy_deny_sentinel as _persist_policy_deny_sentinel,
@@ -470,7 +490,7 @@ from omnigent.server.routes._sessions.helpers import (
     _publish_model_options as _publish_model_options,
     _publish_policy_denied as _publish_policy_denied,
     _publish_policy_deny as _publish_policy_deny,
-    _publish_runner_skills as _publish_runner_skills,
+    _publish_btw_sidechat as _publish_btw_sidechat,
     _publish_session_created as _publish_session_created,
     _publish_session_superseded as _publish_session_superseded,
     _publish_status as _publish_status,
@@ -492,13 +512,12 @@ from omnigent.server.routes._sessions.helpers import (
     _require_declared_subagent as _require_declared_subagent,
     _require_external_status_forward as _require_external_status_forward,
     _require_host_conn_for_worktree as _require_host_conn_for_worktree,
-    _reset_runner_resources_after_switch_impl as _reset_runner_resources_after_switch_impl,
+    _require_permission_mode_forward as _require_permission_mode_forward,
     _resolve_llm_model as _resolve_llm_model,
     _resolve_skill_meta_text_via_runner as _resolve_skill_meta_text_via_runner,
     _resolve_subagent_spec as _resolve_subagent_spec,
     _resource_event_item_from_sse as _resource_event_item_from_sse,
     _routing_decision_item_from_sse as _routing_decision_item_from_sse,
-    _run_compact_locked as _run_compact_locked,
     _same_provider_family_impl as _same_provider_family_impl,
     _seed_missing_title as _seed_missing_title,
     _seed_missing_title_from_user_message as _seed_missing_title_from_user_message,
@@ -508,6 +527,7 @@ from omnigent.server.routes._sessions.helpers import (
     _signal_harness_elicitation_resolved_by_id as _signal_harness_elicitation_resolved_by_id,
     _spec_config_flag_explicitly_disabled as _spec_config_flag_explicitly_disabled,
     _spec_harness as _spec_harness,
+    _start_managed_launch_task as _start_managed_launch_task,
     _stop_session_host_runner as _stop_session_host_runner,
     _stored_file_to_resource as _stored_file_to_resource,
     _stream_live_events as _stream_live_events,
@@ -525,6 +545,7 @@ from omnigent.server.routes._sessions.helpers import (
     _validated_harness_override_executor_type as _validated_harness_override_executor_type,
     _wait_for_managed_runner_tunnel as _wait_for_managed_runner_tunnel,
     announce_hosts_changed as announce_hosts_changed,
+    announce_projects_changed as announce_projects_changed,
     cancel_managed_launch_tasks as cancel_managed_launch_tasks,
     prefetch_session_routing_catalogs as prefetch_session_routing_catalogs,
 )
@@ -543,9 +564,6 @@ from omnigent.server.routes._sessions.helpers import (
 )
 from omnigent.server.routes._sessions.helpers import (
     _build_policy_engine_from_spec_impl as _build_policy_engine_from_spec,
-)
-from omnigent.server.routes._sessions.helpers import (
-    _compact_lock_impl as _compact_lock,
 )
 from omnigent.server.routes._sessions.helpers import (
     _forward_session_change_to_runner_impl as _forward_session_change_to_runner,
@@ -572,9 +590,6 @@ from omnigent.server.routes._sessions.helpers import (
     _publish_sandbox_status_impl as _publish_sandbox_status,
 )
 from omnigent.server.routes._sessions.helpers import (
-    _reset_runner_resources_after_switch_impl as _reset_runner_resources_after_switch,
-)
-from omnigent.server.routes._sessions.helpers import (
     _resolve_harness_impl as _resolve_harness,
 )
 from omnigent.server.routes._sessions.helpers import (
@@ -593,29 +608,39 @@ from omnigent.server.routes._sessions.helpers import (
 # Higher-layer orchestration flows (runner relay, session-event dispatch,
 # native-terminal launch, MCP tool calls) live in _sessions.orchestration.
 from omnigent.server.routes._sessions.orchestration import (
+    HOST_OFFLINE_HOLD_S as HOST_OFFLINE_HOLD_S,
+    HOST_OFFLINE_RECHECK_S as HOST_OFFLINE_RECHECK_S,
+    RUNNER_DISCONNECT_GRACE_S as RUNNER_DISCONNECT_GRACE_S,
+    _MID_TURN_STATUSES as _MID_TURN_STATUSES,
+    _host_row_offline as _host_row_offline,
+    set_relay_host_offline_probe as set_relay_host_offline_probe,
     _accumulate_session_usage as _accumulate_session_usage,
     _best_effort_stop as _best_effort_stop,
+    _stop_host_runner_intentionally as _stop_host_runner_intentionally,
+    _context_labels_from_turn_usage as _context_labels_from_turn_usage,
     _bind_and_launch_managed_runner as _bind_and_launch_managed_runner,
     _build_native_terminal_message_event as _build_native_terminal_message_event,
+    _cancel_pending_archive_stop as _cancel_pending_archive_stop,
     _build_session_list_item as _build_session_list_item,
     _build_session_response as _build_session_response,
     _child_session_summaries_from_conversations as _child_session_summaries_from_conversations,
     _create_session_from_bundle as _create_session_from_bundle,
     _create_session_from_existing_agent as _create_session_from_existing_agent,
     _drive_terminal_resolved_elicitation as _drive_terminal_resolved_elicitation,
-    _enrich_idle_status_with_subagent_output as _enrich_idle_status_with_subagent_output,
+    _drive_terminal_resolved_elicitation_from_store as _drive_terminal_resolved_elicitation_from_store,
+    _enrich_terminal_status_with_subagent_output as _enrich_terminal_status_with_subagent_output,
     _ensure_native_terminal_ready as _ensure_native_terminal_ready,
     _ensure_runner_relay as _ensure_runner_relay,
     _ensure_runner_session_initialized as _ensure_runner_session_initialized,
     _evaluate_input_policy as _evaluate_input_policy,
     _evaluate_tool_call_policy as _evaluate_tool_call_policy,
     _fetch_model_options as _fetch_model_options,
-    _fetch_runner_skills as _fetch_runner_skills,
     _forward_event_to_runner as _forward_event_to_runner,
     _forward_native_subagent_terminal_failure as _forward_native_subagent_terminal_failure,
     _forward_native_terminal_message as _forward_native_terminal_message,
     _get_session_snapshot as _get_session_snapshot,
     _handle_mcp_tools_call as _handle_mcp_tools_call,
+    _harness_elicitation_request_fingerprint as _harness_elicitation_request_fingerprint,
     _heal_subagent_runner_binding_via_parent as _heal_subagent_runner_binding_via_parent,
     _is_native_terminal_session as _is_native_terminal_session,
     _kick_managed_relaunch as _kick_managed_relaunch,
@@ -624,21 +649,24 @@ from omnigent.server.routes._sessions.orchestration import (
     _maybe_wake_stale_resumable_managed_sandbox as _maybe_wake_stale_resumable_managed_sandbox,
     _native_subagent_wrapper_labels as _native_subagent_wrapper_labels,
     _native_terminal_runtime as _native_terminal_runtime,
+    _note_runner_idle_shutdown as _note_runner_idle_shutdown,
     _persist_external_codex_subagent_start as _persist_external_codex_subagent_start,
     _persist_external_conversation_item as _persist_external_conversation_item,
+    _persist_external_devin_subagent_start as _persist_external_devin_subagent_start,
     _persist_external_session_usage as _persist_external_session_usage,
     _persist_host_launch_failure_turn as _persist_host_launch_failure_turn,
     _persist_model_change_note as _persist_model_change_note,
     _persist_native_cumulative_usage as _persist_native_cumulative_usage,
     _persist_native_terminal_failure as _persist_native_terminal_failure,
     _persist_session_event as _persist_session_event,
-    _persist_skipped_kiro_pending_input as _persist_skipped_kiro_pending_input,
     _publish_and_wait_for_harness_elicitation as _publish_and_wait_for_harness_elicitation,
     _publish_subtree_cost_to_ancestors as _publish_subtree_cost_to_ancestors,
     _recover_subagent_status_forward_via_parent as _recover_subagent_status_forward_via_parent,
     _register_policy_elicitation as _register_policy_elicitation,
     _relay_runner_stream as _relay_runner_stream,
+    _relinquish_session_live_state as _relinquish_session_live_state,
     _resolve_elicitation as _resolve_elicitation,
+    _runner_live_on_another_replica_from_conversations as _runner_live_on_another_replica_from_conversations,
     _run_managed_launch as _run_managed_launch,
     _run_managed_wake as _run_managed_wake,
     _runner_reject_detail as _runner_reject_detail,
@@ -646,6 +674,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _spawn_native_approval_popup_forward as _spawn_native_approval_popup_forward,
     _spawn_native_blocked_notice_forward as _spawn_native_blocked_notice_forward,
     _wait_for_host_bound_runner_client as _wait_for_host_bound_runner_client,
+    _wait_for_host_reconnect as _wait_for_host_reconnect,
     _wake_parent_for_blocked_child as _wake_parent_for_blocked_child,
     configure_subagent_block_notifier as configure_subagent_block_notifier,
     ensure_runner_connected as ensure_runner_connected,
@@ -703,13 +732,8 @@ from omnigent.server.schemas import (
     SessionResourceObject,
     SessionResourcePaginatedList,
     SessionResponse,
-    SessionSwitchAgentRequest,
     SkillSummary,
     UpdateSessionRequest,
-)
-from omnigent.session_lifecycle import (
-    is_session_closed,
-    labels_with_closed_status,
 )
 from omnigent.spec.types import (
     FunctionPolicySpec,
@@ -732,13 +756,16 @@ from omnigent.telemetry.events import SessionDeletedEvent as _TelSessionDeletedE
 from omnigent.telemetry.events import SessionStoppedEvent as _TelSessionStoppedEvent
 from omnigent.telemetry.installation_id import get_installation_id as _get_installation_id
 from omnigent.tools.client_specified import parse_client_side_tool_specs
+from omnigent.util.session_lifecycle import (
+    is_session_closed,
+    labels_with_closed_status,
+)
 
 if TYPE_CHECKING:
     __all__ = [
         "_agent_carries_native_fork_history",
         "_agent_is_native",
         "_build_policy_engine_from_spec",
-        "_compact_lock",
         "_dispatch_session_event_to_runner",
         "_ensure_runner_relay_ready",
         "_forward_session_change_to_runner",
@@ -753,7 +780,6 @@ if TYPE_CHECKING:
         "_presentation_labels_for_agent",
         "_publish_runner_recovered_status",
         "_publish_sandbox_status",
-        "_reset_runner_resources_after_switch",
         "_resolve_harness",
         "_same_provider_family",
         "_signal_terminal_resolved_harness_elicitation",
@@ -793,6 +819,10 @@ def create_sessions_router(
     host_registry: HostRegistry | None = None,
     project_store: ProjectStore | None = None,
     background_title_coordinator: BackgroundSessionTitleCoordinator | None = None,
+    pull_request_refresher: PullRequestRefresher | None = None,
+    register_runner_ingest: Callable[..., None] | None = None,
+    register_startup_dispatch: Callable[..., None] | None = None,
+    register_initial_file_upload: Callable[..., None] | None = None,
 ) -> APIRouter:
     """
     Factory that builds the sessions router.
@@ -860,6 +890,8 @@ def create_sessions_router(
     :param background_title_coordinator: Optional app-owned coordinator for
         semantic title generation after first-turn forwarding. ``None`` disables
         background titles in focused router tests.
+    :param pull_request_refresher: The app-owned refresher of stored session
+        PRs; ``None`` builds one for this router, as focused router tests do.
     :returns: A configured :class:`APIRouter` exposing the
         ``/sessions`` endpoints.
     """
@@ -874,7 +906,10 @@ def create_sessions_router(
     from omnigent.server.routes.sessions.routes_items import register_items_routes
     from omnigent.server.routes.sessions.routes_permissions import register_permissions_routes
     from omnigent.server.routes.sessions.routes_resources import register_resources_routes
+    from omnigent.server.routes.sessions.routes_ui import register_ui_routes
 
+    if pull_request_refresher is None:
+        pull_request_refresher = PullRequestRefresher()
     register_core_routes(
         router,
         conversation_store=conversation_store,
@@ -892,6 +927,7 @@ def create_sessions_router(
         host_registry=host_registry,
         project_store=project_store,
         background_title_coordinator=background_title_coordinator,
+        pull_request_refresher=pull_request_refresher,
     )
 
     register_hooks_routes(
@@ -922,6 +958,15 @@ def create_sessions_router(
         auth_provider=auth_provider,
         permission_store=permission_store,
         host_registry=host_registry,
+        register_initial_file_upload=register_initial_file_upload,
+        pull_request_refresher=pull_request_refresher,
+    )
+
+    register_ui_routes(
+        router,
+        conversation_store=conversation_store,
+        auth_provider=auth_provider,
+        permission_store=permission_store,
     )
 
     register_browser_routes(
@@ -955,6 +1000,8 @@ def create_sessions_router(
         host_registry=host_registry,
         background_title_coordinator=background_title_coordinator,
         runner_tunnel_tokens=runner_tunnel_tokens,
+        register_runner_ingest=register_runner_ingest,
+        register_startup_dispatch=register_startup_dispatch,
     )
 
     register_permissions_routes(
@@ -975,6 +1022,7 @@ def create_sessions_router(
         auth_provider=auth_provider,
         permission_store=permission_store,
         agent_cache=agent_cache,
+        host_registry=host_registry,
     )
 
     return router

@@ -2,16 +2,42 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
 import os
 import shutil
 import subprocess
+import sys
+from collections.abc import Callable
 from pathlib import Path
+from types import SimpleNamespace
 
+import psutil  # type: ignore[import-untyped]
 import pytest
+from packaging.version import Version
 
 import omnigent._platform as _platform
+from omnigent.inner import _proc
 from omnigent.onboarding import harness_install as hi
 from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, GEMINI_FAMILY, OPENAI_FAMILY
+from tests._helpers.polling import poll_until
+
+# Captured before the autouse fixture forbids Popen, for the tests that need a
+# real installer process tree.
+_REAL_POPEN = subprocess.Popen
+
+# Installer stand-in: prints to stderr, records the pid of a child that holds stderr and
+# touches a marker only if it lives 60s, then sleeps and exits.
+# argv: pid_file, marker, sleep_s, exit_code.
+_INSTALLER_LEAVING_A_CHILD = (
+    "import pathlib, subprocess, sys, time\n"
+    "print('npm error code EACCES', file=sys.stderr, flush=True)\n"
+    "child = subprocess.Popen([sys.executable, '-c', 'import pathlib, sys, time; "
+    "time.sleep(60); pathlib.Path(sys.argv[1]).touch()', sys.argv[2]])\n"
+    "pathlib.Path(sys.argv[1]).write_text(str(child.pid))\n"
+    "time.sleep(float(sys.argv[3]))\n"
+    "sys.exit(int(sys.argv[4]))\n"
+)
 
 
 @pytest.fixture(autouse=True)
@@ -31,6 +57,8 @@ def _stub_cli_fallback_dirs(monkeypatch: pytest.MonkeyPatch) -> None:
     the stub explicitly.
     """
     monkeypatch.setattr(_platform, "_cli_fallback_dirs", lambda: ())
+    monkeypatch.delenv("OMNIGENT_PI_PATH", raising=False)
+    monkeypatch.delenv("HARNESS_PI_PATH", raising=False)
 
     def _stub_version_run(argv: list[str], **k: object) -> subprocess.CompletedProcess[str]:
         if len(argv) >= 2 and argv[1] == "--version":
@@ -41,18 +69,72 @@ def _stub_cli_fallback_dirs(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(hi.subprocess, "run", _stub_version_run)
 
+    def _forbid_popen(argv: list[str], **k: object) -> object:
+        raise AssertionError(
+            f"unstubbed installer Popen in harness_install tests: {argv!r} — "
+            "stub it with fake_installer() rather than letting it really run "
+            "'npm install -g' / a vendor install script on the dev machine"
+        )
+
+    monkeypatch.setattr(hi.subprocess, "Popen", _forbid_popen)
+
+
+class FakeInstaller:
+    """Stand-in for an installer ``Popen``, exercising the stderr tee.
+
+    :param argv: The argv the installer was asked to run.
+    :param returncode: Exit status :meth:`wait` reports.
+    :param stderr: Text the installer writes to stderr, teed line by line.
+    """
+
+    def __init__(self, argv: list[str], *, returncode: int = 0, stderr: str = "") -> None:
+        self.args = argv
+        self.returncode = returncode
+        self.stderr = io.StringIO(stderr)
+        self.killed = False
+
+    def wait(self, timeout: float | None = None) -> int:
+        return self.returncode
+
+    def kill(self) -> None:
+        self.killed = True
+
+
+def fake_installer(
+    *,
+    returncode: int = 0,
+    stderr: str = "",
+    calls: list[list[str]] | None = None,
+    on_call: Callable[[], None] | None = None,
+):
+    """Build a ``subprocess.Popen`` replacement yielding :class:`FakeInstaller`.
+
+    :param returncode: Exit status the installer reports.
+    :param stderr: Stderr text the installer emits.
+    :param calls: Appended with each argv, for asserting what was run.
+    :param on_call: Side effect per invocation, e.g. marking a binary present.
+    """
+
+    def _popen(argv: list[str], **_kwargs: object) -> FakeInstaller:
+        if calls is not None:
+            calls.append(argv)
+        if on_call is not None:
+            on_call()
+        return FakeInstaller(argv, returncode=returncode, stderr=stderr)
+
+    return _popen
+
 
 @pytest.mark.parametrize(
     "key,binary,package",
     [
-        (ANTHROPIC_FAMILY, "claude", "@anthropic-ai/claude-code"),
         (OPENAI_FAMILY, "codex", "@openai/codex"),
         (hi.PI_KEY, "pi", "@earendil-works/pi-coding-agent"),
         (hi.QWEN_KEY, "qwen", "@qwen-code/qwen-code"),
     ],
 )
 def test_install_spec_and_command(key: str, binary: str, package: str) -> None:
-    """Each known harness maps to the ucode-matching binary + npm package.
+    """Each npm-installed harness maps to the ucode-matching binary + package.
 
     A drift in binary/package (e.g. a wrong npm name) would install the wrong
     thing or check the wrong PATH entry — caught here.
@@ -62,6 +144,45 @@ def test_install_spec_and_command(key: str, binary: str, package: str) -> None:
     assert spec.binary == binary
     assert spec.package == package
     assert hi.harness_install_command(key) == ["npm", "install", "-g", package]
+
+
+def test_claude_installs_via_anthropic_native_installer() -> None:
+    """Claude ships via Anthropic's installer, not ``npm install -g``.
+
+    ``package`` must stay ``None``: that is the flag :func:`harness_setup_hint`
+    and the runner's missing-CLI error branch on to name the vendor installer.
+    """
+    spec = hi.harness_install_spec(ANTHROPIC_FAMILY)
+    assert spec is not None
+    assert spec.binary == "claude"
+    assert spec.package is None
+    assert spec.install_hint == "curl -fsSL https://claude.ai/install.sh | bash"
+    assert hi.harness_install_command(ANTHROPIC_FAMILY) == [
+        "bash",
+        "-c",
+        spec.install_hint,
+    ]
+
+
+@pytest.mark.parametrize(
+    "key,expected",
+    [
+        (ANTHROPIC_FAMILY, "curl -fsSL https://claude.ai/install.sh | bash"),
+        (OPENAI_FAMILY, "npm install -g @openai/codex"),
+    ],
+)
+def test_install_display_hides_the_bash_c_wrapper(key: str, expected: str) -> None:
+    """The command shown to a user is runnable as-is, without the ``bash -c``
+    wrapper :func:`harness_install_command` adds for ``subprocess``."""
+    assert hi.harness_install_display(key) == expected
+
+
+def test_claude_setup_hint_names_the_native_installer() -> None:
+    """A machine missing the claude CLI is pointed at the working installer."""
+    hint = hi.harness_setup_hint("claude-native")
+    assert "claude.ai/install.sh" in hint
+    assert "npm" not in hint
+    assert "claude auth login --claudeai" in hint
 
 
 def test_kimi_install_spec_is_login_only_no_npm() -> None:
@@ -88,6 +209,21 @@ def test_kimi_required_cli_returns_install_spec() -> None:
     spec = hi.required_cli_for_harness("kimi")
     assert spec is not None
     assert spec.binary == "kimi"
+
+
+@pytest.mark.parametrize(
+    "harness",
+    ["antigravity-native", "native-antigravity", "agy-native", "native-agy"],
+)
+def test_antigravity_native_aliases_require_agy_cli(
+    monkeypatch: pytest.MonkeyPatch, harness: str
+) -> None:
+    """Every native agy spelling fails early when its CLI is unavailable."""
+    monkeypatch.setattr(hi.shutil, "which", lambda _name: None)
+    spec = hi.required_cli_for_harness(harness)
+    assert spec is not None
+    assert spec.binary == "agy"
+    assert hi.missing_harness_cli(harness) == spec
 
 
 def test_kimi_only_upstream_binary_satisfies_readiness(
@@ -137,11 +273,245 @@ def test_cli_probe_timeout_defaults_lenient_but_readiness_passes_short(
     assert hi.harness_cli_logged_in(ANTHROPIC_FAMILY) is True
     assert recorded[-1] == 30.0
 
+    # The positive verdict above is now TTL-cached; drop it so the second
+    # call actually probes (this test is about timeout plumbing, and the
+    # cache behavior has its own tests below).
+    hi._LOGIN_PROBE_CACHE.clear()
     assert (
         hi.harness_cli_logged_in(ANTHROPIC_FAMILY, timeout=hi.READINESS_CLI_PROBE_TIMEOUT_S)
         is True
     )
     assert recorded[-1] == hi.READINESS_CLI_PROBE_TIMEOUT_S == 10.0
+
+
+def test_login_probe_caches_positive_verdicts_with_ttl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A logged-in verdict is served from cache until its TTL expires.
+
+    Readiness refreshes across every host daemon exec ``auth status``
+    per pass; without the cache that compounds into a constant ambient
+    subprocess storm on machines with many idle hosts.
+    """
+    monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/local/bin/{name}")
+    runs: list[list[str]] = []
+
+    def _positive_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        runs.append(argv)
+        return subprocess.CompletedProcess(
+            args=argv, returncode=0, stdout='{"loggedIn": true}', stderr=""
+        )
+
+    monkeypatch.setattr(hi.subprocess, "run", _positive_run)
+
+    assert hi.harness_cli_logged_in(ANTHROPIC_FAMILY) is True
+    assert hi.harness_cli_logged_in(ANTHROPIC_FAMILY) is True
+    assert len(runs) == 1, "second call within the TTL must be cache-served"
+
+    # Expire the entry: the next call must probe again.
+    for cache_key in hi._LOGIN_PROBE_CACHE:
+        hi._LOGIN_PROBE_CACHE[cache_key] = 0.0
+    assert hi.harness_cli_logged_in(ANTHROPIC_FAMILY) is True
+    assert len(runs) == 2
+
+
+def test_invalidate_probe_caches_forces_fresh_login_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Manual readiness refreshes must not reuse a cached login verdict."""
+    hi.invalidate_harness_probe_caches()
+    monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/local/bin/{name}")
+    runs: list[list[str]] = []
+
+    def _positive_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        runs.append(argv)
+        return subprocess.CompletedProcess(
+            args=argv, returncode=0, stdout='{"loggedIn": true}', stderr=""
+        )
+
+    monkeypatch.setattr(hi.subprocess, "run", _positive_run)
+
+    assert hi.harness_cli_logged_in(ANTHROPIC_FAMILY) is True
+    assert hi.harness_cli_logged_in(ANTHROPIC_FAMILY) is True
+    hi.invalidate_harness_probe_caches()
+    assert hi.harness_cli_logged_in(ANTHROPIC_FAMILY) is True
+    assert hi.harness_cli_logged_in(ANTHROPIC_FAMILY) is True
+    assert len(runs) == 2
+    hi.invalidate_harness_probe_caches()
+
+
+def test_login_probe_never_caches_negative_verdicts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Not-logged-in must re-probe every call.
+
+    The setup wizard confirms a just-completed login via this function; a
+    cached negative would report the fresh login as failed for the TTL.
+    """
+    monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/local/bin/{name}")
+    runs: list[list[str]] = []
+
+    def _negative_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        runs.append(argv)
+        return subprocess.CompletedProcess(
+            args=argv, returncode=1, stdout='{"loggedIn": false}', stderr=""
+        )
+
+    monkeypatch.setattr(hi.subprocess, "run", _negative_run)
+
+    assert hi.harness_cli_logged_in(ANTHROPIC_FAMILY) is False
+    assert hi.harness_cli_logged_in(ANTHROPIC_FAMILY) is False
+    assert len(runs) == 2, "negative verdicts must never be cache-served"
+
+
+def test_logout_invalidates_login_probe_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A successful logout is confirmed live, not from the cached positive."""
+    monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/local/bin/{name}")
+    logged_in = True
+
+    def _stateful_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        nonlocal logged_in
+        if "logout" in argv:
+            logged_in = False
+            return subprocess.CompletedProcess(args=argv, returncode=0, stdout="", stderr="")
+        body = '{"loggedIn": true}' if logged_in else '{"loggedIn": false}'
+        return subprocess.CompletedProcess(
+            args=argv, returncode=0 if logged_in else 1, stdout=body, stderr=""
+        )
+
+    monkeypatch.setattr(hi.subprocess, "run", _stateful_run)
+
+    assert hi.harness_cli_logged_in(ANTHROPIC_FAMILY) is True
+    assert hi.harness_logout(ANTHROPIC_FAMILY) is True, (
+        "logout must invalidate the cached positive and confirm live"
+    )
+    assert hi.harness_cli_logged_in(ANTHROPIC_FAMILY) is False
+
+
+def test_version_probe_caches_by_binary_signature(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``--version`` parses cache against (path, mtime, size); failures don't.
+
+    A changed executable must re-probe even while the cached version is fresh.
+    """
+    binary = tmp_path / "fake-cli"
+    binary.write_text("#!/bin/sh\n", encoding="utf-8")
+    spec = hi.harness_install_spec(ANTHROPIC_FAMILY)
+    assert spec is not None
+    runs: list[list[str]] = []
+    fail_first = True
+
+    def _version_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        runs.append(argv)
+        if fail_first:
+            raise OSError("scripted probe failure")
+        return subprocess.CompletedProcess(args=argv, returncode=0, stdout="1.2.3", stderr="")
+
+    monkeypatch.setattr(hi.subprocess, "run", _version_run)
+
+    # A failed probe is not cached — the next call tries again.
+    assert hi._harness_cli_version_string(spec, str(binary)) is None
+    fail_first = False
+    assert hi._harness_cli_version_string(spec, str(binary)) == "1.2.3"
+    assert hi._harness_cli_version_string(spec, str(binary)) == "1.2.3"
+    assert len(runs) == 2, "unchanged binary must be version-cached after one success"
+
+    # Swapping the binary (new mtime/size) must re-probe.
+    binary.write_text("#!/bin/sh\n# upgraded\n", encoding="utf-8")
+    os.utime(binary, ns=(1, 1))
+    assert hi._harness_cli_version_string(spec, str(binary)) == "1.2.3"
+    assert len(runs) == 3
+
+
+@pytest.mark.parametrize("refresh", ["expiry", "manual", "install"])
+def test_version_probe_refreshes_an_unchanged_launcher(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, refresh: str
+) -> None:
+    """Upgrading a launcher's delegated executable must restore readiness."""
+    binary = tmp_path / "codex"
+    binary.write_text("#!/bin/sh\n", encoding="utf-8")
+    spec = hi.harness_install_spec(OPENAI_FAMILY)
+    assert spec is not None and spec.min_version is not None
+    monkeypatch.setattr(hi, "resolve_cli_binary", lambda _name: str(binary))
+    monkeypatch.setattr(hi.shutil, "which", lambda _name: "/usr/bin/npm")
+    monkeypatch.setenv("PATH", str(tmp_path))
+    now = 100.0
+    monkeypatch.setattr(hi, "time", SimpleNamespace(monotonic=lambda: now))
+    version = "0.1.0"
+    probes = 0
+
+    def run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        nonlocal probes
+        assert argv == [str(binary), "--version"], f"only version probes run here: {argv!r}"
+        probes += 1
+        return subprocess.CompletedProcess(argv, 0, f"codex-cli {version}\n", "")
+
+    monkeypatch.setattr(hi.subprocess, "run", run)
+    install_calls: list[list[str]] = []
+    monkeypatch.setattr(hi.subprocess, "Popen", fake_installer(calls=install_calls))
+    assert not hi.harness_cli_installed(OPENAI_FAMILY)
+    version = spec.min_version
+    assert not hi.harness_cli_installed(OPENAI_FAMILY)
+    assert probes == 1
+    if refresh == "expiry":
+        now += 60.0
+    elif refresh == "manual":
+        hi.invalidate_harness_probe_caches()
+    else:
+        assert hi.try_install_harness_cli(OPENAI_FAMILY).installed
+        assert install_calls == [hi.harness_install_command(OPENAI_FAMILY)]
+    assert hi.harness_cli_installed(OPENAI_FAMILY)
+    assert hi.harness_cli_version(OPENAI_FAMILY)[0] == version
+    assert probes == 2
+
+
+@pytest.mark.parametrize("returncode", [1, -15])
+@pytest.mark.parametrize("output_stream", ["stdout", "stderr"])
+def test_failed_version_probe_does_not_admit_or_cache_a_broken_cli(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    returncode: int,
+    output_stream: str,
+) -> None:
+    binary = tmp_path / "codex"
+    binary.write_text("#!/bin/sh\n", encoding="utf-8")
+    spec = hi.harness_install_spec(OPENAI_FAMILY)
+    assert spec is not None and spec.min_version is not None
+    monkeypatch.setattr(hi, "resolve_cli_binary", lambda _name: str(binary))
+    runs = 0
+    repaired = False
+
+    def run_probe(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        nonlocal runs
+        runs += 1
+        if repaired:
+            return subprocess.CompletedProcess(
+                args=argv, returncode=0, stdout=f"codex-cli {spec.min_version}\n", stderr=""
+            )
+        diagnostic = "Error: missing optional dependency\nNode.js v22.18.0\n"
+        return subprocess.CompletedProcess(
+            args=argv,
+            returncode=returncode,
+            stdout=diagnostic if output_stream == "stdout" else "",
+            stderr=diagnostic if output_stream == "stderr" else "",
+        )
+
+    monkeypatch.setattr(hi.subprocess, "run", run_probe)
+
+    assert not hi.harness_cli_installed(OPENAI_FAMILY)
+    assert hi.missing_harness_cli("codex-native") == spec
+    assert hi.harness_cli_version(OPENAI_FAMILY)[0] is None
+    assert runs == 3
+
+    # Repairing a dependency need not change the launcher's file signature.
+    repaired = True
+    assert hi.harness_cli_installed(OPENAI_FAMILY)
+    assert hi.missing_harness_cli("codex-native") is None
+    assert hi.harness_cli_version(OPENAI_FAMILY)[0] == spec.min_version
+    assert runs == 4
 
 
 def test_cursor_install_spec_is_login_only_no_npm() -> None:
@@ -209,13 +579,17 @@ def test_antigravity_install_spec_launches_auth_service_no_npm() -> None:
     assert spec.auth_hint is not None
 
 
-def test_harness_setup_hint_antigravity_surfaces_sign_in() -> None:
+@pytest.mark.parametrize(
+    "harness",
+    ["antigravity-native", "native-antigravity", "agy-native", "native-agy"],
+)
+def test_harness_setup_hint_antigravity_surfaces_sign_in(harness: str) -> None:
     """A not-yet-signed-in agy is fixed by launching ``agy`` itself, so the
     launch hint names the installer AND the "run agy to sign in" step —
     otherwise a user who already has agy installed gets a misleading
     install-only hint.
     """
-    hint = hi.harness_setup_hint("antigravity-native")
+    hint = hi.harness_setup_hint(harness)
     assert "antigravity.google/cli/install.sh" in hint
     assert "agy" in hint
     assert "sign" in hint.lower()
@@ -304,10 +678,13 @@ def test_setup_hint_for_native_kiro_points_at_vendor_installer(harness: str) -> 
     assert "omni setup" not in hint
 
 
-@pytest.mark.parametrize("harness", ["claude-native", "codex", "pi", "claude-sdk", None])
+@pytest.mark.parametrize("harness", ["codex", "pi", "claude-sdk", None])
 def test_setup_hint_defaults_to_omnigent_setup(harness: str | None) -> None:
     """Harnesses whose CLI ``omni setup`` installs (npm CLIs) — and the
-    SDK / unknown / ``None`` cases — route to the ``omni setup`` hint."""
+    SDK / unknown / ``None`` cases — route to the ``omni setup`` hint.
+
+    ``claude-native`` is absent: it names Anthropic's installer instead.
+    """
     hint = hi.harness_setup_hint(harness)
     assert "omni setup" in hint
 
@@ -412,7 +789,7 @@ def test_install_harness_cli_requires_npm(monkeypatch: pytest.MonkeyPatch) -> No
         raise AssertionError("subprocess.run reached despite missing npm")
 
     monkeypatch.setattr(hi.subprocess, "run", _explode)
-    assert hi.install_harness_cli(ANTHROPIC_FAMILY) is False
+    assert hi.install_harness_cli(OPENAI_FAMILY) is False
 
 
 def test_try_install_harness_cli_missing_npm(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -427,9 +804,13 @@ def test_try_install_harness_cli_missing_npm(monkeypatch: pytest.MonkeyPatch) ->
         "run",
         lambda *a, **k: (_ for _ in ()).throw(AssertionError("should not shell out")),
     )
-    installed, reason = hi.try_install_harness_cli(ANTHROPIC_FAMILY)
+    installed, reason = hi.try_install_harness_cli(OPENAI_FAMILY)
     assert installed is False
     assert reason is not None and "npm" in reason
+    # Claude's installer is bash-based, so its reason names bash, not npm.
+    installed, reason = hi.try_install_harness_cli(ANTHROPIC_FAMILY)
+    assert installed is False
+    assert reason is not None and "bash" in reason
 
 
 def test_try_install_harness_cli_manual_only() -> None:
@@ -453,14 +834,174 @@ def test_try_install_harness_cli_nonzero_exit(monkeypatch: pytest.MonkeyPatch) -
         return "/usr/bin/npm" if name == "npm" else None
 
     monkeypatch.setattr(hi.shutil, "which", _which)
-    monkeypatch.setattr(
-        hi.subprocess,
-        "run",
-        lambda argv, **k: subprocess.CompletedProcess(args=argv, returncode=1),
-    )
+    monkeypatch.setattr(hi.subprocess, "Popen", fake_installer(returncode=1))
     installed, reason = hi.try_install_harness_cli(OPENAI_FAMILY)
     assert installed is False
     assert reason is not None and "code 1" in reason
+
+
+NPM_EACCES = (
+    "npm error code EACCES\n"
+    "npm error syscall mkdir\n"
+    "npm error path /usr/local/lib/node_modules/@openai\n"
+    "npm error Error: EACCES: permission denied, mkdir "
+    "'/usr/local/lib/node_modules/@openai'\n"
+)
+
+
+@pytest.mark.parametrize(
+    ("stderr", "expected"),
+    [
+        (NPM_EACCES, "permission denied writing the global install directory (npm EACCES)"),
+        (
+            "npm error code ECONNREFUSED\nnpm error request to "
+            "https://registry.npmjs.org/@openai%2fcodex failed\n",
+            "could not reach the npm registry (npm ECONNREFUSED)",
+        ),
+        ("npm error code E401\nnpm error Incorrect or missing password.\n", "rejected the creden"),
+        ("npm error code ENOSPC\nnpm error nospc ENOSPC: no space left\n", "no space left"),
+        # npm 9 and earlier spell the same line differently.
+        ("npm ERR! code EACCES\nnpm ERR! syscall mkdir\n", "permission denied"),
+    ],
+)
+def test_try_install_names_the_npm_failure_cause(
+    monkeypatch: pytest.MonkeyPatch, stderr: str, expected: str
+) -> None:
+    """A failed install reports what the user can fix, not just an exit code.
+
+    An unwritable global directory and an unreachable registry are both exit
+    code 1; reporting only that left the two indistinguishable in the toast.
+    """
+    monkeypatch.setattr(hi.shutil, "which", lambda name: "/usr/bin/npm" if name == "npm" else None)
+    monkeypatch.setattr(hi.subprocess, "Popen", fake_installer(returncode=1, stderr=stderr))
+
+    installed, reason = hi.try_install_harness_cli(OPENAI_FAMILY)
+
+    assert installed is False
+    assert reason is not None and expected in reason
+
+
+@pytest.mark.parametrize(
+    ("returncode", "stderr", "expected"),
+    [
+        (1, NPM_EACCES, "permission denied writing the global install directory (npm EACCES)"),
+        (0, "", "installer completed but 'codex' is still 0.1.0 (requires "),
+    ],
+)
+def test_try_install_reports_an_upgrade_that_left_the_old_cli(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    returncode: int,
+    stderr: str,
+    expected: str,
+) -> None:
+    """An upgrade that leaves the outdated CLI in place is a failure, not an install.
+
+    The old binary still resolves, so only the version check tells the two apart.
+    """
+    binary = tmp_path / "codex"
+    binary.write_text("#!/bin/sh\n", encoding="utf-8")
+    monkeypatch.setattr(hi, "resolve_cli_binary", lambda _name: str(binary))
+    monkeypatch.setattr(hi.shutil, "which", lambda _name: "/usr/bin/npm")
+    monkeypatch.setenv("PATH", str(tmp_path))
+
+    def run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        assert argv == [str(binary), "--version"], f"only version probes run here: {argv!r}"
+        return subprocess.CompletedProcess(argv, 0, "codex-cli 0.1.0\n", "")
+
+    monkeypatch.setattr(hi.subprocess, "run", run)
+    monkeypatch.setattr(
+        hi.subprocess, "Popen", fake_installer(returncode=returncode, stderr=stderr)
+    )
+
+    installed, reason = hi.try_install_harness_cli(OPENAI_FAMILY)
+
+    assert installed is False
+    assert reason is not None and expected in reason
+
+
+def test_try_install_falls_back_to_the_exit_code_for_unrecognized_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Output that identifies no known cause still yields a reason.
+
+    A vendor install script's output is not npm-shaped, so the bare exit code
+    remains the fallback rather than an error.
+    """
+    monkeypatch.setattr(hi.shutil, "which", lambda name: "/usr/bin/npm" if name == "npm" else None)
+    monkeypatch.setattr(
+        hi.subprocess,
+        "Popen",
+        fake_installer(returncode=2, stderr="curl: (22) The requested URL returned 404\n"),
+    )
+
+    installed, reason = hi.try_install_harness_cli(OPENAI_FAMILY)
+
+    assert installed is False
+    assert reason == "installer exited with code 2"
+
+
+def test_installer_stderr_still_reaches_this_process(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Reading the installer's stderr must not stop it being displayed.
+
+    The output is what makes a failure visible in the setup terminal and the
+    host log, so it is teed — captured for the reason *and* written through.
+    """
+    monkeypatch.setattr(hi.shutil, "which", lambda name: "/usr/bin/npm" if name == "npm" else None)
+    monkeypatch.setattr(hi.subprocess, "Popen", fake_installer(returncode=1, stderr=NPM_EACCES))
+
+    hi.try_install_harness_cli(OPENAI_FAMILY)
+
+    assert NPM_EACCES in capsys.readouterr().err
+
+
+def test_installer_timeout_kills_children_holding_stderr(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A timed-out installer's children die with it instead of holding stderr open.
+
+    Waiting on a pipe that a surviving child still writes to would stretch the
+    install timeout to that child's lifetime.
+    """
+    monkeypatch.setattr(hi.subprocess, "Popen", _REAL_POPEN)
+    pid_file, marker = tmp_path / "child.pid", tmp_path / "child-lived-60s"
+    installer = [sys.executable, "-c", _INSTALLER_LEAVING_A_CHILD]
+    installer += [str(pid_file), str(marker), "60", "0"]
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        hi._run_installer(installer, timeout=3)
+
+    assert not marker.exists(), "the timeout waited for the installer's child to finish"
+    child_pid = int(pid_file.read_text())
+    poll_until(lambda: not _proc.process_alive(child_pid), timeout_s=5, interval_s=0.05)
+
+
+def test_installer_returns_when_a_child_keeps_stderr_open(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An installer that exits while its child holds stderr returns without waiting for it.
+
+    The reason comes from what was teed before the drain wait gave up.
+    """
+    monkeypatch.setattr(hi.subprocess, "Popen", _REAL_POPEN)
+    monkeypatch.setattr(hi, "_INSTALLER_TEE_DRAIN_TIMEOUT_S", 0.5)
+    pid_file, marker = tmp_path / "child.pid", tmp_path / "child-lived-60s"
+    installer = [sys.executable, "-c", _INSTALLER_LEAVING_A_CHILD]
+    installer += [str(pid_file), str(marker), "0", "1"]
+
+    try:
+        returncode, stderr_tail = hi._run_installer(installer, timeout=30)
+        returned_before_child_finished = not marker.exists()
+    finally:
+        if pid_file.exists():
+            with contextlib.suppress(psutil.NoSuchProcess):
+                psutil.Process(int(pid_file.read_text())).kill()
+
+    assert returncode == 1
+    assert "npm error code EACCES" in stderr_tail
+    assert returned_before_child_finished, "the install call waited for the installer's child"
 
 
 def test_try_install_harness_cli_success(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -474,12 +1015,12 @@ def test_try_install_harness_cli_success(monkeypatch: pytest.MonkeyPatch) -> Non
             return "/usr/bin/codex" if state["installed"] else None
         return None
 
-    def _run(argv: list[str], **k: object):
-        state["installed"] = True
-        return subprocess.CompletedProcess(args=argv, returncode=0)
-
     monkeypatch.setattr(hi.shutil, "which", _which)
-    monkeypatch.setattr(hi.subprocess, "run", _run)
+    monkeypatch.setattr(
+        hi.subprocess,
+        "Popen",
+        fake_installer(on_call=lambda: state.__setitem__("installed", True)),
+    )
     assert hi.try_install_harness_cli(OPENAI_FAMILY) == (True, None)
 
 
@@ -505,13 +1046,7 @@ def test_try_install_harness_cli_success_when_binary_off_path(
     monkeypatch.setattr(hi.shutil, "which", lambda name: "/usr/bin/npm" if name == "npm" else None)
     monkeypatch.setattr(_platform, "_cli_fallback_dirs", lambda: (fallback_dir,))
 
-    def _run(argv: list[str], **k: object) -> subprocess.CompletedProcess[str]:
-        if len(argv) >= 2 and argv[1] == "--version":
-            out = "9.9.9\n"
-            return subprocess.CompletedProcess(args=argv, returncode=0, stdout=out, stderr="")
-        return subprocess.CompletedProcess(args=argv, returncode=0)
-
-    monkeypatch.setattr(hi.subprocess, "run", _run)
+    monkeypatch.setattr(hi.subprocess, "Popen", fake_installer())
 
     # Install verdict agrees with readiness: both see it installed.
     assert hi.try_install_harness_cli(OPENAI_FAMILY) == (True, None)
@@ -545,11 +1080,7 @@ def test_try_install_prepends_resolved_dir_so_login_can_find_binary(
     (npm_dir / "npm").chmod(0o755)
     monkeypatch.setenv("PATH", str(npm_dir))
     monkeypatch.setattr(_platform, "_cli_fallback_dirs", lambda: (fallback_dir,))
-    monkeypatch.setattr(
-        hi.subprocess,
-        "run",
-        lambda argv, **k: subprocess.CompletedProcess(args=argv, returncode=0),
-    )
+    monkeypatch.setattr(hi.subprocess, "Popen", fake_installer())
 
     # Before: a bare PATH lookup (what harness_login uses) can't find codex.
     assert shutil.which("codex") is None
@@ -574,13 +1105,12 @@ def test_install_harness_cli_runs_npm_then_rechecks(monkeypatch: pytest.MonkeyPa
             return "/usr/bin/codex" if state["installed"] else None
         return None
 
-    def _run(argv: list[str], *, check: bool = False, timeout: float | None = None):
-        calls.append(argv)
-        state["installed"] = True
-        return subprocess.CompletedProcess(args=argv, returncode=0)
-
     monkeypatch.setattr(hi.shutil, "which", _which)
-    monkeypatch.setattr(hi.subprocess, "run", _run)
+    monkeypatch.setattr(
+        hi.subprocess,
+        "Popen",
+        fake_installer(calls=calls, on_call=lambda: state.__setitem__("installed", True)),
+    )
 
     assert hi.install_harness_cli(OPENAI_FAMILY) is True
     assert calls == [["npm", "install", "-g", "@openai/codex"]]
@@ -600,13 +1130,12 @@ def test_install_harness_cli_runs_hermes_installer_then_rechecks(
             return "/usr/local/bin/hermes"
         return None
 
-    def _run(argv: list[str], *, check: bool = False, timeout: float | None = None):
-        calls.append(argv)
-        state["installed"] = True
-        return subprocess.CompletedProcess(args=argv, returncode=0)
-
     monkeypatch.setattr(hi.shutil, "which", _which)
-    monkeypatch.setattr(hi.subprocess, "run", _run)
+    monkeypatch.setattr(
+        hi.subprocess,
+        "Popen",
+        fake_installer(calls=calls, on_call=lambda: state.__setitem__("installed", True)),
+    )
 
     assert hi.install_harness_cli(hi.HERMES_KEY) is True
     spec = hi.harness_install_spec(hi.HERMES_KEY)
@@ -638,11 +1167,7 @@ def test_install_harness_cli_refreshes_user_local_bin(
     (bin_dir / "bash").chmod(0o755)
     monkeypatch.setenv("PATH", str(bin_dir))
     monkeypatch.setattr(_platform, "_cli_fallback_dirs", lambda: (user_bin,))
-    monkeypatch.setattr(
-        hi.subprocess,
-        "run",
-        lambda argv, *, check=False, timeout=None: subprocess.CompletedProcess(argv, 0),
-    )
+    monkeypatch.setattr(hi.subprocess, "Popen", fake_installer())
 
     assert hi.install_harness_cli(hi.HERMES_KEY) is True
     # The resolving dir (~/.local/bin) is now first on PATH, so a bare
@@ -898,7 +1423,7 @@ def test_harness_cli_logged_in_uses_claude_json_verdict(
     monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/bin/{name}")
 
     def _run(argv: list[str], **k: object):
-        assert argv == ["claude", "auth", "status"]  # the status subcommand
+        assert argv == ["/usr/bin/claude", "auth", "status"]  # discovered absolute binary
         return subprocess.CompletedProcess(
             args=argv, returncode=returncode, stdout=stdout, stderr=""
         )
@@ -925,7 +1450,7 @@ def test_harness_cli_logged_in_codex_uses_exit_code(
     monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/bin/{name}")
 
     def _run(argv: list[str], **k: object):
-        assert argv == ["codex", "login", "status"]  # the status subcommand
+        assert argv == ["/usr/bin/codex", "login", "status"]  # discovered absolute binary
         return subprocess.CompletedProcess(
             args=argv, returncode=returncode, stdout=stdout, stderr=""
         )
@@ -956,7 +1481,7 @@ def test_harness_cli_logged_in_uses_cursor_json_verdict(
     monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/bin/{name}")
 
     def _run(argv: list[str], **k: object):
-        assert argv == ["cursor-agent", "status", "--format", "json"]
+        assert argv == ["/usr/bin/cursor-agent", "status", "--format", "json"]
         return subprocess.CompletedProcess(
             args=argv, returncode=returncode, stdout=stdout, stderr=""
         )
@@ -1109,16 +1634,17 @@ def test_ui_setup_steps_generic_for_non_installable() -> None:
 @pytest.mark.parametrize(
     "key,min_version,max_version_exclusive",
     [
-        (hi.OPENCODE_KEY, "1.17.7", "1.18.0"),
+        (hi.OPENCODE_KEY, "1.17.7", "1.19.0"),
         (hi.CURSOR_KEY, "2026.06.02", None),
         (hi.KIMI_KEY, "0.7.0", None),
         (ANTHROPIC_FAMILY, "2.1.161", None),
         (OPENAI_FAMILY, "0.137.0", None),
-        (hi.PI_KEY, "0.79.0", None),
+        (hi.PI_KEY, "0.84.2", None),
         (hi.QWEN_KEY, "0.18.1", None),
         (hi.GOOSE_KEY, "1.38.0", None),
         (hi.HERMES_KEY, "0.17.0", None),
         (hi.KIRO_KEY, "2.10.0", None),
+        (GEMINI_FAMILY, "1.1.13", None),
     ],
 )
 def test_versioned_specs_declare_bounds(
@@ -1135,9 +1661,10 @@ def test_versioned_specs_declare_bounds(
     "version,expected",
     [
         ("1.17.6", False),  # below min
-        ("1.18.0", False),  # at max exclusive
+        ("1.19.0", False),  # at max exclusive
         ("2.0.0", False),  # above max
         ("1.17.8", True),  # inside range
+        ("1.18.16", True),  # inside range (1.18.x)
     ],
 )
 def test_harness_cli_installed_checks_version_for_versioned_specs(
@@ -1149,7 +1676,7 @@ def test_harness_cli_installed_checks_version_for_versioned_specs(
 
     def _run(argv: list[str], **k: object) -> subprocess.CompletedProcess[str]:
         if len(argv) >= 2 and argv[1] == "--version":
-            # OpenCode's supported range is [1.17.7, 1.18.0).
+            # OpenCode's supported range is [1.17.7, 1.19.0).
             return subprocess.CompletedProcess(
                 args=argv, returncode=0, stdout=f"{version}\n", stderr=""
             )
@@ -1238,6 +1765,57 @@ def test_the_kimi_floor_accepts_the_cli_this_spec_installs(
     assert hi.harness_cli_installed(hi.KIMI_KEY) is True
 
 
+@pytest.mark.parametrize("version", ["0.7.0", "0.32.0"])
+def test_the_kimi_floor_accepts_the_floor_and_the_reported_version(
+    monkeypatch: pytest.MonkeyPatch, version: str
+) -> None:
+    """The declared floor itself, and the build from #4278, must read as installed.
+
+    ``test_the_kimi_floor_accepts_the_cli_this_spec_installs`` covers the
+    general case at 0.34.0, and the default-floors parametrize covers 0.6.0 /
+    0.34.0. Neither pins the two values that carry the regression:
+
+    * ``0.7.0`` is the floor itself. An off-by-one there — ``>`` where the
+      comparison should be ``>=`` — rejects the exact version this spec
+      declares as supported, and every existing test still passes.
+    * ``0.32.0`` is the version the reporter ran when setup showed
+      "Kimi Code x Needs upgrade". Pinning the reported build is what makes
+      this a regression test for #4278 rather than for the floor in general.
+    """
+    monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    def _run(argv: list[str], **k: object) -> subprocess.CompletedProcess[str]:
+        if len(argv) >= 2 and argv[1] == "--version":
+            return subprocess.CompletedProcess(
+                args=argv, returncode=0, stdout=f"{version}\n", stderr=""
+            )
+        raise AssertionError(f"unexpected subprocess: {argv!r}")
+
+    monkeypatch.setattr(hi.subprocess, "run", _run)
+    assert hi.harness_cli_installed(hi.KIMI_KEY) is True
+
+
+def test_the_kimi_floor_stays_in_the_kimi_code_version_series() -> None:
+    """The kimi floor must name a ``kimi-code`` release, not a ``kimi-cli`` one.
+
+    ``test_the_kimi_floor_accepts_the_cli_this_spec_installs`` pins one shipping
+    version, so it catches the wrong-project regression only while ``kimi-code``
+    stays below that version. This guards the mistake itself: the two projects
+    share the ``kimi`` name and only their numbering tells them apart —
+    ``kimi-cli`` starts at 1.x, while the ``kimi-code`` binary this spec
+    installs is still a 0.x series. A floor re-derived from ``kimi-cli``'s
+    release list (#4278) is unreachable for every real install, so setup reads
+    "Needs upgrade" no matter how current the user's CLI is.
+
+    When ``kimi-code`` itself ships 1.0, this assertion is the deliberate stop:
+    raise the bound here alongside the floor rather than dropping the guard.
+    """
+    spec = hi.harness_install_spec(hi.KIMI_KEY)
+    assert spec is not None
+    assert spec.min_version is not None
+    assert Version(spec.min_version) < Version("1.0.0")
+
+
 def test_the_hermes_floor_accepts_the_shipping_version_line(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1277,19 +1855,6 @@ def test_harness_cli_installed_true_when_version_in_range(
 
     monkeypatch.setattr(hi.subprocess, "run", _run)
     assert hi.harness_cli_installed(hi.OPENCODE_KEY) is True
-
-
-def test_harness_cli_installed_ignores_upper_bound_for_unversioned_specs(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Harnesses without a version declaration are not probed with ``--version``."""
-    monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/bin/{name}")
-
-    def _explode(*a: object, **k: object) -> None:
-        raise AssertionError("version probe spawned for an unversioned harness")
-
-    monkeypatch.setattr(hi.subprocess, "run", _explode)
-    assert hi.harness_cli_installed(GEMINI_FAMILY) is True
 
 
 @pytest.mark.parametrize(

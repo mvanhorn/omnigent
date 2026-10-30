@@ -1,3 +1,4 @@
+import { SidebarDataProvider } from "@/hooks/useSidebarData";
 // Regression test for the "click sub-agent → rail tab jumps to Files" bug.
 //
 // When the user clicks a sub-agent row in the right rail, the navigation
@@ -22,16 +23,23 @@
 import type * as UseTerminalsModule from "@/hooks/useTerminals";
 import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
 import type * as UseSessionModule from "@/hooks/useSession";
+import type * as UseConversationsModule from "@/hooks/useConversations";
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
-import { MemoryRouter, Route, Routes } from "react-router-dom";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
+import { writeOpenSubagentsInPanel } from "@/lib/subagentPanelPreferences";
+import { subagentTabId } from "@/lib/subagentTabs";
+import type { Session } from "@/lib/types";
+import { writeWorkspacePanelDefault } from "@/lib/workspacePanelPreferences";
 
 // Match the AppShell.test.tsx mocks except DO NOT mock SubagentsPanel —
 // we want the real one so its <Link> renders.
-vi.mock("@/hooks/useConversations", () => ({
+vi.mock("@/hooks/useConversations", async (importOriginal) => ({
+  ...(await importOriginal<typeof UseConversationsModule>()),
   useConversations: vi.fn(),
   useStopSession: vi.fn(() => ({ mutate: vi.fn(), isPending: false })),
 }));
@@ -51,6 +59,11 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", () => ({
     isSuccess: true,
     isLoading: false,
   })),
+}));
+// AppShell reads the GitHub info to gate the rail's GitHub tab; keep it
+// loading here so no network-backed query fires.
+vi.mock("@/hooks/usePullRequests", () => ({
+  usePullRequestInfo: vi.fn(() => ({ data: undefined, isLoading: true })),
 }));
 vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
   // Keep the real module — childSessionsQueryKey, MAX_TREE_DEPTH, and
@@ -73,7 +86,10 @@ vi.mock("@/hooks/useAgents", () => ({
   useUpdateMcpServer: () => ({ mutate: vi.fn(), isPending: false, error: null }),
   useDeleteMcpServer: () => ({ mutate: vi.fn(), isPending: false, error: null }),
 }));
-vi.mock("./Sidebar", () => ({ Sidebar: () => <div data-testid="sidebar" /> }));
+vi.mock("./Sidebar", () => ({
+  Sidebar: () => <div data-testid="sidebar" />,
+  isMobileViewport: () => false,
+}));
 vi.mock("./FilesPanel", () => ({
   FilesPanel: () => <div data-testid="files-panel" />,
 }));
@@ -89,7 +105,6 @@ vi.mock("./FileViewer", () => ({
 vi.mock("./InlineTerminalsSection", () => ({
   InlineTerminalsSection: () => <div data-testid="inline-terminals-section" />,
 }));
-vi.mock("./TodoPanel", () => ({ TodoPanel: () => <div data-testid="todo-panel" /> }));
 vi.mock("./FilesPanelDrawer", () => ({
   FilesPanelDrawer: () => <div data-testid="files-panel-drawer" />,
 }));
@@ -99,11 +114,18 @@ vi.mock("./TerminalsPanel", () => ({
 vi.mock("@/components/icons/ClaudeIcon", () => ({
   ClaudeIcon: (props: Record<string, unknown>) => <svg {...props} data-icon="claude" />,
 }));
+// A sub-agent tab's transcript is covered by SideChatPane's own suite.
+vi.mock("@/components/chat/SideChatPane", () => ({
+  SideChatPane: ({ childId }: { childId: string }) => (
+    <div data-testid="side-chat-pane-stub">{childId}</div>
+  ),
+}));
 vi.mock("@/components/icons/NessieIcon", () => ({
   NessieIcon: (props: Record<string, unknown>) => <svg {...props} data-icon="nessie" />,
 }));
 
 import { AppShell } from "./AppShell";
+import { SubagentActivityMessage } from "@/components/blocks/SubagentActivityMessage";
 import { childSessionsQueryKey, useChildSessions } from "@/hooks/useChildSessions";
 import { useSession } from "@/hooks/useSession";
 import { useConversations } from "@/hooks/useConversations";
@@ -114,6 +136,7 @@ beforeEach(() => {
   // The rail's open-state persists per session in localStorage; clear it so
   // state written by one test (e.g. a collapse) can't leak into the next.
   localStorage.clear();
+  writeWorkspacePanelDefault("open");
   vi.mocked(useConversations).mockReset();
   vi.mocked(useConversations).mockReturnValue({
     data: {
@@ -142,9 +165,37 @@ beforeEach(() => {
   } as never);
 });
 
+function PathProbe() {
+  return <div data-testid="page">{useLocation().pathname}</div>;
+}
+
 describe("click sub-agent in rail (real SubagentsPanel)", () => {
-  it("keeps the right-rail tab on Subagents (does NOT shift to Files)", async () => {
-    // Setup: parent has one child sub-agent. User starts on parent
+  it("keeps the Agents tab and rail width across root, child, and sibling navigation", async () => {
+    const children = [
+      {
+        id: "conv_child",
+        title: null,
+        task_summary: null,
+        tool: "researcher",
+        session_name: null,
+        current_task_status: null,
+        busy: false,
+        last_message_preview: null,
+        pending_elicitations_count: 0,
+      },
+      {
+        id: "conv_sibling",
+        title: null,
+        task_summary: null,
+        tool: "researcher",
+        session_name: null,
+        current_task_status: null,
+        busy: false,
+        last_message_preview: null,
+        pending_elicitations_count: 0,
+      },
+    ];
+    // Setup: parent has two child sub-agents. User starts on parent
     // with the Agents tab selected; URL has ?file=foo.txt (stale from
     // a previous file-viewer interaction).
     //
@@ -160,18 +211,7 @@ describe("click sub-agent in rail (real SubagentsPanel)", () => {
     vi.mocked(useChildSessions).mockImplementation((id) => {
       if (id === "conv_root") {
         return {
-          children: [
-            {
-              id: "conv_child",
-              title: null,
-              tool: "researcher",
-              session_name: null,
-              current_task_status: null,
-              busy: false,
-              last_message_preview: null,
-              pending_elicitations_count: 0,
-            },
-          ],
+          children,
           isLoading: false,
           error: null,
         };
@@ -201,12 +241,10 @@ describe("click sub-agent in rail (real SubagentsPanel)", () => {
           error: null,
         } as never;
       }
-      // Simulate the real-world race: when the user navigates to a
-      // child, ``useSession(conv_child)`` is loading on first render
-      // — so ``activeSession`` is null. AppShell's
-      // ``rootSessionId = activeSession?.parentSessionId ?? conversationId``
-      // therefore briefly resolves to ``conv_child`` itself.
-      if (id === "conv_child") {
+      // Simulate the real-world race: when the user navigates to a child,
+      // ``useSession(conv_child)`` is loading on first render. Without the
+      // sticky root, the fallback would briefly resolve to the child itself.
+      if (id === "conv_child" || id === "conv_sibling") {
         return { session: null, isLoading: true, error: null } as never;
       }
       return { session: null, isLoading: false, error: null };
@@ -217,29 +255,21 @@ describe("click sub-agent in rail (real SubagentsPanel)", () => {
     // production (its useChildSessions queries write here). The sticky
     // root holds across the parent→child click only while the target is
     // a known member of the last root's cached tree.
-    qc.setQueryData(childSessionsQueryKey("conv_root"), [
-      {
-        id: "conv_child",
-        title: null,
-        tool: "researcher",
-        session_name: null,
-        current_task_status: null,
-        busy: false,
-        last_message_preview: null,
-        pending_elicitations_count: 0,
-      },
-    ]);
+    qc.setQueryData(childSessionsQueryKey("conv_root"), children);
+    writeSessionWorkspaceState("conv_root", { widthPx: 500 });
     render(
       <QueryClientProvider client={qc}>
-        <TooltipProvider>
-          <MemoryRouter initialEntries={["/c/conv_root?file=foo.txt"]}>
-            <Routes>
-              <Route element={<AppShell />}>
-                <Route path="c/:conversationId" element={<div data-testid="page" />} />
-              </Route>
-            </Routes>
-          </MemoryRouter>
-        </TooltipProvider>
+        <SidebarDataProvider>
+          <TooltipProvider>
+            <MemoryRouter initialEntries={["/c/conv_root?file=foo.txt"]}>
+              <Routes>
+                <Route element={<AppShell />}>
+                  <Route path="c/:conversationId" element={<div data-testid="page" />} />
+                </Route>
+              </Routes>
+            </MemoryRouter>
+          </TooltipProvider>
+        </SidebarDataProvider>
       </QueryClientProvider>,
     );
 
@@ -261,17 +291,364 @@ describe("click sub-agent in rail (real SubagentsPanel)", () => {
 
     // SubagentsPanel renders now that the tab is selected.
     const childRows = screen.getAllByTestId("subagent-row");
-    // Exactly one child row should render for this fixture's one child;
-    // zero means the panel never loaded, and more than one means duplicate
-    // or unrelated rows could hide the navigation target.
-    expect(childRows).toHaveLength(1);
+    expect(childRows).toHaveLength(2);
     expect(childRows[0]).toHaveAttribute("href", "/c/conv_child");
+    expect(screen.getByRole("complementary", { name: "Workspace" })).toHaveStyle({
+      width: "500px",
+    });
     fireEvent.click(childRows[0]);
 
     // After navigation: the same rail Agents tab we clicked must STILL be
     // mounted and selected, not just any matching tab elsewhere in the shell.
     expect(agentsTab.isConnected).toBe(true);
     expect(agentsTab).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByRole("complementary", { name: "Workspace" })).toHaveStyle({
+      width: "500px",
+    });
+
+    fireEvent.click(screen.getAllByTestId("subagent-row")[1]);
+    expect(screen.getByRole("complementary", { name: "Workspace" })).toHaveStyle({
+      width: "500px",
+    });
+
+    fireEvent.click(screen.getByTestId("subagent-main-row"));
+    expect(screen.getByRole("complementary", { name: "Workspace" })).toHaveStyle({
+      width: "500px",
+    });
+  });
+
+  it.each([undefined, "files"] as const)(
+    "returns from a deep-linked child to a root with remembered tab %s",
+    (rememberedTab) => {
+      vi.mocked(useChildSessions).mockReturnValue({ children: [], isLoading: false, error: null });
+      vi.mocked(useSession).mockImplementation((id) => ({
+        session: id
+          ? {
+              id,
+              agentId: "ag",
+              agentName: null,
+              runnerId: null,
+              status: "idle",
+              createdAt: 0,
+              title: null,
+              labels: {},
+              items: [],
+              pendingElicitations: [],
+              permissionLevel: 4,
+              parentSessionId: id === "conv_child" ? "conv_root" : null,
+              subAgentName: null,
+              kind: id === "conv_child" ? "sub_agent" : "default",
+            }
+          : null,
+        isLoading: false,
+        error: null,
+      }));
+      writeSessionWorkspaceState("conv_child", { rightRailTab: "subagents" });
+      if (rememberedTab) writeSessionWorkspaceState("conv_root", { rightRailTab: rememberedTab });
+      const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      qc.setQueryData(["rootSessionId", "conv_child"], "conv_root");
+      render(
+        <QueryClientProvider client={qc}>
+          <SidebarDataProvider>
+            <TooltipProvider>
+              <MemoryRouter initialEntries={["/c/conv_child"]}>
+                <Routes>
+                  <Route element={<AppShell />}>
+                    <Route path="c/:conversationId" element={<div data-testid="page" />} />
+                  </Route>
+                </Routes>
+              </MemoryRouter>
+            </TooltipProvider>
+          </SidebarDataProvider>
+        </QueryClientProvider>,
+      );
+      expect(screen.getByRole("tab", { name: /Agents/i })).toHaveAttribute("aria-selected", "true");
+      const mainRow = screen.getByTestId("subagent-main-row");
+      expect(mainRow).toHaveAttribute("href", "/c/conv_root");
+
+      fireEvent.click(mainRow);
+
+      const expectedTab = rememberedTab ? /Files/i : /Agents/i;
+      expect(screen.getByRole("tab", { name: expectedTab })).toHaveAttribute(
+        "aria-selected",
+        "true",
+      );
+      expect(readSessionWorkspaceState("conv_root").rightRailTab).toBe(
+        rememberedTab ?? "subagents",
+      );
+    },
+  );
+
+  /** Render `path` in a real shell over root → auth (→ tokens) and billing, with Agents open. */
+  function renderSubagentTree(path: string) {
+    const summary = (id: string, name: string) => ({
+      id,
+      title: `researcher:${name}`,
+      task_summary: null,
+      tool: "researcher",
+      session_name: name,
+      current_task_status: null,
+      busy: false,
+      last_message_preview: null,
+      pending_elicitations_count: 0,
+    });
+    const tree: Record<string, ReturnType<typeof summary>[]> = {
+      conv_root: [summary("conv_child", "auth"), summary("conv_sibling", "billing")],
+      conv_child: [summary("conv_grandchild", "tokens")],
+      conv_grandchild: [summary("conv_greatgrandchild", "expiry")],
+    };
+    vi.mocked(useChildSessions).mockImplementation((id) => ({
+      children: tree[id ?? ""] ?? [],
+      isLoading: false,
+      error: null,
+    }));
+    const snapshot = (id: string, parentSessionId: string | null, title: string | null) =>
+      ({
+        id,
+        agentId: "ag",
+        agentName: null,
+        runnerId: null,
+        status: "idle",
+        createdAt: 0,
+        title,
+        labels: {},
+        items: [],
+        pendingElicitations: [],
+        permissionLevel: 4,
+        parentSessionId,
+        subAgentName: null,
+        kind: parentSessionId === null ? "default" : "sub_agent",
+      }) satisfies Session;
+    const sessions: Record<string, Session> = {
+      conv_root: snapshot("conv_root", null, null),
+      conv_child: snapshot("conv_child", "conv_root", "researcher:auth"),
+      conv_sibling: snapshot("conv_sibling", "conv_root", "researcher:billing"),
+      conv_grandchild: snapshot("conv_grandchild", "conv_child", "researcher:tokens"),
+      conv_greatgrandchild: snapshot(
+        "conv_greatgrandchild",
+        "conv_grandchild",
+        "researcher:expiry",
+      ),
+    };
+    vi.mocked(useSession).mockImplementation((id) => ({
+      session: sessions[id ?? ""] ?? null,
+      isLoading: false,
+      error: null,
+    }));
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    for (const [id, children] of Object.entries(tree)) {
+      qc.setQueryData(childSessionsQueryKey(id), children);
+    }
+    for (const [id, session] of Object.entries(sessions)) qc.setQueryData(["session", id], session);
+    writeSessionWorkspaceState(path.split("?")[0].slice("/c/".length), {
+      rightRailTab: "subagents",
+    });
+    render(
+      <QueryClientProvider client={qc}>
+        <SidebarDataProvider>
+          <TooltipProvider>
+            <MemoryRouter initialEntries={[path]}>
+              <Routes>
+                <Route element={<AppShell />}>
+                  <Route
+                    path="c/:conversationId"
+                    element={
+                      <>
+                        <PathProbe />
+                        <SubagentActivityMessage
+                          data={{
+                            type: "resource_event",
+                            event_type: "session.subagent.delegated",
+                            resource_type: "session",
+                            resource_id: "conv_child",
+                            resource: { title: "Audit auth" },
+                          }}
+                        />
+                      </>
+                    }
+                  />
+                </Route>
+              </Routes>
+            </MemoryRouter>
+          </TooltipProvider>
+        </SidebarDataProvider>
+      </QueryClientProvider>,
+    );
+    return qc;
+  }
+
+  /** The Agents-tab row for `childId`, once the rail has rooted its tree. */
+  const agentRow = (childId: string) =>
+    waitFor(() => {
+      const row = screen
+        .getAllByTestId("subagent-row")
+        .find((candidate) => candidate.getAttribute("data-child-session-id") === childId);
+      expect(row).toBeDefined();
+      return row!;
+    });
+
+  it.each([
+    {
+      entry: "an Agents-tab row",
+      path: "/c/conv_root",
+      prepare: () => {},
+      click: async () => fireEvent.click(await agentRow("conv_child")),
+    },
+    {
+      entry: "a transcript link while execution logs cover the rail",
+      path: "/c/conv_root?debug=1",
+      prepare: () => {
+        fireEvent.click(screen.getByTestId("execution-log-row-main"));
+        expect(screen.getByTestId("execution-logs-panel")).toHaveAttribute("data-state", "open");
+      },
+      click: async () => fireEvent.click(screen.getByRole("link", { name: "Audit auth" })),
+    },
+  ])(
+    "opens a sub-agent from $entry as a rail tab beside the parent",
+    async ({ path, prepare, click }) => {
+      writeOpenSubagentsInPanel(true);
+      renderSubagentTree(path);
+      prepare();
+
+      await click();
+
+      expect(screen.getByTestId("page")).toHaveTextContent("/c/conv_root");
+      // The opener's revealRightPanel closes panels that cover the rail.
+      expect(screen.queryByTestId("execution-logs-panel")).not.toHaveAttribute(
+        "data-state",
+        "open",
+      );
+      const rail = screen.getByRole("complementary", { name: "Workspace" });
+      expect(within(rail).getByRole("tab", { name: "auth" })).toHaveAttribute(
+        "aria-selected",
+        "true",
+      );
+      expect(within(rail).getByTestId("side-chat-pane-stub")).toHaveTextContent("conv_child");
+    },
+  );
+
+  it("opens a sub-agent tab's full screen link on the Agents tab", async () => {
+    writeOpenSubagentsInPanel(true);
+    renderSubagentTree("/c/conv_root");
+    fireEvent.click(await agentRow("conv_child"));
+
+    const rail = screen.getByRole("complementary", { name: "Workspace" });
+    fireEvent.click(within(rail).getByRole("link", { name: "Open full screen" }));
+
+    expect(screen.getByTestId("page")).toHaveTextContent("/c/conv_child");
+    await waitFor(() =>
+      expect(within(rail).getByRole("tab", { name: /^Agents/ })).toHaveAttribute(
+        "aria-selected",
+        "true",
+      ),
+    );
+    // Remembered, so later clicks on this sub-agent from the Agents tab stay there.
+    expect(readSessionWorkspaceState("conv_child").rightRailTab).toBe("subagents");
+  });
+
+  it.each([
+    {
+      name: "navigates to an ancestor instead of opening it as a tab",
+      page: "conv_grandchild",
+      clicked: "conv_child",
+      tabs: undefined,
+    },
+    {
+      name: "navigates to an ancestor whose descendants' snapshots aren't loaded",
+      page: "conv_greatgrandchild",
+      clicked: "conv_child",
+      tabs: undefined,
+      uncached: "conv_grandchild",
+    },
+    {
+      name: "opens a sibling as a tab and stays on the chat on screen",
+      page: "conv_child",
+      clicked: "conv_sibling",
+      tabs: [subagentTabId("conv_sibling")],
+    },
+  ])("$name", async ({ page, clicked, tabs, uncached }) => {
+    writeOpenSubagentsInPanel(true);
+    const qc = renderSubagentTree(`/c/${page}`);
+    const row = await agentRow(clicked);
+    // The parent chain can't be walked past a snapshot that hasn't loaded.
+    if (uncached) qc.removeQueries({ queryKey: ["session", uncached] });
+
+    fireEvent.click(row);
+
+    expect(screen.getByTestId("page")).toHaveTextContent(
+      tabs === undefined ? `/c/${clicked}` : `/c/${page}`,
+    );
+    expect(readSessionWorkspaceState(page).openSubagentTabs).toEqual(tabs);
+  });
+
+  it("restores a saved width while a cold-loaded session snapshot is unresolved", () => {
+    vi.mocked(useChildSessions).mockReturnValue({
+      children: [],
+      isLoading: true,
+      error: null,
+    });
+    vi.mocked(useSession).mockReturnValue({
+      session: null,
+      isLoading: true,
+      error: null,
+    } as never);
+    writeSessionWorkspaceState("conv_cold", { widthPx: 500 });
+
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={qc}>
+        <SidebarDataProvider>
+          <TooltipProvider>
+            <MemoryRouter initialEntries={["/c/conv_cold"]}>
+              <Routes>
+                <Route element={<AppShell />}>
+                  <Route path="c/:conversationId" element={<div data-testid="page" />} />
+                </Route>
+              </Routes>
+            </MemoryRouter>
+          </TooltipProvider>
+        </SidebarDataProvider>
+      </QueryClientProvider>,
+    );
+
+    expect(screen.getByRole("complementary", { name: "Workspace" })).toHaveStyle({
+      width: "500px",
+    });
+  });
+
+  it("does not persist width under a cold-loaded child's tentative key", () => {
+    vi.mocked(useChildSessions).mockReturnValue({
+      children: [],
+      isLoading: true,
+      error: null,
+    });
+    vi.mocked(useSession).mockReturnValue({
+      session: null,
+      isLoading: true,
+      error: null,
+    } as never);
+
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={qc}>
+        <SidebarDataProvider>
+          <TooltipProvider>
+            <MemoryRouter initialEntries={["/c/conv_cold_child"]}>
+              <Routes>
+                <Route element={<AppShell />}>
+                  <Route path="c/:conversationId" element={<div data-testid="page" />} />
+                </Route>
+              </Routes>
+            </MemoryRouter>
+          </TooltipProvider>
+        </SidebarDataProvider>
+      </QueryClientProvider>,
+    );
+
+    fireEvent.keyDown(screen.getByRole("separator", { name: "Resize panel" }), {
+      key: "ArrowLeft",
+    });
+    expect(readSessionWorkspaceState("conv_cold_child").widthPx).toBeUndefined();
   });
 
   it("shows the Agents tab with count 1 while a childless session's initial fetch is loading", () => {
@@ -308,15 +685,17 @@ describe("click sub-agent in rail (real SubagentsPanel)", () => {
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     render(
       <QueryClientProvider client={qc}>
-        <TooltipProvider>
-          <MemoryRouter initialEntries={["/c/conv_solo"]}>
-            <Routes>
-              <Route element={<AppShell />}>
-                <Route path="c/:conversationId" element={<div data-testid="page" />} />
-              </Route>
-            </Routes>
-          </MemoryRouter>
-        </TooltipProvider>
+        <SidebarDataProvider>
+          <TooltipProvider>
+            <MemoryRouter initialEntries={["/c/conv_solo"]}>
+              <Routes>
+                <Route element={<AppShell />}>
+                  <Route path="c/:conversationId" element={<div data-testid="page" />} />
+                </Route>
+              </Routes>
+            </MemoryRouter>
+          </TooltipProvider>
+        </SidebarDataProvider>
       </QueryClientProvider>,
     );
 

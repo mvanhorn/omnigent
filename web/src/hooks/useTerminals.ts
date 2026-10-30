@@ -3,7 +3,9 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { authenticatedFetch } from "../lib/identity";
 import { useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
+import { isTempConvId } from "@/lib/tempConversationId";
 import { terminalInfoFromResource, terminalsQueryKey, type TerminalInfo } from "@/lib/terminals";
+import { showToast } from "@/components/ui/toast";
 
 export { terminalInfoFromResource, terminalsQueryKey, type TerminalInfo } from "@/lib/terminals";
 
@@ -55,6 +57,7 @@ export const AGENT_TERMINAL_IDS: ReadonlySet<string> = new Set([
   "terminal_antigravity_main",
   "terminal_kimi_main",
   "terminal_hermes_main",
+  "terminal_devin_main",
 ]);
 
 /**
@@ -72,9 +75,26 @@ export function isAgentTerminalKey(terminalKey: string): boolean {
 }
 
 /**
+ * Find the session's agent terminal, excluding user-created shells.
+ *
+ * The Chat/Terminal view toggle must use this selector instead of the first
+ * terminal in the resource list. A user shell can be the only cached row
+ * briefly while the agent terminal is starting or reconciling; treating that
+ * shell as a fallback duplicates it in the main viewport.
+ */
+/** Display label for a terminal, e.g. ``"zsh · u-abc123"``. */
+export function terminalDisplayLabel(terminal: TerminalInfo): string {
+  return terminal.session ? `${terminal.name} · ${terminal.session}` : terminal.name;
+}
+
+export function findAgentTerminal(terminals: TerminalInfo[]): TerminalInfo | null {
+  return terminals.find((terminal) => AGENT_TERMINAL_IDS.has(terminal.id)) ?? null;
+}
+
+/**
  * Project the terminal list down to the session's *inventory* — the
- * shells shown in the right-rail Shells tab, its count badge, and the
- * mobile menu entry.
+ * shells shown as the rail's soft tabs and in the mobile Shells menu
+ * entry / drawer.
  *
  * For terminal-first sessions (SDK and native alike) the agent's own
  * terminal is excluded: it is reachable through the pill's Terminal
@@ -91,15 +111,26 @@ export function inventoryTerminals(
   return terminals.filter((t) => !AGENT_TERMINAL_IDS.has(t.id));
 }
 
+// When each conversation's list last came from a complete runner answer. SSE
+// deltas, soft-status answers and failed fetches never set it.
+const completeTerminalListAt = new Map<string, number>();
+
 interface UseTerminalsResult {
   terminals: TerminalInfo[];
   isLoading: boolean;
+  /** True while the authoritative list is (re)fetching; SSE may have filled it partially. */
+  isFetching?: boolean;
+  /**
+   * Epoch ms of the last complete runner answer, 0 if none. Until then the list
+   * may hold only SSE-delivered terminals; absent means "not known complete".
+   */
+  listCompleteAt?: number;
   error: Error | null;
 }
 
 /**
  * How often (ms) to re-poll the authoritative terminals endpoint while
- * the runner reports a terminal is spinning up but none is visible yet.
+ * the runner reports the agent terminal is spinning up but it is not visible.
  * Short enough that the Terminal-pill spinner clears within a couple
  * seconds of the terminal landing; only active during that window, so it
  * adds no steady-state polling.
@@ -110,37 +141,37 @@ export const PENDING_RECONCILE_INTERVAL_MS = 2500;
  * Decide the React Query ``refetchInterval`` for the terminals query.
  *
  * Returns :data:`PENDING_RECONCILE_INTERVAL_MS` only while the runner
- * reports a terminal is spinning up (*reconcileWhilePending*) and none is
- * visible yet; ``false`` (no polling) the instant a terminal lands or
- * pending clears. Reading *terminalCount* keeps the poll self-limiting to
- * the Terminal-pill spinner window — no steady-state polling.
+ * reports the agent terminal is spinning up (*reconcileWhilePending*) and it
+ * is not visible; ``false`` (no polling) the instant the agent terminal lands or
+ * pending clears. A user shell does not satisfy the pending agent-terminal
+ * launch and must not stop reconciliation.
  *
  * :param reconcileWhilePending: Whether the runner reports a terminal
  *     spinning up (``terminalPending``).
- * :param terminalCount: Terminals currently in the query cache.
+ * :param agentTerminalAvailable: Whether the agent terminal is in the cache.
  * :returns: Poll interval in ms, or ``false`` to disable polling.
  */
 export function terminalsReconcileInterval(
   reconcileWhilePending: boolean,
-  terminalCount: number,
+  agentTerminalAvailable: boolean,
 ): number | false {
-  return reconcileWhilePending && terminalCount === 0 ? PENDING_RECONCILE_INTERVAL_MS : false;
+  return reconcileWhilePending && !agentTerminalAvailable ? PENDING_RECONCILE_INTERVAL_MS : false;
 }
 
 interface UseTerminalsOptions {
   /**
-   * When ``true`` (the runner is auto-creating a terminal — see
+   * When ``true`` (the runner is auto-creating the agent terminal — see
    * ``terminalPending``), poll :func:`fetchTerminals` every
-   * :data:`PENDING_RECONCILE_INTERVAL_MS` until a terminal appears.
+   * :data:`PENDING_RECONCILE_INTERVAL_MS` until the agent terminal appears.
    *
    * The query is otherwise fetch-once + live-SSE-delta driven. A single
    * missed ``session.resource.created`` delta (e.g. dropped through the
    * dbx-apps proxy before the SSE subscription opened, with the server's
    * best-effort snapshot-on-connect reconcile also timing out) would
-   * otherwise leave ``terminals`` empty — stranding the Terminal-pill
+   * otherwise leave the agent terminal absent — stranding the Terminal-pill
    * spinner on ``terminalPending && !terminalsAvailable`` until a manual
    * page refresh. This bounded reconcile poll self-heals that exact
-   * window: it stops the instant a terminal lands (or pending clears).
+   * window: it stops the instant the agent terminal lands (or pending clears).
    */
   reconcileWhilePending?: boolean;
 }
@@ -181,10 +212,15 @@ const SOFT_TERMINAL_LIST_STATUSES = new Set([404, 409, 502, 503]);
  * :raises Error: On a non-soft HTTP error status.
  */
 export async function fetchTerminals(conversationId: string): Promise<TerminalInfo[]> {
+  return (await fetchTerminalList(conversationId)) ?? [];
+}
+
+/** {@link fetchTerminals}, but null when the runner could not answer (a soft status). */
+async function fetchTerminalList(conversationId: string): Promise<TerminalInfo[] | null> {
   const res = await authenticatedFetch(
     `/v1/sessions/${encodeURIComponent(conversationId)}/resources/terminals?order=asc&limit=1000`,
   );
-  if (SOFT_TERMINAL_LIST_STATUSES.has(res.status)) return [];
+  if (SOFT_TERMINAL_LIST_STATUSES.has(res.status)) return null;
   if (!res.ok) throw new Error(`terminals fetch failed: ${res.status} ${res.statusText}`);
   const json = (await res.json()) as { data?: unknown };
   const rows = Array.isArray(json.data) ? json.data : [];
@@ -274,6 +310,63 @@ export function useCreateTerminal(conversationId: string) {
 }
 
 /**
+ * Delete (kill) a terminal for a conversation over HTTP.
+ *
+ * Issues DELETE on the terminal resource route, which the server proxies to
+ * the runner to terminate the PTY and drop the resource. The removal is also
+ * broadcast as a ``session.resource.deleted`` SSE delta that prunes the
+ * terminal from the query cache — so the tab closes even for callers that
+ * don't touch the cache themselves.
+ *
+ * :param conversationId: Session/conversation identifier.
+ * :param terminalId: Opaque terminal resource id (NOT the ``terminal:`` tab
+ *     key), e.g. ``"terminal_bash_s1"``.
+ * :raises Error: When the server rejects the delete (a 404 is treated as
+ *     success — the goal state, "no such terminal", already holds).
+ */
+export async function deleteTerminal(conversationId: string, terminalId: string): Promise<void> {
+  const res = await authenticatedFetch(
+    `/v1/sessions/${encodeURIComponent(conversationId)}/resources/terminals/${encodeURIComponent(terminalId)}`,
+    { method: "DELETE" },
+  );
+  if (!res.ok && res.status !== 404) {
+    throw new Error(`terminal delete failed: ${res.status} ${res.statusText}`);
+  }
+}
+
+/**
+ * Mutation hook around :func:`deleteTerminal`.
+ *
+ * On success the terminal is removed from the query cache immediately (by
+ * id), so its soft tab closes without waiting for the
+ * ``session.resource.deleted`` SSE round-trip (which still arrives and
+ * dedupes as a no-op).
+ *
+ * :param conversationId: Session/conversation identifier.
+ * :returns: TanStack mutation taking the terminal resource id.
+ */
+export function useDeleteTerminal(conversationId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (terminalId: string) => deleteTerminal(conversationId, terminalId),
+    onSuccess: (_result, terminalId) => {
+      const key = terminalsQueryKey(conversationId);
+      const current = queryClient.getQueryData<TerminalInfo[]>(key) ?? [];
+      queryClient.setQueryData<TerminalInfo[]>(
+        key,
+        current.filter((t) => t.id !== terminalId),
+      );
+    },
+    // The kill round-trips to the runner and can fail (offline runner, 403 for
+    // a non-editor, 500). Surface it — otherwise the tab silently reappears
+    // once ``isPending`` clears and the user has no idea the shell survived.
+    onError: () => {
+      showToast("Couldn't close the shell — it's still running.", { duration: 0 });
+    },
+  });
+}
+
+/**
  * Live terminals for a conversation.
  *
  * Two sources feed the same query cache, keyed by ``terminalsQueryKey``:
@@ -298,9 +391,13 @@ export function useCreateTerminal(conversationId: string) {
  * the fetched list with whatever is already cached, deduped by id.
  */
 export function useTerminals(
-  conversationId: string | null,
+  rawConversationId: string | null,
   options?: UseTerminalsOptions,
 ): UseTerminalsResult {
+  // A `temp:*` id is a client-only routing token (navigate-first new-chat
+  // window) with no server session — normalize it to null so no fetch/poll
+  // hits `/v1/sessions/temp:*/resources/terminals`, by construction.
+  const conversationId = isTempConvId(rawConversationId) ? null : rawConversationId;
   const queryClient = useQueryClient();
   const reconcileWhilePending = options?.reconcileWhilePending ?? false;
   // The terminal list is SSE-primary: live `session.resource.{created,deleted}`
@@ -313,14 +410,16 @@ export function useTerminals(
   // continuous mask would read stale-`false` during a cold/relaunch boot and
   // wrongly hide a terminal the SSE just delivered.
   const runnerOnline = useSessionRunnerOnline(conversationId ?? undefined);
-  const { data, isLoading, error } = useQuery({
+  const { data, isLoading, isFetching, error } = useQuery({
     queryKey:
       conversationId === null
         ? ["conversation", null, "terminals"]
         : terminalsQueryKey(conversationId),
     queryFn: async () => {
       const key = terminalsQueryKey(conversationId!);
-      const fetched = await fetchTerminals(conversationId!);
+      const list = await fetchTerminalList(conversationId!);
+      if (list !== null) completeTerminalListAt.set(conversationId!, Date.now());
+      const fetched = list ?? [];
       // Union with any SSE-written entries already in the cache so a
       // ``session.resource.created`` that raced the fetch is not lost.
       // Fetched rows win on id collision (they are the fresher snapshot).
@@ -335,11 +434,13 @@ export function useTerminals(
     // initial load without hammering an unreachable runner.
     retry: 1,
     // Self-heal a missed ``session.resource.created`` while a terminal is
-    // spinning up: poll the authoritative endpoint until one appears, then
-    // stop. Reads the query's own cached data for the stop condition so it
-    // never feeds back through the caller.
+    // spinning up: poll the authoritative endpoint until the agent pane
+    // appears, then stop. User shells are unrelated and do not satisfy it.
     refetchInterval: (query) =>
-      terminalsReconcileInterval(reconcileWhilePending, query.state.data?.length ?? 0),
+      terminalsReconcileInterval(
+        reconcileWhilePending,
+        findAgentTerminal(query.state.data ?? []) !== null,
+      ),
   });
   // The poll corrects the SSE-driven list ONLY on runner-liveness edges — it
   // never masks continuously. Two corrections, both keyed off the edge so a
@@ -361,6 +462,7 @@ export function useTerminals(
       if (runnerOnline === true && wasRunnerOnline.current !== true) {
         void queryClient.invalidateQueries({ queryKey: terminalsQueryKey(conversationId) });
       } else if (runnerOnline === false && wasRunnerOnline.current === true) {
+        completeTerminalListAt.delete(conversationId);
         queryClient.setQueryData<TerminalInfo[]>(terminalsQueryKey(conversationId), []);
       }
     }
@@ -371,6 +473,8 @@ export function useTerminals(
     // corrected on poll edges above). No continuous runner-online mask.
     terminals: data ?? [],
     isLoading,
+    isFetching,
+    listCompleteAt: conversationId === null ? 0 : (completeTerminalListAt.get(conversationId) ?? 0),
     error: (error as Error | null) ?? null,
   };
 }

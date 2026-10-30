@@ -47,6 +47,24 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
 from tests.runtime.policies.conftest import make_fixed_function_policy_spec
 
 
+def _rebind(store: SqlAlchemyConversationStore, conversation_id: str, agent_id: str) -> None:
+    """Repoint a session at another agent, as an out-of-band binding change."""
+    from sqlalchemy import update
+
+    from omnigent.db.db_models import SqlConversation, current_workspace_id
+
+    with store._conv_engine.begin() as conn:
+        result = conn.execute(
+            update(SqlConversation)
+            .where(
+                SqlConversation.workspace_id == current_workspace_id(),
+                SqlConversation.id == conversation_id,
+            )
+            .values(agent_id=agent_id)
+        )
+    assert result.rowcount == 1, f"rebind matched {result.rowcount} rows for {conversation_id!r}"
+
+
 def _sub_agent_title() -> str:
     """Return a unique sub-agent title (production sub-agents always have one)."""
     return f"test-agent:{uuid.uuid4().hex[:8]}"
@@ -89,10 +107,12 @@ name: no-guardrails
         conversation_id=conv.id,
         conversation_store=conversation_store,
     )
-    # No user-declared guardrails, but the hardcoded
-    # ask_on_add_policy guard is always present.
-    assert len(engine.policies) == 1
-    assert engine.policies[0].spec.name == "__ask_on_add_policy"
+    # No user-declared guardrails, but the hardcoded approval guards
+    # are always present.
+    assert [p.spec.name for p in engine.policies] == [
+        "__ask_on_add_policy",
+        "__ask_on_scheduled_task_change",
+    ]
     assert engine.label_defs == {}
     assert engine.labels == {}
 
@@ -120,9 +140,11 @@ guardrails: {}
         conversation_id=conv.id,
         conversation_store=conversation_store,
     )
-    # The only policy is the hardcoded ask_on_add_policy guard.
-    assert len(engine.policies) == 1
-    assert engine.policies[0].spec.name == "__ask_on_add_policy"
+    # Mandatory approval guards remain even without configured policies.
+    assert [p.spec.name for p in engine.policies] == [
+        "__ask_on_add_policy",
+        "__ask_on_scheduled_task_change",
+    ]
     assert engine.label_defs == {}
     assert engine.labels == {}
 
@@ -169,9 +191,15 @@ guardrails:
     # Names in YAML order — regression would reorder alphabet
     # or reverse direction.
     names = [p.spec.name for p in engine.policies]
-    # Declared policies in YAML order, plus the hardcoded
-    # ask_on_add_policy guard appended by the builder.
-    assert names == ["alpha", "bravo", "charlie", "__ask_on_add_policy"]
+    # Declared policies in YAML order, plus the mandatory approval
+    # guards appended by the builder.
+    assert names == [
+        "alpha",
+        "bravo",
+        "charlie",
+        "__ask_on_add_policy",
+        "__ask_on_scheduled_task_change",
+    ]
 
 
 def test_build_resolves_model_override_then_spec(
@@ -218,6 +246,86 @@ guardrails:
         conversation_store=conversation_store,
     )
     assert engine_after.model == "claude-sonnet-4-6"
+
+
+@pytest.mark.parametrize(
+    ("harness_override", "expected_cost"),
+    [
+        (None, 1.0),
+        ("codex", 10.0),
+    ],
+)
+def test_build_pricing_uses_effective_session_harness(
+    tmp_path: Path,
+    conversation_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+    harness_override: str | None,
+    expected_cost: float,
+) -> None:
+    """Custom pricing follows the session override, then the agent harness."""
+    agent_dir = _write_spec(
+        tmp_path,
+        """
+spec_version: 1
+name: custom-pricing-harness
+executor:
+  type: omnigent
+  config:
+    harness: claude-sdk
+llm:
+  model: self-hosted-model
+""",
+    )
+    spec = parse(agent_dir)
+    conv = conversation_store.create_conversation()
+    if harness_override is not None:
+        conversation_store.update_conversation(conv.id, harness_override=harness_override)
+
+    provider_config = {
+        "providers": {
+            "anthropic-local": {
+                "kind": "local",
+                "default": True,
+                "anthropic": {
+                    "base_url": "http://anthropic.local/v1",
+                    "api_key": "test",
+                    "pricing": {
+                        "input_per_million": 1.0,
+                        "output_per_million": 2.0,
+                    },
+                },
+            },
+            "openai-local": {
+                "kind": "local",
+                "default": True,
+                "openai": {
+                    "base_url": "http://openai.local/v1",
+                    "api_key": "test",
+                    "pricing": {
+                        "input_per_million": 10.0,
+                        "output_per_million": 20.0,
+                    },
+                },
+            },
+        }
+    }
+    monkeypatch.setattr(
+        "omnigent.onboarding.provider_config.load_config",
+        lambda: provider_config,
+    )
+
+    engine = build_policy_engine(
+        spec=spec,
+        conversation_id=conv.id,
+        conversation_store=conversation_store,
+    )
+    engine.record_usage(
+        input_tokens=1_000_000,
+        output_tokens=0,
+        total_tokens=1_000_000,
+    )
+
+    assert engine.usage["total_cost_usd"] == pytest.approx(expected_cost)
 
 
 def test_build_resolves_model_none_without_llm_or_override(
@@ -431,7 +539,10 @@ def test_build_from_programmatic_spec(
     )
     assert engine.ask_timeout == 45
     assert engine.policies[0].spec.name == "taint_web"
-    assert engine.policies[-1].spec.name == "__ask_on_add_policy"
+    assert [p.spec.name for p in engine.policies[-2:]] == [
+        "__ask_on_add_policy",
+        "__ask_on_scheduled_task_change",
+    ]
     assert engine.labels == {"integrity": "1"}
 
 
@@ -468,7 +579,12 @@ def test_default_policies_appended_after_agent_policies(
         default_policies=[admin_policy],
     )
     names = [p.spec.name for p in engine.policies]
-    assert names == ["agent_policy", "admin_policy", "__ask_on_add_policy"]
+    assert names == [
+        "agent_policy",
+        "admin_policy",
+        "__ask_on_add_policy",
+        "__ask_on_scheduled_task_change",
+    ]
 
 
 def test_default_policies_alone_builds_live_engine(
@@ -493,7 +609,10 @@ def test_default_policies_alone_builds_live_engine(
         default_policies=[admin_policy],
     )
     assert engine.policies[0].spec.name == "admin_audit"
-    assert engine.policies[-1].spec.name == "__ask_on_add_policy"
+    assert [p.spec.name for p in engine.policies[-2:]] == [
+        "__ask_on_add_policy",
+        "__ask_on_scheduled_task_change",
+    ]
 
 
 def test_empty_default_policies_preserves_existing_behaviour(
@@ -517,11 +636,10 @@ def test_empty_default_policies_preserves_existing_behaviour(
         conversation_store=conversation_store,
         default_policies=[],
     )
-    # Only the hardcoded ask_on_add_policy guard.
-    assert len(engine_none.policies) == 1
-    assert engine_none.policies[0].spec.name == "__ask_on_add_policy"
-    assert len(engine_empty.policies) == 1
-    assert engine_empty.policies[0].spec.name == "__ask_on_add_policy"
+    # Only the two hardcoded approval guards.
+    guards = ["__ask_on_add_policy", "__ask_on_scheduled_task_change"]
+    assert [p.spec.name for p in engine_none.policies] == guards
+    assert [p.spec.name for p in engine_empty.policies] == guards
 
 
 # ── Sub-agent cost roll-up (subtree usage aggregation) ──
@@ -1255,19 +1373,7 @@ def test_agent_rebind_after_spec_resolution_fails_closed(
     agent_a = "1" * 32
 
     def _switch(conv_id: str, new_agent_id: str) -> None:
-        # switch_conversation_agent inserts the target agent row, so each
-        # switch needs its own id.
-        conversation_store.switch_conversation_agent(
-            conv_id,
-            new_agent_id=new_agent_id,
-            new_agent_name="other",
-            new_agent_bundle_location="other/bundle",
-            new_agent_description=None,
-            copy_model_settings=False,
-            carry_history_into_native=False,
-            presentation_labels={},
-            previous_builtin_id=None,
-        )
+        _rebind(conversation_store, conv_id, new_agent_id)
 
     # Matching agent proceeds (guard must not be a blanket refusal).
     ok_conv = conversation_store.create_conversation(title="match", agent_id=agent_a)
@@ -1397,7 +1503,8 @@ def test_delete_of_a_root_inherited_key_does_not_resurrect_from_the_snapshot(
     assert engine.session_state[SESSION_COST_ASK_APPROVED_STATE_KEY] == 0.05
 
     engine.apply_state_updates(
-        [StateUpdate(key=SESSION_COST_ASK_APPROVED_STATE_KEY, action=StateUpdateAction.DELETE)]
+        [StateUpdate(key=SESSION_COST_ASK_APPROVED_STATE_KEY, action=StateUpdateAction.DELETE)],
+        approved=True,
     )
 
     assert SESSION_COST_ASK_APPROVED_STATE_KEY not in engine.session_state, engine.session_state
@@ -1440,12 +1547,14 @@ def test_delete_of_the_same_key_name_on_a_top_level_session_removes_it(
                 action=StateUpdateAction.SET,
                 value=0.05,
             )
-        ]
+        ],
+        approved=True,
     )
     assert engine.session_state[SESSION_COST_ASK_APPROVED_STATE_KEY] == 0.05
 
     engine.apply_state_updates(
-        [StateUpdate(key=SESSION_COST_ASK_APPROVED_STATE_KEY, action=StateUpdateAction.DELETE)]
+        [StateUpdate(key=SESSION_COST_ASK_APPROVED_STATE_KEY, action=StateUpdateAction.DELETE)],
+        approved=True,
     )
 
     assert SESSION_COST_ASK_APPROVED_STATE_KEY not in engine.session_state, engine.session_state
@@ -1603,17 +1712,7 @@ def test_mid_build_change_fails_closed_on_every_provenance(
     if hazard == "switch":
 
         def _apply() -> None:
-            conversation_store.switch_conversation_agent(
-                conv.id,
-                new_agent_id=uuid.uuid4().hex,
-                new_agent_name="other",
-                new_agent_bundle_location="other/bundle",
-                new_agent_description=None,
-                copy_model_settings=False,
-                carry_history_into_native=False,
-                presentation_labels={},
-                previous_builtin_id=None,
-            )
+            _rebind(conversation_store, conv.id, uuid.uuid4().hex)
 
         expected = "no longer resolves to agent"
     else:
@@ -1767,17 +1866,7 @@ def test_engine_refuses_a_tree_assembled_across_a_change(
             if not self._fired and any(c.id == child.id for c in page.data):
                 self._fired = True
                 if mutation == "switch":
-                    self._inner.switch_conversation_agent(
-                        child.id,
-                        new_agent_id=uuid.uuid4().hex,
-                        new_agent_name="other",
-                        new_agent_bundle_location="other/bundle",
-                        new_agent_description=None,
-                        copy_model_settings=False,
-                        carry_history_into_native=False,
-                        presentation_labels={},
-                        previous_builtin_id=None,
-                    )
+                    _rebind(self._inner, child.id, uuid.uuid4().hex)
                 else:
                     asyncio.run(self._inner.delete_conversation(child.id))
             return page
@@ -1785,11 +1874,20 @@ def test_engine_refuses_a_tree_assembled_across_a_change(
         def __getattr__(self, name: str):
             return getattr(self._inner, name)
 
-    # One row per page, so the tree genuinely pages.
+    # One row per page, so the tree genuinely pages. A switch survives the
+    # walk and is caught by the paged-tree guard ("moved"). A delete of the
+    # evaluated row invalidates the page cursor, so the walk restarts and the
+    # clean re-read observes the row is genuinely gone ("disappeared") — a
+    # different guard, same fail-closed refusal.
+    expected = (
+        "moved while its spawn tree"
+        if mutation == "switch"
+        else "disappeared while building its policy engine"
+    )
     original_page_size = builder_mod._SUBTREE_USAGE_PAGE_SIZE
     builder_mod._SUBTREE_USAGE_PAGE_SIZE = 1
     try:
-        with pytest.raises(OmnigentError, match="moved while its spawn tree"):
+        with pytest.raises(OmnigentError, match=expected):
             build_policy_engine(
                 spec=AgentSpec(spec_version=1, name="x"),
                 conversation_id=child.id,

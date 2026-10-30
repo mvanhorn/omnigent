@@ -13,10 +13,16 @@ count, so a wrong field turns the test red.
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import pytest
 
 from omnigent.onboarding import ambient
-from omnigent.onboarding.ambient import DetectedProvider, detect_providers
+from omnigent.onboarding.ambient import (
+    DetectedProvider,
+    detect_providers,
+)
 
 # Every provider env var ambient may read — cleared in the base fixture so
 # the host's own keys don't leak into the deterministic detection tests.
@@ -267,6 +273,52 @@ def test_codex_auth_without_credential_not_detected(clean_env, auth_json: str) -
     assert detect_providers() == []
 
 
+@pytest.mark.parametrize(
+    ("auth_json", "expected_mode"),
+    [
+        # apikey mode: only a baked-in OpenAI API key.
+        ('{"auth_mode": "apikey", "OPENAI_API_KEY": "sk-codex-real"}', "apikey"),
+        # chatgpt mode: OAuth tokens.
+        (
+            '{"auth_mode": "chatgpt", "tokens": {"access_token": "at-real", '
+            '"refresh_token": "", "id_token": ""}}',
+            "chatgpt",
+        ),
+        # refresh-token-only still authenticates as the ChatGPT plan.
+        ('{"tokens": {"access_token": "", "refresh_token": "rt-real"}}', "chatgpt"),
+        # tokens win over a co-present API key (mirrors codex's own resolution).
+        (
+            '{"OPENAI_API_KEY": "sk-x", "tokens": {"access_token": "at-real"}}',
+            "chatgpt",
+        ),
+        # enterprise / external-token integration.
+        ('{"personal_access_token": "pat-real"}', "pat"),
+        # no usable credential at all.
+        ("{}", None),
+        ('{"OPENAI_API_KEY": ""}', None),
+        ("not json at all", None),
+    ],
+)
+def test_codex_auth_effective_mode(clean_env, auth_json: str, expected_mode: str | None) -> None:
+    """``codex_auth_effective_mode`` names the credential the login really uses.
+
+    This is what lets the provider listing say "API key login" instead of a
+    bare "subscription" — a drift that sent quota diagnoses at the wrong
+    credential. Failure means the mode discriminator no longer mirrors the
+    codex CLI's own ``auth_mode`` resolution.
+    """
+    cred_dir = clean_env / ".codex"
+    cred_dir.mkdir()
+    auth_path = cred_dir / "auth.json"
+    auth_path.write_text(auth_json, encoding="utf-8")
+    assert ambient.codex_auth_effective_mode(auth_path) == expected_mode
+
+
+def test_codex_auth_effective_mode_missing_file(clean_env) -> None:
+    """A missing ``auth.json`` yields no mode (no login to describe)."""
+    assert ambient.codex_auth_effective_mode(clean_env / ".codex" / "auth.json") is None
+
+
 def test_claude_macos_keychain_login_detected(clean_env, monkeypatch: pytest.MonkeyPatch) -> None:
     """On macOS with no creds file, a Keychain login (CLI status) is detected.
 
@@ -429,14 +481,14 @@ def test_detection_priority_order(clean_env, monkeypatch: pytest.MonkeyPatch) ->
 
 # ── Codex config.toml custom provider (cli-config) detection ───────────────
 
-# The exact shape `isaac configure codex` writes (AI Gateway mode): a custom
+# The exact shape `isaac configure codex` writes (Unity Gateway mode): a custom
 # [model_providers.Databricks] table authenticated by a token-printing
 # command, selected via a top-level model_provider — and NO auth.json.
 _ISAAC_STYLE_CODEX_CONFIG = """
 model_provider = "Databricks"
 
 [model_providers.Databricks]
-name = "Databricks AI Gateway"
+name = "Databricks Unity Gateway"
 base_url = "https://example.ai-gateway.cloud.databricks.com/codex/v1"
 wire_api = "responses"
 
@@ -459,7 +511,7 @@ _ISAAC_STYLE_DETECTION = DetectedProvider(
     family="openai",
     source="~/.codex/config.toml provider 'Databricks'",
     model_provider="Databricks",
-    display_name="Databricks AI Gateway",
+    display_name="Databricks Unity Gateway",
 )
 
 
@@ -487,7 +539,19 @@ def test_codex_config_custom_provider_detected(clean_env) -> None:
     assert detect_providers() == [_ISAAC_STYLE_DETECTION]
 
 
-def test_codex_config_provider_transport_reads_base_url_and_auth(clean_env) -> None:
+@pytest.mark.parametrize(
+    ("settings", "refresh_interval", "timeout"),
+    [
+        ("timeout_ms = 5000\nrefresh_interval_ms = 1500000", 1_500_000, 5_000),
+        ("", 0, 20_000),
+        ("timeout_ms = 0\nrefresh_interval_ms = -1", 0, 20_000),
+        ('timeout_ms = "slow"\nrefresh_interval_ms = "often"', 0, 20_000),
+        ("timeout_ms = true\nrefresh_interval_ms = true", 0, 20_000),
+    ],
+)
+def test_codex_config_provider_transport_reads_base_url_and_auth(
+    clean_env, settings: str, refresh_interval: int, timeout: int
+) -> None:
     """``codex_config_provider_transport`` returns base_url + a shell auth command.
 
     The runtime-routing counterpart of the detection: pi-native reads this to
@@ -499,13 +563,20 @@ def test_codex_config_provider_transport_reads_base_url_and_auth(clean_env) -> N
         codex_config_provider_transport,
     )
 
-    _write_codex_config(clean_env, _ISAAC_STYLE_CODEX_CONFIG)
+    _write_codex_config(
+        clean_env,
+        _ISAAC_STYLE_CODEX_CONFIG.replace(
+            "timeout_ms = 5000\nrefresh_interval_ms = 1500000", settings
+        ),
+    )
     transport = codex_config_provider_transport(_codex_config_path(), "Databricks")
     assert transport is not None
     assert transport.base_url == "https://example.ai-gateway.cloud.databricks.com/codex/v1"
     assert transport.auth_command == (
         "jq -r .access_token /home/user/.databricks/model-serving-token.json"
     )
+    assert transport.auth_refresh_interval_ms == refresh_interval
+    assert transport.auth_timeout_ms == timeout
 
 
 def test_codex_config_provider_transport_missing_table_returns_none(clean_env) -> None:
@@ -665,6 +736,11 @@ def test_codex_config_not_detected(clean_env, label: str, body: str) -> None:
             "authorization-header",
             '[model_providers.Custom.http_headers]\nAuthorization = "Bearer tok"',
         ),
+        # Azure-style API key header.
+        (
+            "api-key-header",
+            '[model_providers.Custom.http_headers]\napi-key = "ak-test"',
+        ),
     ],
 )
 def test_codex_config_other_self_contained_auth_detected(
@@ -747,3 +823,231 @@ def test_vertex_claude_not_detected_when_incomplete(
     for var, val in env.items():
         monkeypatch.setenv(var, val)
     assert detect_providers() == []
+
+
+def test_prewarm_detect_providers_is_consumed_once(
+    clean_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A prewarmed sweep serves exactly the next detection, then expires.
+
+    One-shot semantics keep staleness bounded: only the runner-boot consumer
+    (seconds after the prewarm) sees the snapshot; every later call runs a
+    fresh sweep, exactly as before the prewarm existed.
+    """
+    sweeps: list[str] = []
+    sentinel = [
+        DetectedProvider(name="claude", kind="subscription", family="anthropic", source="test")
+    ]
+
+    def _fake_sweep() -> list[DetectedProvider]:
+        sweeps.append("sweep")
+        return sentinel
+
+    monkeypatch.setattr(ambient, "_detect_providers_now", _fake_sweep)
+    monkeypatch.setattr(ambient, "_prewarmed_detection", None)
+
+    ambient.prewarm_detect_providers()
+    # Consumes the prewarmed future — no second sweep.
+    assert detect_providers() == sentinel
+    assert sweeps == ["sweep"]
+    # The next call is fresh, not the stale snapshot.
+    assert detect_providers() == sentinel
+    assert sweeps == ["sweep", "sweep"]
+
+
+def test_prewarm_detect_providers_failure_falls_back_to_fresh_sweep(
+    clean_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A crashed speculative sweep must not poison the real detection."""
+    sweeps: list[str] = []
+
+    def _flaky_sweep() -> list[DetectedProvider]:
+        sweeps.append("sweep")
+        if len(sweeps) == 1:
+            raise RuntimeError("scripted prewarm failure")
+        return []
+
+    monkeypatch.setattr(ambient, "_detect_providers_now", _flaky_sweep)
+    monkeypatch.setattr(ambient, "_prewarmed_detection", None)
+
+    ambient.prewarm_detect_providers()
+    assert detect_providers() == []
+    assert sweeps == ["sweep", "sweep"]
+
+
+# --- Claude Code managed-settings gateway (the `isaac configure claude` shape) ---
+#
+# The credential lives in Claude Code's own enterprise settings, so omnigent
+# REFLECTS it (readiness + label) but surfaces it as the existing `subscription`
+# credential — never a new `cli-config` provider shape, which released/stale
+# runners reject at parse (the version-skew break that got the first attempt
+# reverted). These tests pin that: detection yields a subscription, and the
+# managed paths are read from an explicit tuple (absolute paths escape $HOME).
+
+_ISAAC_CLAUDE_SETTINGS: dict[str, object] = {
+    "env": {
+        "ANTHROPIC_BASE_URL": "https://dbc-test.cloud.databricks.com/ai-gateway/anthropic",
+        "ANTHROPIC_DEFAULT_OPUS_MODEL": "system.ai.claude-opus-4-8",
+    },
+    "apiKeyHelper": "jq -r '.access_token' ~/.databricks/model-serving-token.json",
+}
+
+
+def _write_managed_settings(home, monkeypatch, payload: object):
+    """Write a Claude Code managed-settings file and point detection at it."""
+    import json
+
+    path = home / "managed-settings.json"
+    path.write_text(json.dumps(payload))
+    monkeypatch.setattr(ambient, "CLAUDE_CODE_MANAGED_SETTINGS_PATHS", (path,))
+    return path
+
+
+def test_claude_managed_gateway_reads_base_url_and_credential(clean_env, monkeypatch) -> None:
+    """An isaac-style settings file yields (base_url, has_credential=True)."""
+    _write_managed_settings(clean_env, monkeypatch, _ISAAC_CLAUDE_SETTINGS)
+    base_url, has_credential = ambient.claude_managed_gateway()
+    assert base_url == "https://dbc-test.cloud.databricks.com/ai-gateway/anthropic"
+    assert has_credential is True
+
+
+def test_claude_managed_gateway_detected_as_subscription_not_cli_config(
+    clean_env, monkeypatch
+) -> None:
+    """The managed gateway surfaces as a `claude` SUBSCRIPTION, never `cli-config`.
+
+    This is the load-bearing safety property: a `cli-config cli:claude` entry is
+    a poison pill an older runner's parser rejects, breaking every turn. Failure
+    here means the revert's root cause has been reintroduced.
+    """
+    _write_managed_settings(clean_env, monkeypatch, _ISAAC_CLAUDE_SETTINGS)
+    detected = detect_providers()
+    assert [(d.name, d.kind, d.family) for d in detected] == [
+        ("claude", "subscription", "anthropic")
+    ]
+    assert detected[0].source == "Claude Code managed settings"
+    assert all(d.kind != "cli-config" or d.name != "claude" for d in detected)
+
+
+def test_claude_managed_gateway_wins_over_cli_login_no_double_count(
+    clean_env, monkeypatch
+) -> None:
+    """Gateway present AND `claude auth status` logged-in → ONE claude subscription.
+
+    `claude auth status` reports a managed apiKeyHelper as logged in, so the two
+    signals describe the same credential; detection must not emit it twice.
+    """
+    from omnigent.onboarding import harness_install
+
+    monkeypatch.setattr(harness_install, "harness_cli_logged_in", lambda key: True)
+    _write_managed_settings(clean_env, monkeypatch, _ISAAC_CLAUDE_SETTINGS)
+    claude_rows = [d for d in detect_providers() if d.name == "claude"]
+    assert len(claude_rows) == 1
+    assert claude_rows[0].source == "Claude Code managed settings"
+
+
+def test_claude_cli_login_still_detected_without_managed_gateway(clean_env, monkeypatch) -> None:
+    """With no managed gateway, an ordinary CLI login is still detected."""
+    from omnigent.onboarding import harness_install
+
+    monkeypatch.setattr(harness_install, "harness_cli_logged_in", lambda key: True)
+    monkeypatch.setattr(ambient.sys, "platform", "darwin")
+    monkeypatch.setattr(ambient, "CLAUDE_CODE_MANAGED_SETTINGS_PATHS", ())
+    claude_rows = [d for d in detect_providers() if d.name == "claude"]
+    assert [(d.kind, d.source) for d in claude_rows] == [("subscription", "claude CLI login")]
+
+
+def test_claude_managed_gateway_synthesizes_a_subscription_entry(clean_env, monkeypatch) -> None:
+    """The adopted/synthesized entry is a plain subscription — old-parser-safe.
+
+    Proves the shape written to (and merged into) config.yaml is
+    `{kind: subscription, cli: claude}` — a value every released parser accepts —
+    with NO `cli-config` / `model_provider` / new field.
+    """
+    from omnigent.onboarding.detected import synthesize_detected_entries
+
+    _write_managed_settings(clean_env, monkeypatch, _ISAAC_CLAUDE_SETTINGS)
+    entries = synthesize_detected_entries(detect_providers())
+    assert entries["claude"] == {"kind": "subscription", "cli": "claude"}
+
+
+@pytest.mark.parametrize(
+    "payload,expected",
+    [
+        (_ISAAC_CLAUDE_SETTINGS, "Databricks Unity Gateway"),
+        (
+            {
+                "env": {"ANTHROPIC_BASE_URL": "https://llm.corp.example.com/v1"},
+                "apiKeyHelper": "print-token",
+            },
+            "llm.corp.example.com",
+        ),
+        ({"apiKeyHelper": "print-token"}, "Claude Code gateway"),  # helper, no base URL
+        ({"env": {"ANTHROPIC_BASE_URL": "https://x.cloud.databricks.com/ai-gateway/a"}}, None),
+        ({"env": {"MCP_TOOL_TIMEOUT": "1"}}, None),
+    ],
+)
+def test_claude_managed_gateway_display_name(
+    clean_env, monkeypatch, payload: object, expected: object
+) -> None:
+    """The display label reflects the backing; None when no credential is delivered."""
+    _write_managed_settings(clean_env, monkeypatch, payload)
+    assert ambient.claude_managed_gateway_display_name() == expected
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        (_ISAAC_CLAUDE_SETTINGS, "https://dbc-test.cloud.databricks.com/ai-gateway/anthropic"),
+        ({"env": {"ANTHROPIC_BASE_URL": "https://api.anthropic.com"}, "apiKeyHelper": "t"}, None),
+        ({"env": {"ANTHROPIC_BASE_URL": "https://gw.example/anthropic"}}, None),
+        ({"apiKeyHelper": "print-token"}, None),
+    ],
+)
+def test_claude_managed_gateway_routes(
+    clean_env, monkeypatch, payload: object, expected: str | None
+) -> None:
+    """Only a credentialed, non-Anthropic managed gateway owns Claude routing."""
+    _write_managed_settings(clean_env, monkeypatch, payload)
+    assert ambient.claude_managed_gateway_routes() == expected
+
+
+def test_claude_managed_gateway_missing_file_is_graceful(clean_env, monkeypatch) -> None:
+    """An absent settings file yields (None, False) rather than raising."""
+    monkeypatch.setattr(ambient, "CLAUDE_CODE_MANAGED_SETTINGS_PATHS", (clean_env / "nope.json",))
+    assert ambient.claude_managed_gateway() == (None, False)
+    assert [d for d in detect_providers() if d.name == "claude"] == []
+
+
+def test_claude_managed_gateway_first_readable_file_decides(clean_env, monkeypatch) -> None:
+    """A higher-precedence file without a gateway is not overridden by a lower one."""
+    import json
+
+    high = clean_env / "high.json"
+    high.write_text(json.dumps({"env": {"MCP_TOOL_TIMEOUT": "1"}}))
+    low = clean_env / "low.json"
+    low.write_text(json.dumps(_ISAAC_CLAUDE_SETTINGS))
+    monkeypatch.setattr(ambient, "CLAUDE_CODE_MANAGED_SETTINGS_PATHS", (high, low))
+    assert ambient.claude_managed_gateway() == (None, False)
+
+
+def test_claude_managed_model_picker_reads_replacement_options(tmp_path: Path) -> None:
+    path = tmp_path / "managed-settings.json"
+    path.write_text(
+        json.dumps(
+            {
+                "modelPicker": {
+                    "options": [
+                        {"model": "gateway-opus", "label": "Opus"},
+                        {"model": "gateway-sonnet", "label": "Sonnet"},
+                    ],
+                    "replaceBuiltInOptions": True,
+                }
+            }
+        )
+    )
+
+    assert ambient.claude_managed_model_picker((path,)) == (
+        ("gateway-opus", "Opus"),
+        ("gateway-sonnet", "Sonnet"),
+    )

@@ -10,6 +10,7 @@ import urllib.error
 from datetime import UTC, datetime
 from email.message import Message
 from typing import Any
+from unittest.mock import patch
 
 SCRIPT_PATH = pathlib.Path(__file__).with_name("waiting_on_author.py")
 SPEC = importlib.util.spec_from_file_location("waiting_on_author", SCRIPT_PATH)
@@ -63,6 +64,8 @@ class FakeAPI:
         issue_comments: dict[int, list[dict[str, Any]]] | None = None,
         review_comments: dict[int, list[dict[str, Any]]] | None = None,
         reviews: dict[int, list[dict[str, Any]]] | None = None,
+        review_by_id: dict[tuple[int, int], dict[str, Any]] | None = None,
+        review_comment_by_id: dict[int, dict[str, Any]] | None = None,
         commits: dict[int, list[dict[str, Any]]] | None = None,
         writers: list[str] | None = None,
     ):
@@ -73,6 +76,8 @@ class FakeAPI:
         self.issue_comments = issue_comments or {}
         self.review_comments = review_comments or {}
         self.reviews = reviews or {}
+        self.review_by_id = review_by_id or {}
+        self.review_comment_by_id = review_comment_by_id or {}
         self.commits = commits or {}
         self.removed: list[tuple[int, str]] = []
         self.closed: list[int] = []
@@ -82,6 +87,12 @@ class FakeAPI:
 
     def get_pull(self, pull_number: int) -> dict[str, Any]:
         return self.pull | {"number": pull_number}
+
+    def get_review(self, pull_number: int, review_id: int) -> dict[str, Any]:
+        return self.review_by_id[(pull_number, review_id)]
+
+    def get_review_comment(self, comment_id: int) -> dict[str, Any]:
+        return self.review_comment_by_id[comment_id]
 
     def remove_label(self, issue_number: int, label: str) -> bool:
         self.removed.append((issue_number, label))
@@ -259,6 +270,85 @@ class WaitingOnAuthorTest(unittest.TestCase):
 
 
 class WaitingForReviewTest(unittest.TestCase):
+    def test_invalid_pause_config_leaves_handoff_state_unchanged(self) -> None:
+        invalid_configs = [
+            "{",
+            '{"assignment_paused":null}',
+            '{"assignment_paused":"paused"}',
+            '{"assignment_paused":{"paused":true}}',
+            '{"assignment_paused":[42]}',
+            '{"assignment_paused":[""]}',
+        ]
+        for scheduled in [False, True]:
+            for config in [*invalid_configs, FileNotFoundError("areas.json")]:
+                with self.subTest(scheduled=scheduled, config=config):
+                    api = FakeAPI(
+                        pull=pr(author="alice", assignees=["maintainer1"]),
+                        issues=[issue(12)],
+                        timeline_by_issue={12: [labeled_at("2026-07-01T00:00:00Z")]},
+                        issue_comments={
+                            12: [
+                                {
+                                    "user": {"login": "alice"},
+                                    "created_at": "2026-07-20T00:00:00Z",
+                                }
+                            ]
+                        },
+                    )
+                    read_result = (
+                        {"side_effect": config}
+                        if isinstance(config, Exception)
+                        else {"return_value": config}
+                    )
+                    with patch.object(waiting_on_author.Path, "read_text", **read_result):
+                        if scheduled:
+                            waiting_on_author.close_stale_waiting_prs(
+                                api, now=datetime(2026, 7, 24, tzinfo=UTC)
+                            )
+                        else:
+                            with self.assertRaises((ValueError, FileNotFoundError)):
+                                waiting_on_author.clear_on_author_activity(
+                                    "issue_comment",
+                                    {
+                                        "issue": {"number": 12, "pull_request": {}},
+                                        "comment": {"user": {"login": "alice"}},
+                                    },
+                                    api,
+                                )
+                    self.assertEqual(api.removed, [])
+                    self.assertEqual(api.added, [])
+                    self.assertEqual(api.review_requests, [])
+                    self.assertEqual(api.closed, [])
+                    self.assertEqual(api.comments, [])
+
+    def test_handoff_skips_when_waiting_label_already_removed(self) -> None:
+        api = FakeAPI()
+        with patch.object(api, "remove_label", return_value=False):
+            changed = waiting_on_author.hand_off_to_reviewer(
+                api, pr(assignees=["maintainer1"]), "author replied"
+            )
+        self.assertFalse(changed)
+        self.assertEqual(api.added, [])
+        self.assertEqual(api.review_requests, [])
+
+    def test_handoff_excludes_paused_assignees_and_reviewers(self) -> None:
+        api = FakeAPI()
+        pull = pr(assignees=["paused", "active"], requested_reviewers=["PAUSED"])
+        with patch.object(
+            waiting_on_author.Path, "read_text", return_value='{"assignment_paused":["Paused"]}'
+        ):
+            waiting_on_author.hand_off_to_reviewer(api, pull, "author replied")
+        self.assertEqual(api.review_requests, [(12, ["active"])])
+
+    def test_handoff_with_every_owner_paused_still_updates_label(self) -> None:
+        api = FakeAPI()
+        with patch.object(
+            waiting_on_author.Path, "read_text", return_value='{"assignment_paused":["paused"]}'
+        ):
+            waiting_on_author.hand_off_to_reviewer(api, pr(assignees=["PAUSED"]), "author replied")
+        self.assertEqual(api.review_requests, [])
+        self.assertEqual(api.added, [(12, waiting_on_author.REVIEW_LABEL)])
+
     def test_author_reply_hands_off_to_reviewer(self) -> None:
         api = FakeAPI(pull=pr(author="alice", assignees=["maintainer1"]))
         waiting_on_author.clear_on_author_activity(
@@ -442,6 +532,21 @@ class AutoWaitingOnAuthorTest(unittest.TestCase):
         )
         self.assertEqual(api.added, [])
 
+    def test_dismissed_review_leaves_the_label_alone(self) -> None:
+        api = self.dispatch(
+            "pull_request_review",
+            {
+                "pull_request": {"number": 12},
+                "review": {
+                    "user": {"login": "maintainer1"},
+                    "state": "dismissed",
+                    "body": "stale feedback",
+                },
+            },
+            pull=pr(labels=[]),
+        )
+        self.assertEqual(api.added, [])
+
     def test_commenting_review_applies_the_label(self) -> None:
         api = self.dispatch(
             "pull_request_review",
@@ -482,6 +587,99 @@ class AutoWaitingOnAuthorTest(unittest.TestCase):
             pull=pr(labels=[]),
         )
         self.assertEqual(api.added, [(12, waiting_on_author.LABEL)])
+
+    def test_relayed_review_rehydrates_trusted_api_data(self) -> None:
+        pull = pr(labels=[]) | {"base": {"repo": {"full_name": waiting_on_author.CANONICAL_REPO}}}
+        api = FakeAPI(
+            pull=pull,
+            review_by_id={
+                (12, 41): {
+                    "id": 41,
+                    "user": {"login": "maintainer1"},
+                    "state": "changes_requested",
+                    "body": "please fix",
+                }
+            },
+        )
+        event, payload = waiting_on_author.hydrate_relay_event(
+            {"event_name": "pull_request_review", "pull_number": 12, "activity_id": 41},
+            api,
+            waiting_on_author.CANONICAL_REPO,
+            "pull_request_review",
+        )
+
+        waiting_on_author.run(event, payload, api, waiting_on_author.CANONICAL_REPO)
+
+        self.assertEqual(api.added, [(12, waiting_on_author.LABEL)])
+
+    def test_relayed_review_comment_rehydrates_author_reply(self) -> None:
+        pull = pr(author="alice") | {
+            "base": {"repo": {"full_name": waiting_on_author.CANONICAL_REPO}}
+        }
+        api = FakeAPI(
+            pull=pull,
+            review_comment_by_id={
+                73: {
+                    "id": 73,
+                    "user": {"login": "alice"},
+                    "body": "fixed",
+                    "pull_request_url": (
+                        "https://api.github.com/repos/omnigent-ai/omnigent/pulls/12"
+                    ),
+                }
+            },
+        )
+        event, payload = waiting_on_author.hydrate_relay_event(
+            {
+                "event_name": "pull_request_review_comment",
+                "pull_number": 12,
+                "activity_id": 73,
+            },
+            api,
+            waiting_on_author.CANONICAL_REPO,
+            "pull_request_review_comment",
+        )
+
+        waiting_on_author.run(event, payload, api, waiting_on_author.CANONICAL_REPO)
+
+        self.assertEqual(api.removed, [(12, waiting_on_author.LABEL)])
+
+    def test_relayed_review_comment_must_match_pull(self) -> None:
+        pull = pr() | {"base": {"repo": {"full_name": waiting_on_author.CANONICAL_REPO}}}
+        api = FakeAPI(
+            pull=pull,
+            review_comment_by_id={
+                73: {
+                    "id": 73,
+                    "pull_request_url": (
+                        "https://api.github.com/repos/omnigent-ai/omnigent/pulls/99"
+                    ),
+                }
+            },
+        )
+
+        with self.assertRaisesRegex(ValueError, "does not belong"):
+            waiting_on_author.hydrate_relay_event(
+                {
+                    "event_name": "pull_request_review_comment",
+                    "pull_number": 12,
+                    "activity_id": 73,
+                },
+                api,
+                waiting_on_author.CANONICAL_REPO,
+                "pull_request_review_comment",
+            )
+
+    def test_relayed_event_must_match_workflow_event(self) -> None:
+        api = FakeAPI()
+
+        with self.assertRaisesRegex(ValueError, "does not match workflow event"):
+            waiting_on_author.hydrate_relay_event(
+                {"event_name": "pull_request_review", "pull_number": 12, "activity_id": 41},
+                api,
+                waiting_on_author.CANONICAL_REPO,
+                "pull_request_review_comment",
+            )
 
     def test_applying_clears_waiting_for_review(self) -> None:
         api = self.dispatch(

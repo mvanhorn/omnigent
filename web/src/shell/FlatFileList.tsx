@@ -1,12 +1,21 @@
-import { FileIcon } from "lucide-react";
 import { useState } from "react";
 import { RunnerOfflineError, type WorkspaceChangedFile } from "@/hooks/useWorkspaceChangedFiles";
 import { RunnerAsleepHint } from "./RunnerAsleepHint";
 import { cn } from "@/lib/utils";
 import { TooltipProvider } from "@/components/ui/tooltip";
-import { gitStatusLabel, gitStatusLetter } from "./fileStatusUtils";
+import {
+  ROW_ACTION_SIZE_CLASS,
+  ROW_META_SLOT_CLASS,
+  ROW_STATUS_SLOT_CLASS,
+  formatBytes,
+  gitStatusLabel,
+  gitStatusLetter,
+} from "./fileStatusUtils";
+import { CopyPathButton } from "./CopyPathButton";
 import { FileDownloadButton } from "./FileDownloadButton";
+import { useRevealMenu } from "./RevealInFileManager";
 import { useCursorTooltip } from "./useCursorTooltip";
+import { WorkspaceFileIcon } from "./WorkspaceFileIcon";
 
 export type { ChangedSort } from "@/lib/changedSort";
 import type { ChangedSort } from "@/lib/changedSort";
@@ -141,6 +150,7 @@ function FileListItem({
   conversationId: string | undefined;
 }) {
   const { handlers, tooltip } = useCursorTooltip(file.path);
+  const reveal = useRevealMenu(isDeleted ? null : file.path);
   const slash = file.path.lastIndexOf("/");
   const dir = slash > 0 ? file.path.slice(0, slash) : "";
   const hasDownload = !isDeleted && Boolean(conversationId);
@@ -148,8 +158,9 @@ function FileListItem({
   return (
     <li>
       <div
+        onContextMenu={reveal.onContextMenu}
         className={cn(
-          "group flex w-full min-w-0 items-center gap-2 rounded-md px-2 py-1",
+          "group flex w-full min-w-0 items-center gap-2 rounded-md py-0.5 pr-1 pl-2",
           isDeleted ? "opacity-50" : "hover:bg-muted",
         )}
       >
@@ -162,39 +173,40 @@ function FileListItem({
           onClick={() => !isDeleted && onFileSelect(file.path)}
           disabled={isDeleted}
         >
-          <FileIcon className="size-3.5 shrink-0 self-center text-muted-foreground" />
-          <span
-            className={cn("truncate font-mono text-ui md:text-sm", isDeleted && "line-through")}
-            {...handlers}
-          >
+          <WorkspaceFileIcon path={file.path} className="self-center" />
+          <span className={cn("truncate text-ui", isDeleted && "line-through")} {...handlers}>
             {file.name}
           </span>
           {dir && <span className="truncate text-muted-foreground text-sm">{dir}</span>}
         </button>
-        {((file.lines_added ?? 0) !== 0 || (file.lines_removed ?? 0) !== 0) && (
-          <span
-            className="shrink-0 font-mono text-[10px]"
-            aria-label={[
-              file.lines_added !== null && `${file.lines_added} lines added`,
-              file.lines_removed !== null && `${file.lines_removed} removed`,
-            ]
-              .filter(Boolean)
-              .join(", ")}
-          >
-            {file.lines_added !== null && (
-              <span className="text-green-600 dark:text-green-400">+{file.lines_added}</span>
-            )}
-            {file.lines_added !== null && file.lines_removed !== null && " "}
-            {file.lines_removed !== null && (
-              <span className="text-destructive">&minus;{file.lines_removed}</span>
-            )}
-          </span>
-        )}
-        <span className="relative flex shrink-0 items-center justify-center">
+        {/* Fixed-width and always rendered: a variable diffstat ("+7 −1" vs
+            "+1204 −318") would otherwise shift the copy button and status
+            letter to a different x on every row. */}
+        <span className={cn("flex shrink-0 items-center justify-end", ROW_META_SLOT_CLASS)}>
+          {((file.lines_added ?? 0) !== 0 || (file.lines_removed ?? 0) !== 0) && (
+            <span
+              className="font-mono text-[10px]"
+              aria-label={[
+                file.lines_added !== null && `${file.lines_added} lines added`,
+                file.lines_removed !== null && `${file.lines_removed} removed`,
+              ]
+                .filter(Boolean)
+                .join(", ")}
+            >
+              {file.lines_added !== null && (
+                <span className="text-green-600 dark:text-green-400">+{file.lines_added}</span>
+              )}
+              {file.lines_added !== null && file.lines_removed !== null && " "}
+              {file.lines_removed !== null && (
+                <span className="text-destructive">&minus;{file.lines_removed}</span>
+              )}
+            </span>
+          )}
+        </span>
+        <span className={cn("flex shrink-0 items-center justify-center", ROW_STATUS_SLOT_CLASS)}>
           <span
             className={cn(
               "rounded px-1 py-0.5 font-mono text-[10px]",
-              hasDownload && "group-hover:invisible",
               isDeleted
                 ? "bg-destructive/10 text-destructive"
                 : file.status === "created"
@@ -205,12 +217,27 @@ function FileListItem({
           >
             {gitStatusLetter(file.status)}
           </span>
-          {hasDownload && conversationId && (
-            <span className="absolute inset-0 flex items-center justify-center">
-              <FileDownloadButton conversationId={conversationId} path={file.path} />
+        </span>
+        {/* File size at rest, replaced by copy/download actions on hover — the
+            same far-right slot used by the Files tree. */}
+        <span
+          className={cn("relative flex shrink-0 items-center justify-end", ROW_META_SLOT_CLASS)}
+        >
+          {file.bytes !== null && !isDeleted && (
+            <span className="text-muted-foreground text-sm group-hover:invisible">
+              {formatBytes(file.bytes)}
             </span>
           )}
+          <span className="absolute inset-0 flex items-center justify-end gap-1">
+            {hasDownload && conversationId ? (
+              <FileDownloadButton conversationId={conversationId} path={file.path} />
+            ) : (
+              <span className={cn("shrink-0", ROW_ACTION_SIZE_CLASS)} aria-hidden />
+            )}
+            <CopyPathButton path={file.path} revealOnHover />
+          </span>
         </span>
+        {reveal.menu}
       </div>
       {tooltip}
     </li>
@@ -299,7 +326,7 @@ export function FlatFileList({
     return (
       <>
         {stageControl}
-        <p className="px-2 py-1 text-muted-foreground text-xs">No {stageChange}</p>
+        <p className="px-2 py-1 text-muted-foreground text-sm">No {stageChange}</p>
       </>
     );
   }
@@ -307,7 +334,7 @@ export function FlatFileList({
     return (
       <>
         {stageControl}
-        <p className="px-2 py-1 text-muted-foreground text-xs">
+        <p className="px-2 py-1 text-muted-foreground text-sm">
           All {stageChange} are in hidden files.{" "}
           <button
             type="button"
@@ -324,7 +351,7 @@ export function FlatFileList({
     return (
       <>
         {stageControl}
-        <p className="px-2 py-1 text-muted-foreground text-xs">
+        <p className="px-2 py-1 text-muted-foreground text-sm">
           No {stageFiles} match "{searchQuery.trim()}"
         </p>
       </>

@@ -8,7 +8,10 @@ reload instead of falling back to the empty-session start screen.
 
 from __future__ import annotations
 
+import os
+
 import httpx
+import pytest
 from playwright.sync_api import Page, expect
 
 
@@ -263,6 +266,7 @@ def _seed_item(
     resp.raise_for_status()
 
 
+@pytest.mark.compat_smoke
 def test_bare_idle_finalizes_turn_and_folds(
     page: Page,
     seeded_session: tuple[str, str],
@@ -330,11 +334,14 @@ def test_bare_idle_finalizes_turn_and_folds(
     # Turn is live (running + streaming lifecycle) — the trace must be
     # expanded, no fold yet.
     expect(bubble.locator('[data-testid="turn-worked-fold"]')).to_have_count(0)
+    working = page.get_by_test_id("working-indicator")
+    expect(working).to_be_visible(timeout=15_000)
 
     # The bare terminal edge: no response_id, like the PTY-activity relay.
     _publish_status(base_url, session_id, "idle")
 
     # The fold must appear IN PLACE — no reload between publish and assert.
+    expect(working).to_have_count(0, timeout=15_000)
     expect(bubble.locator('[data-testid="turn-worked-fold"]').first).to_be_visible(timeout=15_000)
 
 
@@ -423,19 +430,116 @@ def _seed_completed_tool_call(
     )
 
 
-def test_stepwise_step_edges_fold_once(
+def test_interjected_answer_starts_worked_fold_expanded(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """A reply to a mid-response user message is visible after reload.
+
+    Native harnesses can persist a user steering message inside the response
+    already doing work. The assistant may answer that message, resume its prior
+    work, and finish with a separate wrap-up. Each work run starts expanded
+    because the response contains an interjection. All assistant messages stay
+    visible when either disclosure closes.
+
+    :param page: Playwright page fixture.
+    :param seeded_session: ``(base_url, session_id)`` from the local server.
+    :returns: None.
+    """
+    base_url, session_id = seeded_session
+    response_id = "resp_interjected_answer_1"
+
+    _seed_assistant_message(
+        base_url,
+        session_id,
+        text="Waiting for the merge to finish.",
+        response_id=response_id,
+    )
+    _seed_user_message(
+        base_url,
+        session_id,
+        text="[Request interrupted by user]",
+        response_id=response_id,
+    )
+    _seed_user_message(
+        base_url,
+        session_id,
+        text="Does this conflict with the other change?",
+        response_id=response_id,
+    )
+    _seed_assistant_message(
+        base_url,
+        session_id,
+        text="Checking the overlap.",
+        response_id=response_id,
+    )
+    _seed_completed_tool_call(
+        base_url,
+        session_id,
+        response_id=response_id,
+        call_id="call_interjection_diff",
+        arguments='{"command": "git diff --stat"}',
+        output="No overlapping files.\n",
+    )
+    _seed_assistant_message(
+        base_url,
+        session_id,
+        text="No code conflict.",
+        response_id=response_id,
+    )
+    _seed_completed_tool_call(
+        base_url,
+        session_id,
+        response_id=response_id,
+        call_id="call_interjection_merge",
+        arguments='{"command": "git merge --continue"}',
+        output="Merge completed.\n",
+    )
+    _seed_assistant_message(
+        base_url,
+        session_id,
+        text="Merge complete.",
+        response_id=response_id,
+    )
+
+    page.goto(f"{base_url}/c/{session_id}")
+    continuation = page.locator(
+        _ASSISTANT_BUBBLE,
+        has=page.get_by_text("Merge complete.", exact=True),
+    ).first
+    expect(continuation).to_be_visible(timeout=20_000)
+    folds = continuation.locator(_FOLD)
+    expect(folds).to_have_count(2)
+    first_trigger = folds.nth(0).locator('[data-slot="collapsible-trigger"]').first
+    second_trigger = folds.nth(1).locator('[data-slot="collapsible-trigger"]').first
+    expect(first_trigger).to_have_attribute("aria-expanded", "true")
+    expect(second_trigger).to_have_attribute("aria-expanded", "true")
+    expect(continuation.get_by_text("Checking the overlap.", exact=True)).to_be_visible()
+    expect(continuation.get_by_text("No code conflict.", exact=True)).to_be_visible()
+
+    first_trigger.click()
+    expect(first_trigger).to_have_attribute("aria-expanded", "false")
+    expect(second_trigger).to_have_attribute("aria-expanded", "true")
+    second_trigger.click()
+    expect(second_trigger).to_have_attribute("aria-expanded", "false")
+    expect(continuation.get_by_text("Checking the overlap.", exact=True)).to_be_visible()
+    expect(continuation.get_by_text("No code conflict.", exact=True)).to_be_visible()
+    expect(continuation.get_by_text("Merge complete.", exact=True)).to_be_visible()
+
+
+def test_stepwise_step_edges_keep_one_bubble_with_three_work_folds(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
     """
-    A codex goal-mode turn folds once despite per-step status edges.
+    A codex goal-mode turn stays in one bubble despite per-step status edges.
 
     Goal mode publishes a DISTINCT response id on every step's
     running/idle edge while all conversation items carry ONE thread id.
     Each between-step idle used to settle a per-step bubble, so a
-    multi-step goal grew one "Worked for" fold per step and the folds
-    flickered while later steps ran. The whole thread must render as one
-    bubble that folds exactly once when the goal settles.
+    multi-step goal grew one bubble per step and the folds flickered while
+    later steps ran. The whole thread must render as one bubble, with one
+    stable work disclosure for each step after the goal settles.
 
     :param page: Playwright page fixture.
     :param seeded_session: ``(base_url, session_id)`` from the local server.
@@ -487,7 +591,10 @@ def test_stepwise_step_edges_fold_once(
 
     expect(page.locator(_FOLD).first).to_be_visible(timeout=15_000)
     assert page.locator(_ASSISTANT_BUBBLE).count() == 1
-    assert page.locator(_FOLD).count() == 1
+    expect(page.locator(_FOLD)).to_have_count(3)
+    for step in (1, 2, 3):
+        expect(page.get_by_text(f"Step {step}: narration.", exact=True)).to_be_visible()
+    expect(page.get_by_text("All three steps are done.", exact=True)).to_be_visible()
 
 
 def test_distinct_item_rids_fold_once_per_user_message(
@@ -657,6 +764,7 @@ def test_prior_fold_holds_through_followup_send(
     assert fold.count() == 2
 
 
+@pytest.mark.nightly
 def test_settled_fold_holds_through_scheduled_wake(
     page: Page,
     seeded_session: tuple[str, str],
@@ -756,3 +864,302 @@ def test_settled_fold_holds_through_scheduled_wake(
     expect(fold.nth(1)).to_be_visible(timeout=15_000)
     assert fold.count() == 2
     assert page.locator(_ASSISTANT_BUBBLE).count() == 2
+
+
+_LATENCY_QUESTION = (
+    "can you help me understand the definition of this latency? "
+    "what's the start time and what's the end time"
+)
+_LATENCY_ANSWER = (
+    "It is end-to-end launch latency: wall-clock seconds from asking to launch the "
+    "job to user code running on the GPU pod.\n\n"
+    "The start clock is captured in the Makefile right before it invokes `air run`; "
+    "the end clock is the first line of the job's command block on the remote pod."
+)
+_TASK_NOTIFICATION = "\n".join(
+    [
+        "<task-notification>",
+        "<task-id>b3f9a2c1d</task-id>",
+        "<tool-use-id>toolu_bdrk_01Xy7Q2PfLm8RkVn3Ws4Tz9A</tool-use-id>",
+        "<output-file>/tmp/claude/tasks/b3f9a2c1d.output</output-file>",
+        "<status>completed</status>",
+        (
+            '<summary>Background command "air run -f cases/latency_launch_hello_world/run.yml" '
+            + "completed (exit code 0)</summary>"
+        ),
+        "</task-notification>",
+    ]
+)
+_RUNS_SUMMARY = (
+    "Both additional runs succeeded.\n\n"
+    "**df1 latency_launch_hello_world (civ4) — 3 runs total**\n\n"
+    "| # | Launch latency (s) | Run |\n|---|---|---|\n"
+    "| 1 | 40 | 864427556073297 |\n| 2 | 35 | 60354668994037 |\n| 3 | 37 | 236213654141952 |"
+)
+
+
+def _assert_answer_outside_fold(page: Page) -> None:
+    """Assert the pre-wake answer and the wake marker render, with one fold.
+
+    :param page: Playwright page fixture.
+    :returns: None.
+    """
+    fold = page.locator(_FOLD)
+    expect(fold.first).to_be_visible(timeout=15_000)
+    expect(fold).to_have_count(1)
+    # The answer Claude finished BEFORE the wake must stay readable without
+    # expanding anything; folding it behind the follow-up work is the bug.
+    expect(page.get_by_text("It is end-to-end launch latency", exact=False)).to_be_visible()
+    marker = page.get_by_test_id("system-message")
+    expect(marker).to_be_visible()
+    expect(marker).to_contain_text("Background task completed")
+    expect(page.get_by_text("Both additional runs succeeded.", exact=False)).to_be_visible()
+    expect(page.locator(_ASSISTANT_BUBBLE)).to_have_count(2)
+
+
+def test_background_task_wake_keeps_prior_answer_visible(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """
+    A finished answer stays visible when Claude resumes on a background task.
+
+    Claude Code reports a finished background shell task by injecting a
+    ``<task-notification>`` user entry and starting a NEW turn on it, with
+    no human message in between. The claude-native forwarder mirrors that
+    entry as an ``is_meta`` user item. Grouping every assistant item after
+    the real user message into one bubble folded the already-complete
+    answer behind the follow-up work's "Worked for" row, so the chat showed
+    only the wrap-up text while the terminal showed the answer.
+
+    The wake must render as a muted system marker that starts a new bubble:
+    the answer keeps its own bubble and only the follow-up work folds. The
+    wire order below is the one observed live (answer, idle edge, hidden
+    notification, running edge, tool work, wrap-up, idle edge). Asserted
+    live and again after a reload, because both views must agree.
+
+    :param page: Playwright page fixture.
+    :param seeded_session: ``(base_url, session_id)`` from the local server.
+    :returns: None.
+    """
+    base_url, session_id = seeded_session
+
+    page.goto(f"{base_url}/c/{session_id}")
+    expect(page.get_by_role("textbox", name="Message the agent")).to_be_visible(timeout=20_000)
+
+    _seed_user_message(base_url, session_id, text=_LATENCY_QUESTION, response_id="resp_q")
+    _publish_status(base_url, session_id, "running", response_id="resp_answer")
+    _seed_assistant_message(base_url, session_id, text=_LATENCY_ANSWER, response_id="resp_answer")
+    _publish_status(base_url, session_id, "idle", response_id="resp_answer")
+    expect(page.get_by_text("It is end-to-end launch latency", exact=False)).to_be_visible(
+        timeout=15_000
+    )
+
+    # Claude Code wakes on the finished background task: a hidden meta user
+    # entry, then a fresh turn's running edge and its tool work.
+    _seed_item(
+        base_url,
+        session_id,
+        item_type="message",
+        item_data={
+            "role": "user",
+            "is_meta": True,
+            "content": [{"type": "input_text", "text": _TASK_NOTIFICATION}],
+        },
+        response_id="resp_wake",
+    )
+    _publish_status(base_url, session_id, "running", response_id="resp_followup")
+    _seed_assistant_message(
+        base_url,
+        session_id,
+        text="Both background runs finished — pulling their launch metrics.",
+        response_id="resp_followup",
+    )
+    _seed_completed_tool_call(
+        base_url,
+        session_id,
+        response_id="resp_followup",
+        call_id="call_wake_runs",
+        arguments='{"command": "air runs list --latest 2 --format json"}',
+        output=(
+            '[{"run": "864427556073297", "launch_s": 40}, '
+            '{"run": "60354668994037", "launch_s": 35}]\n'
+        ),
+    )
+    _seed_assistant_message(base_url, session_id, text=_RUNS_SUMMARY, response_id="resp_followup")
+    _publish_status(base_url, session_id, "idle", response_id="resp_followup")
+
+    _assert_answer_outside_fold(page)
+
+    page.reload()
+    expect(page.get_by_role("textbox", name="Message the agent")).to_be_visible(timeout=20_000)
+    _assert_answer_outside_fold(page)
+
+
+_PLACEHOLDER_ANSWER = "Lorem ipsum dolor sit amet, consectetur adipiscing elit."
+
+
+def _hold_for_recording(page: Page, milliseconds: int = 1_500) -> None:
+    """Leave a visible state on screen long enough to read in a demo recording.
+
+    :param page: Playwright page being driven.
+    :param milliseconds: Hold time when recording, e.g. ``1500``.
+    :returns: None.
+    """
+    if os.environ.get("OMNIGENT_E2E_RECORD_DIR"):
+        page.wait_for_timeout(milliseconds)
+
+
+def _set_final_answer_preference(page: Page, *, enabled: bool) -> None:
+    """Flip Settings → Appearance → "Show only the final answer" and return to the chat.
+
+    :param page: Playwright page showing a conversation.
+    :param enabled: The toggle state to leave behind, e.g. ``True``.
+    :returns: None.
+    """
+    page.get_by_role("link", name="Settings", exact=True).click()
+    page.get_by_test_id("settings-nav-appearance").click()
+    toggle = page.get_by_test_id("fold-assistant-narration-toggle")
+    toggle.scroll_into_view_if_needed(timeout=20_000)
+    expect(page.get_by_text("Show only the final answer", exact=True)).to_be_visible()
+    expect(toggle).to_have_attribute("aria-checked", "false" if enabled else "true")
+    _hold_for_recording(page)
+    toggle.click()
+    expect(toggle).to_have_attribute("aria-checked", "true" if enabled else "false")
+    _hold_for_recording(page)
+    page.get_by_role("link", name="Back", exact=True).click()
+
+
+def test_final_answer_setting_folds_narration_with_tool_work(
+    request: pytest.FixtureRequest,
+    seeded_session: tuple[str, str],
+) -> None:
+    """Opting in leaves only the final message outside one Worked fold.
+
+    :param request: Pytest request, used to create the recorded page after seeding.
+    :param seeded_session: ``(base_url, session_id)`` from the local server.
+    :returns: None.
+    """
+    base_url, session_id = seeded_session
+    response_id = "resp_final_answer_fold"
+    narration = (
+        "I'll write the placeholder to a temporary file, encrypt it into a second "
+        "file, then decrypt it and display the result."
+    )
+    progress = "The placeholder is written; encrypting and decrypting it now."
+    _seed_user_message(
+        base_url,
+        session_id,
+        text="Write a placeholder, encrypt it, decrypt it, and show it.",
+        response_id=response_id,
+    )
+    _seed_assistant_message(base_url, session_id, text=narration, response_id=response_id)
+    _seed_completed_tool_call(
+        base_url,
+        session_id,
+        response_id=response_id,
+        call_id="call_write_placeholder",
+        arguments='{"command": "echo lorem > /tmp/placeholder.txt"}',
+        output="",
+    )
+    _seed_assistant_message(base_url, session_id, text=progress, response_id=response_id)
+    _seed_completed_tool_call(
+        base_url,
+        session_id,
+        response_id=response_id,
+        call_id="call_round_trip",
+        arguments=(
+            '{"command": "openssl enc -aes-256-cbc -pbkdf2 -k demo -in /tmp/placeholder.txt'
+            ' | openssl enc -d -aes-256-cbc -pbkdf2 -k demo"}'
+        ),
+        output="lorem\n",
+    )
+    _seed_assistant_message(
+        base_url, session_id, text=_PLACEHOLDER_ANSWER, response_id=response_id
+    )
+
+    page: Page = request.getfixturevalue("page")
+    page.goto(f"{base_url}/c/{session_id}")
+    bubble = page.locator(
+        _ASSISTANT_BUBBLE, has=page.get_by_text(_PLACEHOLDER_ANSWER, exact=True)
+    ).first
+    expect(bubble).to_be_visible(timeout=20_000)
+    expect(bubble.locator(_FOLD)).to_have_count(2)
+    expect(bubble.get_by_text(narration, exact=True)).to_be_visible()
+    expect(bubble.get_by_text(progress, exact=True)).to_be_visible()
+    _hold_for_recording(page, 2_500)
+
+    _set_final_answer_preference(page, enabled=True)
+
+    expect(bubble.locator(_FOLD)).to_have_count(1, timeout=20_000)
+    expect(bubble.get_by_text(_PLACEHOLDER_ANSWER, exact=True)).to_be_visible()
+    expect(bubble.get_by_text(narration, exact=True)).to_have_count(0)
+    expect(bubble.get_by_text(progress, exact=True)).to_have_count(0)
+    _hold_for_recording(page, 2_500)
+
+    trigger = bubble.locator(_FOLD).locator('[data-slot="collapsible-trigger"]').first
+    expect(trigger).to_contain_text("Worked")
+    trigger.click()
+    expect(trigger).to_have_attribute("aria-expanded", "true")
+    expect(bubble.get_by_text(narration, exact=True)).to_be_visible()
+    expect(bubble.get_by_text(progress, exact=True)).to_be_visible()
+    expect(bubble.get_by_text(_PLACEHOLDER_ANSWER, exact=True)).to_be_visible()
+    _hold_for_recording(page, 3_000)
+
+
+def test_final_answer_setting_folds_progress_messages_without_tools(
+    request: pytest.FixtureRequest,
+    seeded_session: tuple[str, str],
+) -> None:
+    """Opting in folds text-only progress messages and persists across reload.
+
+    :param request: Pytest request, used to create the recorded page after seeding.
+    :param seeded_session: ``(base_url, session_id)`` from the local server.
+    :returns: None.
+    """
+    base_url, session_id = seeded_session
+    response_id = "resp_progress_only"
+    updates = [
+        "I'll show a few brief progress updates while I prepare the answer.",
+        "Read the message and noted the Slack thread as context.",
+        "The placeholder response is ready; sharing it next.",
+    ]
+    _seed_user_message(
+        base_url,
+        session_id,
+        text="Give me a lorem ipsum placeholder, with progress updates.",
+        response_id=response_id,
+    )
+    for text in [*updates, _PLACEHOLDER_ANSWER]:
+        _seed_assistant_message(base_url, session_id, text=text, response_id=response_id)
+
+    page: Page = request.getfixturevalue("page")
+    page.goto(f"{base_url}/c/{session_id}")
+    bubble = page.locator(
+        _ASSISTANT_BUBBLE, has=page.get_by_text(_PLACEHOLDER_ANSWER, exact=True)
+    ).first
+    expect(bubble).to_be_visible(timeout=20_000)
+    expect(bubble.locator(_FOLD)).to_have_count(0)
+    for text in updates:
+        expect(bubble.get_by_text(text, exact=True)).to_be_visible()
+    _hold_for_recording(page, 2_500)
+
+    _set_final_answer_preference(page, enabled=True)
+
+    expect(bubble.locator(_FOLD)).to_have_count(1, timeout=20_000)
+    for text in updates:
+        expect(bubble.get_by_text(text, exact=True)).to_have_count(0)
+    expect(bubble.get_by_text(_PLACEHOLDER_ANSWER, exact=True)).to_be_visible()
+    _hold_for_recording(page, 2_500)
+
+    page.reload()
+    expect(bubble.locator(_FOLD)).to_have_count(1, timeout=20_000)
+    expect(bubble.get_by_text(updates[0], exact=True)).to_have_count(0)
+    _hold_for_recording(page)
+
+    _set_final_answer_preference(page, enabled=False)
+
+    expect(bubble.locator(_FOLD)).to_have_count(0, timeout=20_000)
+    for text in updates:
+        expect(bubble.get_by_text(text, exact=True)).to_be_visible()
+    _hold_for_recording(page, 2_500)

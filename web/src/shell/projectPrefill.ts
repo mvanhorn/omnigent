@@ -1,13 +1,15 @@
 import type { Host } from "@/hooks/useHosts";
 import { SANDBOX_HOST_CHOICE } from "@/lib/hostPreferences";
+import type { ProjectLaunchDefaults } from "@/lib/projectLaunchPreferences";
 
 type ProjectPrefillPhase = "location" | "settled";
 
 /**
- * A project's stored session defaults, as the composer consumes them. This is
- * the ONLY project-driven prefill source: a set field seeds the composer, and
- * an absent field falls through to the composer's generic defaults (last host /
- * recent workspace / last-used agent).
+ * A project's session defaults, as the composer consumes them: its stored
+ * config overlaid with how its last session started (withProjectLaunchDefaults).
+ * This is the ONLY project-driven prefill source: a set field seeds the
+ * composer, and an absent field falls through to the composer's generic
+ * defaults (last host / recent workspace / last-used agent).
  *
  * `undefined` means the config is still loading for a project that has one — the
  * machine WAITS in that case so a generic default can't win the race. Pass an
@@ -21,6 +23,42 @@ export interface ProjectPrefillConfig {
   agentId?: string;
   /** Opt-in worktree default; only `true` is meaningful (absent = no worktree). */
   useWorktree?: boolean;
+  /** Default model for the configured agent's harness. Not seeded by this
+   *  machine — the composer's harness-seed effect consumes it directly (it owns
+   *  the model slot and would otherwise clobber a machine write). */
+  model?: string;
+  /** Default reasoning effort for the configured agent; consumed by the same
+   *  harness-seed effect as `model`. */
+  effort?: string;
+  /** Agent the project's last session started with. Unlike `agentId` it is a
+   *  hint: it seeds only once the pickable list confirms it still exists. */
+  launchAgentId?: string;
+}
+
+/**
+ * Overlay how a project's last session started on its stored defaults. The
+ * started agent becomes `launchAgentId`; when it is the stored agent and the
+ * start recorded its own harness options, those replace the stored model and
+ * effort. A started host replaces the stored host and its working directory.
+ */
+export function withProjectLaunchDefaults(
+  config: ProjectPrefillConfig,
+  launch: ProjectLaunchDefaults | null,
+): ProjectPrefillConfig {
+  if (launch === null) return config;
+  const merged = { ...config };
+  if (launch.agentId !== undefined) {
+    merged.launchAgentId = launch.agentId;
+    if (launch.agentId === config.agentId && launch.harnessOptions !== undefined) {
+      merged.model = undefined;
+      merged.effort = undefined;
+    }
+  }
+  if (launch.hostId !== undefined) {
+    merged.hostId = launch.hostId;
+    merged.workspace = launch.workspace;
+  }
+  return merged;
 }
 
 export interface ProjectPrefillState {
@@ -92,17 +130,32 @@ export function projectPrefillStep(
   // can't win the race against a stored default.
   if (inputs.config === undefined) return null;
 
-  if (!state.agentSeeded) {
+  // The last start's agent is a hint like the last-used agent: the agent track
+  // waits for the pickable list to confirm it, and a missing one falls through.
+  const launchAgentId = inputs.config.launchAgentId;
+  if (!state.agentSeeded && (launchAgentId == null || inputs.agents !== undefined)) {
     const { agents, lastAgentId, config } = inputs;
-    // Need the pickable agents to judge whether a stored / last-used agent is
-    // still selectable; wait for them.
-    if (agents !== undefined) {
+    if (launchAgentId != null && agents?.some((a) => a.id === launchAgentId)) {
       next = { ...next, agentSeeded: true };
-      if (config?.agentId != null && agents.some((a) => a.id === config.agentId)) {
-        writes.agentId = config.agentId;
-      } else if (lastAgentId && agents.some((a) => a.id === lastAgentId)) {
-        // No configured agent (or it's no longer available) — seed the
-        // last-used agent so the composer never sits without one.
+      writes.agentId = launchAgentId;
+    }
+    // A blank/whitespace-only stored id is "not configured", not a real agent
+    // — fall through to the generic default instead of seeding a value the
+    // composer could only surface as "agent unavailable".
+    else if (config?.agentId != null && config.agentId.trim() !== "") {
+      // A configured agent seeds verbatim, without waiting for (or checking)
+      // the picker list — the create API accepts session-scoped agents the
+      // caller can read, so absence from the list doesn't mean unusable.
+      // Never substitute the last-used agent for a configured one; if the id
+      // truly can't be resolved the composer surfaces an explicit
+      // "configured agent unavailable" state instead.
+      next = { ...next, agentSeeded: true };
+      writes.agentId = config.agentId;
+    } else if (agents !== undefined) {
+      // No configured agent: need the pickable agents to judge whether the
+      // last-used agent is still selectable; wait for them.
+      next = { ...next, agentSeeded: true };
+      if (lastAgentId && agents.some((a) => a.id === lastAgentId)) {
         writes.agentId = lastAgentId;
       }
     }
@@ -153,13 +206,22 @@ function locationStep(
     configHostOnline &&
     !inputs.sandboxSelected &&
     (selectedHostId === null || selectedHostId === config!.hostId);
-  if (configHostUsable) {
-    writes.hostId = config!.hostId;
-    // A configured workspace seeds the field; without one, the composer's
-    // home-fallback fills it. Any opt-in worktree (config.useWorktree) is
-    // handled by a dedicated post-settle effect once the workspace is in place
-    // (see NewChatDialog's worktree effect).
-    if (config!.workspace != null) writes.workspace = config!.workspace;
-  }
+  if (configHostUsable) writes.hostId = config!.hostId;
+  // A configured workspace seeds the field even when the config host is
+  // offline (or config names no host) — dropping the hint would let a
+  // generic recent path fill in, which can belong to another project.
+  // Deliberate tradeoff: the generic default then fills selectedHostId with a
+  // DIFFERENT host, so host and workspace can diverge (a path that may not
+  // exist there) — accepted over losing the project's workspace hint. Only
+  // a sandbox pick or an explicit switch to a different host suppresses it.
+  // Without one, the composer's home-fallback fills the field. Any opt-in
+  // worktree (config.useWorktree) is handled by a dedicated post-settle
+  // effect once the workspace is in place (see NewChatDialog's worktree
+  // effect).
+  const workspaceUsable =
+    config?.workspace != null &&
+    !inputs.sandboxSelected &&
+    (selectedHostId === null || selectedHostId === config.hostId);
+  if (workspaceUsable) writes.workspace = config!.workspace;
   return settled(state);
 }

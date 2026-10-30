@@ -14,12 +14,21 @@ from issue_prioritization.classification import IssueContent
 from issue_prioritization.config import ScoringConfig
 from issue_prioritization.databricks_io import (
     VolumeArtifactSink,
+    _classification_from_row,
     latest_scores_view_sql,
 )
-from issue_prioritization.domain import Impact, Issue, IssueType, Priority, ScoreResult, ScoreStep
+from issue_prioritization.domain import (
+    Impact,
+    Issue,
+    IssueType,
+    MissingInformation,
+    Priority,
+    ScoreResult,
+    ScoreStep,
+)
 from issue_prioritization.model_serving import serving_endpoint_classifier
 from issue_prioritization.mutations import BotState, MutationPlan, MutationTarget
-from issue_prioritization.pipeline import PipelineMode, PipelineRun
+from issue_prioritization.pipeline import ClassificationFailure, PipelineMode, PipelineRun
 
 
 def test_dry_run_artifact_contains_complete_mutation_plan(tmp_path) -> None:
@@ -57,12 +66,18 @@ def test_dry_run_artifact_contains_complete_mutation_plan(tmp_path) -> None:
         (ranked,),
         0,
         (plan,),
+        classification_failures=(ClassificationFailure(8, "invalid information status"),),
     )
 
     VolumeArtifactSink(str(tmp_path), ScoringConfig.default()).write(run)
 
     payload = json.loads((tmp_path / "preview" / "mutations.json").read_text())
-    assert payload[0]["target"] == {"priority": "P1-high", "components": ["comp:db"]}
+    assert payload[0]["target"] == {
+        "priority": "P1-high",
+        "components": ["comp:db"],
+        "issue_type": None,
+        "needs_info": None,
+    }
     assert payload[0]["labels_add"] == ["P1-high", "comp:db"]
     assert payload[0]["labels_remove"] == ["P2-medium", "severity:S2"]
     assert "<!-- omnigent-issue-prioritization-v2" in payload[0]["comment"]
@@ -72,7 +87,30 @@ def test_dry_run_artifact_contains_complete_mutation_plan(tmp_path) -> None:
     assert metadata["mode"] == "dry_run"
     assert metadata["adopt_legacy_bot_priorities"] is False
     assert metadata["legacy_priorities_adopted"] == 0
+    assert metadata["classification_failures"] == [
+        {"issue_number": 8, "reason": "invalid information status"}
+    ]
     assert not (tmp_path / "preview" / ".run.json.tmp").exists()
+
+
+def test_persisted_classification_normalizes_missing_information() -> None:
+    classification = _classification_from_row(
+        SimpleNamespace(
+            issue_number=7,
+            issue_type="Bug",
+            impact="medium",
+            area_keys=[],
+            component_labels=[],
+            reasoning="Needs a trigger.",
+            content_hash="hash",
+            reported_type="Bug",
+            evidence_kind="none",
+            information_status="needs_info",
+            missing_information=[" TRIGGER "],
+        )
+    )
+
+    assert classification.missing_information == (MissingInformation.TRIGGER,)
 
 
 def test_latest_scores_view_selects_one_complete_run() -> None:
@@ -95,31 +133,63 @@ class FakeServingEndpoints:
         return self.response
 
 
-def test_serving_classifier_uses_online_chat_endpoint() -> None:
+@pytest.mark.parametrize("review_bugs", [False, True])
+def test_serving_classifier_uses_online_chat_endpoint(review_bugs) -> None:
     payload = json.dumps(
         {
             "type": "Bug",
             "impact": "medium",
             "area_keys": [],
+            "evidence_kind": "observed_intermittent",
+            "information_status": "sufficient",
+            "missing_information": [],
             "reasoning": "Affects a real workflow.",
         }
     )
     serving = FakeServingEndpoints(
         SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(content=payload), text=None)]
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content=payload), text=None, finish_reason="stop"
+                )
+            ]
         )
     )
     workspace = SimpleNamespace(serving_endpoints=serving)
-    classifier = serving_endpoint_classifier("test-endpoint", AreaCatalog({}, {}), workspace)
+    classifier = serving_endpoint_classifier(
+        "test-endpoint", AreaCatalog({}, {}), workspace, review_bugs=review_bugs
+    )
 
     result = classifier.classify(IssueContent(7, "Broken flow", "It fails", (), "user"))
 
     assert result.issue_type == IssueType.BUG
     endpoint, request = serving.calls[0]
     assert endpoint == "test-endpoint"
-    assert request["max_tokens"] == 2048
+    assert request["max_tokens"] == (8192 if review_bugs else 2048)
     assert request["messages"][0].role == ChatMessageRole.USER
     assert "Broken flow" in request["messages"][0].content
+
+
+@pytest.mark.parametrize("payload", ['{"type":"Feature","impact":"low"}', '{"type":'])
+def test_serving_classifier_rejects_truncated_responses_before_json_parsing(payload):
+    serving = FakeServingEndpoints(
+        SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content=payload), text=None, finish_reason="length"
+                )
+            ]
+        )
+    )
+    classifier = serving_endpoint_classifier(
+        "test-endpoint",
+        AreaCatalog({}, {}),
+        SimpleNamespace(serving_endpoints=serving),
+        review_bugs=True,
+    )
+    with pytest.raises(RuntimeError, match="output token limit"):
+        classifier.classify(IssueContent(7, "Broken", "", (), "user"))
+    assert len(serving.calls) == 1
 
 
 def test_serving_classifier_rejects_empty_response() -> None:

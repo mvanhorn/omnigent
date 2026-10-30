@@ -12,6 +12,7 @@ import urllib.parse
 import urllib.request
 from datetime import UTC, datetime
 from email.message import Message
+from pathlib import Path
 from typing import Any
 
 LABEL = "waiting-on-author"
@@ -21,6 +22,7 @@ REVIEW_LABEL = "waiting-for-review"
 WAITING_DAYS = 7
 CANONICAL_REPO = "omnigent-ai/omnigent"
 MAX_CLOSURES_PER_RUN = 30
+REVIEW_EVENTS = {"pull_request_review", "pull_request_review_comment"}
 
 
 def label_names(item: dict[str, Any]) -> list[str]:
@@ -113,6 +115,16 @@ class GitHubAPI:
     def get_pull(self, pull_number: int) -> dict[str, Any]:
         pull, _ = self.request("GET", f"/repos/{self.repo}/pulls/{pull_number}")
         return pull
+
+    def get_review(self, pull_number: int, review_id: int) -> dict[str, Any]:
+        review, _ = self.request(
+            "GET", f"/repos/{self.repo}/pulls/{pull_number}/reviews/{review_id}"
+        )
+        return review
+
+    def get_review_comment(self, comment_id: int) -> dict[str, Any]:
+        comment, _ = self.request("GET", f"/repos/{self.repo}/pulls/comments/{comment_id}")
+        return comment
 
     def remove_label(self, issue_number: int, label: str) -> bool:
         quoted = urllib.parse.quote(label, safe="")
@@ -220,14 +232,24 @@ def remove_waiting_label(api: GitHubAPI, issue_number: int, reason: str) -> bool
     return removed
 
 
-def hand_off_to_reviewer(api: GitHubAPI, pull: dict[str, Any], reason: str) -> None:
+def hand_off_to_reviewer(api: GitHubAPI, pull: dict[str, Any], reason: str) -> bool:
     """Move a PR from the author's court back into the reviewer's.
 
     The label is what maintainers filter on; the review request is what actually
     surfaces the PR in their GitHub review queue. GitHub clears the request when a
     review is submitted, so it has to be re-made here or the reply is invisible.
     """
+    config = json.loads(Path(__file__).resolve().parents[1].joinpath("areas.json").read_text())
+    paused_logins = config.get("assignment_paused", [])
+    if not isinstance(paused_logins, list) or any(
+        not isinstance(login, str) or not login for login in paused_logins
+    ):
+        raise ValueError("assignment_paused must be an array of non-empty GitHub logins")
+    paused = {login.casefold() for login in paused_logins}
+
     number = pull["number"]
+    if not remove_waiting_label(api, number, reason):
+        return False
     labels = label_names(pull)
     if REVIEW_LABEL not in labels:
         api.add_label(number, REVIEW_LABEL)
@@ -242,7 +264,7 @@ def hand_off_to_reviewer(api: GitHubAPI, pull: dict[str, Any], reason: str) -> N
             (person or {}).get("login")
             for person in (pull.get("assignees") or []) + (pull.get("requested_reviewers") or [])
         )
-        if login and login.lower() != author
+        if login and login.lower() != author and login.casefold() not in paused
     ]
     queued = api.request_review(number, sorted(set(owners))) if owners else 0
     if not queued:
@@ -250,6 +272,7 @@ def hand_off_to_reviewer(api: GitHubAPI, pull: dict[str, Any], reason: str) -> N
         # to whoever filters on it. Auto-assign normally populates assignees, so
         # this means something upstream skipped the PR.
         print(f"::warning::#{number} is {REVIEW_LABEL} with no reviewer queued")
+    return True
 
 
 def user_login(item: dict[str, Any]) -> str | None:
@@ -355,9 +378,13 @@ def apply_waiting_on_maintainer_activity(
         pull_number = payload["pull_request"]["number"]
         review = payload.get("review") or {}
         actor = (review.get("user") or {}).get("login")
+        review_state = (review.get("state") or "").lower()
         # An approval asks nothing of the author; it means the PR is ready.
-        if (review.get("state") or "").lower() == "approved":
+        if review_state == "approved":
             print(f"#{pull_number}: approving review, leaving the label alone.")
+            return False
+        if review_state not in {"commented", "changes_requested"}:
+            print(f"#{pull_number}: {review_state or 'unknown'} review, leaving the label alone.")
             return False
         if is_slash_command(review.get("body")):
             return False
@@ -429,10 +456,7 @@ def clear_on_author_activity(event_name: str, payload: dict[str, Any], api: GitH
 
     if not author_activity:
         return False
-    removed = remove_waiting_label(api, pull_number, reason)
-    if removed:
-        hand_off_to_reviewer(api, pull, reason)
-    return removed
+    return hand_off_to_reviewer(api, pull, reason)
 
 
 def close_stale_waiting_prs(api: GitHubAPI, now: datetime | None = None) -> int:
@@ -456,8 +480,7 @@ def close_stale_waiting_prs(api: GitHubAPI, now: datetime | None = None) -> int:
             pull = api.get_pull(issue["number"])
             reason = author_activity_since_label(api, pull, label_applied_at)
             if reason:
-                if remove_waiting_label(api, issue["number"], reason):
-                    hand_off_to_reviewer(api, pull, reason)
+                hand_off_to_reviewer(api, pull, reason)
                 continue
 
             if days_between(label_applied_at, now) < WAITING_DAYS:
@@ -471,6 +494,42 @@ def close_stale_waiting_prs(api: GitHubAPI, now: datetime | None = None) -> int:
             print(f"::warning::Could not close #{issue['number']}: {error}")
     print(f"Closed {closed} PR(s) labeled {LABEL}.")
     return closed
+
+
+def relay_integer(record: dict[str, Any], field: str) -> int:
+    value = record.get(field)
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"Relay field {field!r} must be a positive integer")
+    return value
+
+
+def hydrate_relay_event(
+    record: dict[str, Any], api: GitHubAPI, repo: str, expected_event: str
+) -> tuple[str, dict[str, Any]]:
+    event_name = record.get("event_name")
+    if event_name not in REVIEW_EVENTS:
+        raise ValueError(f"Unsupported relayed event: {event_name!r}")
+    if event_name != expected_event:
+        raise ValueError(
+            f"Relayed event {event_name!r} does not match workflow event {expected_event!r}"
+        )
+
+    pull_number = relay_integer(record, "pull_number")
+    activity_id = relay_integer(record, "activity_id")
+    pull = api.get_pull(pull_number)
+    base_repo = ((pull.get("base") or {}).get("repo") or {}).get("full_name") or ""
+    if base_repo.lower() != repo.lower():
+        raise ValueError(f"Relayed PR #{pull_number} targets {base_repo!r}, not {repo!r}")
+
+    if event_name == "pull_request_review":
+        review = api.get_review(pull_number, activity_id)
+        return event_name, {"pull_request": pull, "review": review}
+
+    comment = api.get_review_comment(activity_id)
+    expected_url = f"https://api.github.com/repos/{repo}/pulls/{pull_number}"
+    if comment.get("pull_request_url") != expected_url:
+        raise ValueError(f"Review comment {activity_id} does not belong to PR #{pull_number}")
+    return event_name, {"pull_request": pull, "comment": comment}
 
 
 def run(
@@ -495,8 +554,7 @@ def run(
     apply_waiting_on_maintainer_activity(event_name, payload, api)
 
 
-def load_event_payload() -> dict[str, Any]:
-    path = os.environ.get("GITHUB_EVENT_PATH")
+def load_json(path: str | None) -> dict[str, Any]:
     if not path:
         return {}
     with open(path, encoding="utf-8") as handle:
@@ -509,8 +567,15 @@ def main() -> int:
     if not token:
         print("GITHUB_TOKEN is required", file=sys.stderr)
         return 1
-    event_name = os.environ.get("GITHUB_EVENT_NAME", "")
-    run(event_name, load_event_payload(), GitHubAPI(token, repo), repo)
+    api = GitHubAPI(token, repo)
+    relay_path = os.environ.get("WAITING_ON_AUTHOR_RELAY_PATH")
+    if relay_path:
+        expected_event = os.environ.get("WAITING_ON_AUTHOR_RELAY_EVENT", "")
+        event_name, payload = hydrate_relay_event(load_json(relay_path), api, repo, expected_event)
+    else:
+        event_name = os.environ.get("GITHUB_EVENT_NAME", "")
+        payload = load_json(os.environ.get("GITHUB_EVENT_PATH"))
+    run(event_name, payload, api, repo)
     return 0
 
 

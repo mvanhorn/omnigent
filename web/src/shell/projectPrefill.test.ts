@@ -6,7 +6,13 @@ import { describe, expect, it } from "vitest";
 
 import type { Host } from "@/hooks/useHosts";
 import { SANDBOX_HOST_CHOICE } from "@/lib/hostPreferences";
-import { initialPrefillState, projectPrefillStep } from "./projectPrefill";
+import type { ProjectLaunchDefaults } from "@/lib/projectLaunchPreferences";
+import {
+  initialPrefillState,
+  projectPrefillStep,
+  withProjectLaunchDefaults,
+  type ProjectPrefillConfig,
+} from "./projectPrefill";
 
 const hosts: Host[] = [
   { host_id: "host_1", name: "laptop", owner: "corey", status: "online" },
@@ -81,11 +87,19 @@ describe("projectPrefill config seeding", () => {
     expect(writes.workspace).toBeUndefined();
   });
 
-  it("silently drops a config host that is offline / missing", () => {
+  it("drops an offline / missing config host but keeps the configured workspace", () => {
     const { writes } = runToDone(inputs({ config: { hostId: "host_off", workspace: "/x" } }));
-    // The offline config host is ignored; the generic host default takes over.
+    // The offline config host is ignored (the generic host default takes
+    // over), but the workspace hint survives — otherwise a generic recent
+    // path, possibly another project's, would fill the field.
     expect(writes.hostId).toBeUndefined();
-    expect(writes.workspace).toBeUndefined();
+    expect(writes.workspace).toBe("/x");
+  });
+
+  it("seeds a configured workspace even when the config names no host", () => {
+    const { writes } = runToDone(inputs({ config: { workspace: "/x" } }));
+    expect(writes.hostId).toBeUndefined();
+    expect(writes.workspace).toBe("/x");
   });
 
   it("does not seed a config host the user has already switched away from", () => {
@@ -160,7 +174,12 @@ describe("projectPrefill agent seeding", () => {
     expect(writes.agentId).toBe("ag_hello");
   });
 
-  it("ignores a config agent that is not pickable and falls back to last-used", () => {
+  it("seeds a config agent missing from the picker list verbatim — never the last-used", () => {
+    // The create API accepts session-scoped agents the caller can read, so a
+    // configured agent absent from the list is seeded as-is; if it's truly
+    // unresolvable the composer surfaces an explicit unavailable state.
+    // Substituting last-agent-id here silently rebound project sessions to
+    // whatever agent the user last touched.
     const { writes } = runToDone(
       inputs({
         agents: [{ id: "ag_hello" }],
@@ -168,7 +187,29 @@ describe("projectPrefill agent seeding", () => {
         config: { agentId: "ag_gone" },
       }),
     );
-    expect(writes.agentId).toBe("ag_hello");
+    expect(writes.agentId).toBe("ag_gone");
+  });
+
+  it("seeds a config agent before the picker list has loaded", () => {
+    const step = projectPrefillStep(
+      initialPrefillState("Alpha"),
+      inputs({ agents: undefined, config: { agentId: "ag_cfg" } }),
+    );
+    expect(step).not.toBeNull();
+    expect(step!.state.agentSeeded).toBe(true);
+    expect(step!.writes.agentId).toBe("ag_cfg");
+  });
+
+  it("treats a blank config agent id as absent and falls back to the last-used agent", () => {
+    // An empty or whitespace-only stored id is "not configured" — seeding it
+    // verbatim would trip the composer's "agent unavailable" state for a
+    // config that names no agent at all.
+    for (const agentId of ["", "   "]) {
+      const { writes } = runToDone(
+        inputs({ agents: [{ id: "ag_hello" }], lastAgentId: "ag_hello", config: { agentId } }),
+      );
+      expect(writes.agentId).toBe("ag_hello");
+    }
   });
 
   it("seeds no agent when neither config nor last-used is available", () => {
@@ -186,5 +227,89 @@ describe("projectPrefill agent seeding", () => {
     // Host track can still settle, but the agent track stays open.
     expect(step).not.toBeNull();
     expect(step!.state.agentSeeded).toBe(false);
+  });
+});
+
+describe("projectPrefill last start's agent", () => {
+  it("waits for the pickable list before seeding any agent", () => {
+    const step = projectPrefillStep(
+      initialPrefillState("Alpha"),
+      inputs({ agents: undefined, config: { agentId: "ag_cfg", launchAgentId: "ag_launch" } }),
+    );
+    expect(step!.state.agentSeeded).toBe(false);
+    expect(step!.writes.agentId).toBeUndefined();
+  });
+
+  it.each([
+    {
+      label: "the last start's agent while the list has it",
+      agents: ["ag_launch", "ag_cfg", "ag_hello"],
+      config: { agentId: "ag_cfg", launchAgentId: "ag_launch" },
+      seeded: "ag_launch",
+    },
+    {
+      label: "the configured agent once the last start's is gone",
+      agents: ["ag_cfg", "ag_hello"],
+      config: { agentId: "ag_cfg", launchAgentId: "ag_gone" },
+      seeded: "ag_cfg",
+    },
+    {
+      label: "the last-used agent without a configured one",
+      agents: ["ag_hello"],
+      config: { launchAgentId: "ag_gone" },
+      seeded: "ag_hello",
+    },
+  ])("seeds $label", ({ agents, config, seeded }) => {
+    const { writes } = runToDone(
+      inputs({ agents: agents.map((id) => ({ id })), lastAgentId: "ag_hello", config }),
+    );
+    expect(writes.agentId).toBe(seeded);
+  });
+});
+
+describe("withProjectLaunchDefaults", () => {
+  const stored = {
+    hostId: "host_1",
+    workspace: "/repos/alpha",
+    agentId: "ag_claude",
+    model: "opus",
+    effort: "low",
+    useWorktree: true,
+  };
+
+  it("keeps the stored defaults when the project has no last start", () => {
+    expect(withProjectLaunchDefaults(stored, null)).toEqual(stored);
+  });
+
+  it.each<{ label: string; launch: ProjectLaunchDefaults; expected: ProjectPrefillConfig }>([
+    {
+      label: "keeps the stored model and effort for another agent's start",
+      launch: { agentId: "ag_codex", harness: "codex-native", harnessOptions: { effort: "high" } },
+      expected: { ...stored, launchAgentId: "ag_codex" },
+    },
+    {
+      label: "drops them when the stored agent started with its own options",
+      launch: { agentId: "ag_claude", harness: "claude-native", harnessOptions: { model: "" } },
+      expected: { ...stored, launchAgentId: "ag_claude", model: undefined, effort: undefined },
+    },
+    {
+      // A Smart Routing start records no harness options.
+      label: "keeps them when the stored agent started without options",
+      launch: { agentId: "ag_claude", pickedHarness: "auto-native" },
+      expected: { ...stored, launchAgentId: "ag_claude" },
+    },
+  ])("$label", ({ launch, expected }) => {
+    expect(withProjectLaunchDefaults(stored, launch)).toEqual(expected);
+  });
+
+  it("replaces the stored host together with its working directory", () => {
+    expect(withProjectLaunchDefaults(stored, { hostId: SANDBOX_HOST_CHOICE })).toEqual({
+      ...stored,
+      hostId: SANDBOX_HOST_CHOICE,
+      workspace: undefined,
+    });
+    expect(
+      withProjectLaunchDefaults({}, { hostId: "host_2", workspace: "/repos/working-dir-b" }),
+    ).toEqual({ hostId: "host_2", workspace: "/repos/working-dir-b" });
   });
 });

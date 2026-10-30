@@ -37,20 +37,21 @@ inputs:
     description: Model API key (referenced by the provider config, used to scan output).
     required: true
   claude-code-version:
-    description: "@anthropic-ai/claude-code npm version to install."
+    description: "Optional exact Claude Code version override; defaults to the shared harness pin."
     required: false
-    default: 2.1.212
+    default: ""
 
 runs:
   using: composite
   steps:
     - name: Set up uv
-      uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+      # This action also runs from repositories checked out below the workspace root.
+      uses: omnigent-ai/omnigent/.github/actions/setup-uv@c144e4b1a1c2f9ed45aa6596b90c3672b3faf1c8 # self-contained setup
       with:
         enable-cache: true
 
     - name: Cache virtualenv
-      uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: ${{ inputs.workdir }}/.venv
         key: venv-${{ runner.os }}-${{ hashFiles(format('{0}/.python-version', inputs.workdir)) }}-${{ hashFiles(format('{0}/uv.lock', inputs.workdir)) }}
@@ -58,24 +59,14 @@ runs:
     - name: Install dependencies
       shell: bash
       working-directory: ${{ inputs.workdir }}
-      run: uv sync --extra all --extra dev
+      # Current callers are tools-less prose/JSON agents; repository checks never run.
+      run: uv sync --extra all
 
     - name: Install Claude Code CLI
-      shell: bash
-      env:
-        NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
-        CLAUDE_CODE_VERSION: ${{ inputs.claude-code-version }}
-      run: |
-        set -euo pipefail
-        # Install outside the checked-out tree: a repo-root package.json would
-        # otherwise capture this bare `npm install` and hoist it there, leaving
-        # this dir's node_modules empty.
-        CC_CLI_DIR="${RUNNER_TEMP}/omnigent-cc-cli"
-        mkdir -p "$CC_CLI_DIR"
-        cd "$CC_CLI_DIR"
-        npm install --ignore-scripts --no-audit --no-fund "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"
-        node node_modules/@anthropic-ai/claude-code/install.cjs
-        echo "$CC_CLI_DIR/node_modules/.bin" >> "$GITHUB_PATH"
+      uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@c76912dd5f9cfe9e2e11572eae45ad657243232f
+      with:
+        harness: claude
+        version: ${{ inputs.claude-code-version }}
 
     - name: Write Omnigent provider config
       shell: bash

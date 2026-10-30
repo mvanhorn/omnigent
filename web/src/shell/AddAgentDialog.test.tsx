@@ -1,3 +1,4 @@
+import { testAgent } from "@/test/agentFixtures";
 import type * as ReactRouterDomModule from "react-router-dom";
 
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
@@ -24,22 +25,12 @@ const useAvailableAgentsMock = vi.mocked(useAvailableAgents);
 const createSessionMock = vi.mocked(createSession);
 
 const AGENTS: AvailableAgent[] = [
-  {
-    id: "ag_claude",
-    name: "claude-native-ui",
+  testAgent("ag_claude", "claude-native-ui", {
     display_name: "Claude Code",
     description: "Claude Code agent",
     harness: "claude-native",
-    skills: [],
-  },
-  {
-    id: "ag_codex",
-    name: "codex",
-    display_name: "codex",
-    description: null,
-    harness: "codex",
-    skills: [],
-  },
+  }),
+  testAgent("ag_codex", "codex", { display_name: "codex", harness: "codex" }),
 ];
 
 function mockAgents(agents: AvailableAgent[]) {
@@ -162,6 +153,17 @@ describe("AddAgentDialog", () => {
     const initialItems = createSessionMock.mock.calls[0][1];
     expect(initialItems).not.toEqual([]);
     expect(JSON.stringify(initialItems)).toContain("designs/feature-x.md");
+  });
+
+  it("gives the form scroll region room for the fields' focus ring", () => {
+    renderDialog();
+
+    const scrollRegion = screen.getByTestId("add-agent-dialog").querySelector(".overflow-y-auto");
+    if (!scrollRegion) throw new Error("add-agent scroll region not found");
+    // overflow-y-auto also clips horizontally at the padding box, so the
+    // full-width fields need horizontal padding or their 3px focus ring is
+    // chopped at the container's left/right edges.
+    expect(scrollRegion).toHaveClass("px-1", "-mx-1");
   });
 
   it("shows an empty-state and a disabled submit when no agents are available", () => {

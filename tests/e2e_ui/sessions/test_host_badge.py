@@ -10,8 +10,13 @@ clickable, opening the reconnect instructions. That one shape is the point: the
 badge must not swap the host's name for generic "Host is offline" copy in some
 disconnect states and keep it in others, which is what it used to do depending
 on whether the runner happened to outlive the host (see the reconnect tests
-below). A dormant *resumable* managed host is the deliberate exception: its
-offline is idle dormancy the next message wakes, so it stays passive.
+below). A dormant *resumable* managed host reads offline too, but its tooltip
+says it's asleep, and its Reconnect host has the server wake it (see
+``test_host_asleep_composer.py``).
+
+Clicking a badge that has nothing to reconnect opens ``SwitchHostDialog``
+instead, which moves the session to another machine — covered at the bottom of
+this module.
 
 The harness seeds a normal runner-bound ``hello_world`` session, so the browser
 view is patched into a host-bound shape via route interception (same approach as
@@ -42,6 +47,8 @@ from urllib.parse import urlparse
 import pytest
 from playwright.sync_api import Page, Route, expect
 
+from tests.e2e_ui.conftest import fetch_with_retry
+
 _FAKE_HOST_ID = "host_test_badge"
 # Unix seconds well before now so an offline host is outside the startup grace
 # (STARTING_GRACE_S) and reads its real liveness, not `starting` — see
@@ -54,14 +61,16 @@ def _drop_routes(page: Page) -> Iterator[None]:
     """Drop this module's route handlers before the page closes.
 
     Every test here leaves a ``/health`` poll and snapshot refetches in flight.
-    A handler that calls ``route.fetch()`` as the page tears down raises
+    A handler that replays upstream as the page tears down raises
     ``TargetClosedError``, which surfaces as an error in the NEXT test's setup.
 
     :param page: Playwright page fixture.
     :returns: Iterator yielding once, then unrouting.
     """
     yield
-    page.unroute_all(behavior="ignoreErrors")
+    # A recording run closes the page when the test body ends.
+    if not page.is_closed():
+        page.unroute_all(behavior="ignoreErrors")
 
 
 def _patch_host_view(
@@ -100,7 +109,7 @@ def _patch_host_view(
         if request.method != "GET" or urlparse(request.url).path != f"/v1/sessions/{session_id}":
             route.continue_()
             return
-        response = route.fetch()
+        response = fetch_with_retry(route)
         payload = response.json()
         payload["host_id"] = _FAKE_HOST_ID
         payload["host_resumable"] = host_resumable
@@ -127,7 +136,7 @@ def _patch_host_view(
         if request.method != "GET" or urlparse(request.url).path != "/v1/sessions":
             route.continue_()
             return
-        response = route.fetch()
+        response = fetch_with_retry(route)
         payload = response.json()
         rows = payload.get("data") if isinstance(payload, dict) else None
         if isinstance(rows, list):
@@ -145,7 +154,7 @@ def _patch_host_view(
         if request.method != "GET" or urlparse(request.url).path != "/health":
             route.continue_()
             return
-        response = route.fetch()
+        response = fetch_with_retry(route)
         payload = response.json()
         live = {"runner_online": runner_online, "host_online": host_online}
         if isinstance(payload.get("sessions"), dict):
@@ -189,24 +198,27 @@ def test_host_badge_shows_host_name_when_online(
 
     page.goto(f"{base_url}/c/{session_id}")
 
-    badge = page.get_by_test_id("host-badge")
+    badge = page.get_by_test_id("composer-host-select")
     expect(badge).to_be_visible(timeout=15_000)
-    expect(badge).to_contain_text("e2e-host")
-    # The dot is decorative; status is conveyed by the title (mouse hover) and an
-    # sr-only word. Online == reachable host.
-    expect(badge).to_have_attribute("title", "Host e2e-host, online", timeout=15_000)
+    expect(badge).to_have_attribute("aria-label", re.compile(re.escape("e2e-host")))
+    # The dot is decorative; status is conveyed by the accessible name and the
+    # hover tooltip. Online == reachable host.
+    expect(badge).to_have_attribute("aria-label", "Host e2e-host, online", timeout=15_000)
+    badge.hover()
+    tooltip = page.get_by_test_id("composer-host-tooltip")
+    expect(tooltip).to_contain_text("Host: e2e-host")
+    expect(tooltip).to_contain_text("Status: Connected")
 
 
 def test_host_badge_shows_offline_when_host_unreachable(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
-    """A dormant resumable managed host shows offline, and stays passive.
+    """A dormant resumable managed host shows offline and reads as asleep.
 
-    ``host_resumable`` is the one offline host with no reconnect affordance: the
-    sandbox is idle-stopped and the next message wakes it, so ``omnigent host``
-    would be the wrong instruction. Every other offline host is clickable (see
-    the reconnect tests below).
+    The sandbox is idle-stopped and the next message wakes it, so the tooltip
+    says it's asleep rather than disconnected. Its Reconnect host is covered in
+    ``test_host_asleep_composer.py``.
 
     :param page: Playwright page fixture.
     :param seeded_session: ``(base_url, session_id)`` for a real server-backed
@@ -224,11 +236,16 @@ def test_host_badge_shows_offline_when_host_unreachable(
 
     page.goto(f"{base_url}/c/{session_id}")
 
-    badge = page.get_by_test_id("host-badge")
+    badge = page.get_by_test_id("composer-host-select")
     expect(badge).to_be_visible(timeout=15_000)
-    expect(badge).to_contain_text("e2e-host")
-    expect(badge).to_have_attribute("title", "Host e2e-host, offline", timeout=15_000)
-    assert badge.evaluate("el => el.tagName") != "BUTTON"
+    expect(badge).to_have_attribute("aria-label", re.compile(re.escape("e2e-host")))
+    # The label keeps the plain offline status; the tooltip says why.
+    expect(badge).to_have_attribute("aria-label", "Host e2e-host, offline", timeout=15_000)
+    expect(badge).not_to_have_attribute("aria-label", re.compile(re.escape("click to reconnect")))
+    badge.hover()
+    expect(page.get_by_test_id("composer-host-tooltip")).to_contain_text(
+        "Status: Asleep — wakes on next message"
+    )
 
 
 def test_host_badge_offline_host_keeps_name_while_runner_outlives_it(
@@ -258,13 +275,13 @@ def test_host_badge_offline_host_keeps_name_while_runner_outlives_it(
 
     page.goto(f"{base_url}/c/{session_id}")
 
-    badge = page.get_by_test_id("host-badge")
+    badge = page.get_by_test_id("composer-host-select")
     expect(badge).to_be_visible(timeout=15_000)
-    expect(badge).to_contain_text("e2e-host")
-    expect(badge).to_have_attribute(
-        "title", "Host e2e-host, offline — click to reconnect", timeout=15_000
-    )
+    expect(badge).to_have_attribute("aria-label", re.compile(re.escape("e2e-host")))
+    expect(badge).to_have_attribute("aria-label", "Host e2e-host, offline", timeout=15_000)
     assert badge.evaluate("el => el.tagName") == "BUTTON"
+    badge.hover()
+    expect(page.get_by_test_id("composer-host-tooltip")).to_contain_text("Status: Disconnected")
     # The runner is alive, so the session itself is still usable — the offline
     # host must not block the composer here.
     expect(page.get_by_label("Message the agent")).not_to_be_disabled()
@@ -277,7 +294,7 @@ def test_host_badge_offline_host_keeps_name_when_runner_is_down_too(
     """A fully unreachable session names its dropped host instead of generic copy.
 
     This is the ``host_offline`` liveness state, which used to replace the host
-    name with "Host is offline — click to reconnect". The name is what tells the
+    name with "Host is offline". The name is what tells the
     user WHICH machine to go restart, so it stays; the separate band below the
     composer stays suppressed.
 
@@ -298,12 +315,10 @@ def test_host_badge_offline_host_keeps_name_when_runner_is_down_too(
 
     page.goto(f"{base_url}/c/{session_id}")
 
-    badge = page.get_by_test_id("host-badge")
+    badge = page.get_by_test_id("composer-host-select")
     expect(badge).to_be_visible(timeout=15_000)
-    expect(badge).to_contain_text("e2e-host")
-    expect(badge).to_have_attribute(
-        "title", "Host e2e-host, offline — click to reconnect", timeout=15_000
-    )
+    expect(badge).to_have_attribute("aria-label", re.compile(re.escape("e2e-host")))
+    expect(badge).to_have_attribute("aria-label", "Host e2e-host, offline", timeout=15_000)
     assert badge.evaluate("el => el.tagName") == "BUTTON"
     # The badge owns the affordance; the old band below the composer stays away.
     expect(page.get_by_test_id("disconnected-indicator")).to_have_count(0)
@@ -337,9 +352,10 @@ def test_host_badge_click_shows_host_reconnect_instructions(
 
     page.goto(f"{base_url}/c/{session_id}")
 
-    badge = page.get_by_test_id("host-badge")
+    badge = page.get_by_test_id("composer-host-select")
     expect(badge).to_be_visible(timeout=15_000)
     badge.click()
+    page.get_by_role("menuitem", name="Reconnect host", exact=True).click()
 
     dialog = page.get_by_test_id("reconnect-session-dialog")
     expect(dialog).to_be_visible(timeout=15_000)
@@ -377,8 +393,172 @@ def test_host_badge_labels_sandbox_session_by_provider(
 
     page.goto(f"{base_url}/c/{session_id}")
 
-    badge = page.get_by_test_id("host-badge")
+    badge = page.get_by_test_id("composer-host-select")
     expect(badge).to_be_visible(timeout=15_000)
     # The managed-<hex> host name is collapsed to the provider label.
-    expect(badge).to_contain_text("Databricks-lakebox Sandbox")
-    expect(badge).not_to_contain_text("managed-cd8f66d0")
+    expect(badge).to_have_attribute(
+        "aria-label", re.compile(re.escape("Databricks-lakebox Sandbox"))
+    )
+    expect(badge).not_to_have_attribute("aria-label", re.compile(re.escape("managed-cd8f66d0")))
+
+
+def _patch_switch_targets(page: Page, session_id: str, *, target_host_id: str) -> list[dict]:
+    """Offer a second online host and capture the two calls a switch makes.
+
+    The move has no dedicated endpoint — it is a ``PATCH /v1/sessions/{id}``
+    that releases the runner binding followed by a
+    ``POST /v1/hosts/{target}/runners`` that binds a new one. Both are
+    intercepted and answered here so the test never needs a second real host;
+    what it asserts is that the UI issues them, in that order, with the right
+    payloads.
+
+    :param page: Playwright page before navigation.
+    :param target_host_id: Host id the dialog should offer as a move target.
+    :returns: A list that accumulates ``{"kind", "body"}`` for each captured
+        call, in the order the browser made them.
+    """
+    calls: list[dict] = []
+
+    def _patch_release(route: Route) -> None:
+        request = route.request
+        if request.method != "PATCH":
+            # fallback(), not continue_(): this route shadows the snapshot patch
+            # registered earlier, and continue_() would skip it and hit the
+            # network with the unpatched (host-unbound) session.
+            route.fallback()
+            return
+        calls.append({"kind": "release", "body": request.post_data_json})
+        route.fulfill(
+            status=200,
+            headers={"content-type": "application/json"},
+            body=json.dumps({"id": session_id, "runner_id": None, "model_override": None}),
+        )
+
+    def _patch_launch(route: Route) -> None:
+        calls.append({"kind": "launch", "body": route.request.post_data_json})
+        route.fulfill(
+            status=200,
+            headers={"content-type": "application/json"},
+            body=json.dumps({"runner_id": "runner_switched"}),
+        )
+
+    def _patch_filesystem(route: Route) -> None:
+        # The dialog lists the target's home to default the directory.
+        route.fulfill(
+            status=200,
+            headers={"content-type": "application/json"},
+            body=json.dumps(
+                {"entries": [{"path": "/home/e2e/repo", "name": "repo", "is_dir": True}]}
+            ),
+        )
+
+    page.route(re.compile(r"/v1/hosts/[^/]+/filesystem"), _patch_filesystem)
+    page.route(re.compile(rf"/v1/hosts/{re.escape(target_host_id)}/runners(\?|$)"), _patch_launch)
+    page.route(re.compile(rf"/v1/sessions/{re.escape(session_id)}(\?|$)"), _patch_release)
+    return calls
+
+
+def test_host_badge_switches_the_session_to_another_host(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """Clicking an online host badge moves the session to another machine.
+
+    The whole point of the flow: pick a host, pick a directory, and the session
+    is released from the old runner and relaunched on the new host. The origin
+    host is excluded from the picker (moving to where it already is is a no-op).
+
+    :param page: Playwright page fixture.
+    :param seeded_session: ``(base_url, session_id)`` for a real server-backed
+        session; the browser view is patched to a host-bound, online shape.
+    :returns: None.
+    """
+    base_url, session_id = seeded_session
+    target_id = "host_test_target"
+    _patch_host_view(
+        page,
+        session_id,
+        host={"name": "e2e-host", "owner": "e2e", "status": "online", "sandbox_provider": None},
+        host_online=True,
+    )
+
+    # Re-patch /v1/hosts to advertise BOTH the bound host and a move target.
+    def _patch_two_hosts(route: Route) -> None:
+        if route.request.method != "GET" or urlparse(route.request.url).path != "/v1/hosts":
+            route.continue_()
+            return
+        route.fulfill(
+            status=200,
+            headers={"content-type": "application/json"},
+            body=json.dumps(
+                {
+                    "hosts": [
+                        {
+                            "host_id": _FAKE_HOST_ID,
+                            "name": "e2e-host",
+                            "owner": "e2e",
+                            "status": "online",
+                            "sandbox_provider": None,
+                        },
+                        {
+                            "host_id": target_id,
+                            "name": "e2e-target",
+                            "owner": "e2e",
+                            "status": "online",
+                            "sandbox_provider": None,
+                        },
+                    ]
+                }
+            ),
+        )
+
+    page.route(re.compile(r"/v1/hosts(\?|$)"), _patch_two_hosts)
+    calls = _patch_switch_targets(page, session_id, target_host_id=target_id)
+
+    page.goto(f"{base_url}/c/{session_id}")
+
+    badge = page.get_by_test_id("composer-host-select")
+    expect(badge).to_be_visible(timeout=15_000)
+    badge.click()
+    page.get_by_role("menuitem", name="Switch host…", exact=True).click()
+
+    dialog = page.get_by_test_id("switch-host-dialog")
+    expect(dialog).to_be_visible(timeout=15_000)
+    # The only other online host is preselected, so the common "just move it
+    # over there" case is one click.
+    trigger = page.get_by_test_id("switch-host-select")
+    expect(trigger).to_contain_text("e2e-target", timeout=15_000)
+    # The preselection is itself the "origin is excluded" signal: the bound host
+    # is the only other one in the list, so it landing on e2e-target means it
+    # was filtered out. Which hosts the picker offers is pinned exactly (both
+    # normally and after a stranded failure) in SwitchHostDialog.test.tsx — this
+    # test deliberately does NOT open the dropdown, because Radix's dismissable
+    # layer leaves the page briefly unable to receive the submit click.
+    expect(trigger).not_to_contain_text("e2e-host")
+
+    directory = page.get_by_test_id("workspace-path-input")
+    expect(directory).to_be_visible(timeout=15_000)
+    directory.fill("/home/e2e/repo")
+    # Dismiss the path field's suggestion dropdown and wait for it to go before
+    # submitting. It is rendered in flow, so closing it lifts the footer ~24px:
+    # a mousedown on the submit button closes the dropdown, the button moves out
+    # from under the pointer, and the mouseup never lands on it.
+    page.get_by_test_id("switch-host-dialog").get_by_text("Switch host", exact=True).first.click()
+    expect(page.get_by_test_id("workspace-path-dropdown")).to_have_count(0)
+
+    switch = page.get_by_test_id("switch-host-button")
+    expect(switch).to_be_enabled(timeout=15_000)
+    switch.click()
+
+    # The dialog closes on success, and both legs of the move went out.
+    expect(dialog).to_have_count(0, timeout=15_000)
+    kinds = [c["kind"] for c in calls]
+    assert kinds == ["release", "launch"], f"expected release then launch, got {kinds}"
+    release_body = calls[0]["body"] or {}
+    # The runner binding is released, and the model override goes with it: a
+    # model id is resolved against the OLD host's catalog.
+    assert release_body.get("runner_id") == "", release_body
+    assert release_body.get("model_override") == "default", release_body
+    launch_body = calls[1]["body"] or {}
+    assert launch_body.get("session_id") == session_id, launch_body
+    assert launch_body.get("workspace") == "/home/e2e/repo", launch_body

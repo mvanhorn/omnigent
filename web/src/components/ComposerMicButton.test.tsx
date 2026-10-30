@@ -45,6 +45,11 @@ vi.mock("@/lib/dictation", () => {
   };
 });
 
+// Spy on the toast so tests can assert a failure is actually surfaced to the
+// user, not just tucked into the button tooltip.
+const showToastMock = vi.fn();
+vi.mock("@/components/ui/toast", () => ({ showToast: (msg: unknown) => showToastMock(msg) }));
+
 function installDictationSession() {
   sessionEvents = null;
   sessionStopMock = vi.fn(async () => "");
@@ -59,19 +64,30 @@ function installDictationSession() {
 let handlers: Record<string, (event: unknown) => void>;
 let startSpy: ReturnType<typeof vi.fn>;
 let stopSpy: ReturnType<typeof vi.fn>;
+let recognitionLang: string | undefined;
 /** Original navigator.mediaDevices descriptor, restored after each test. */
 let originalMediaDevices: PropertyDescriptor | undefined;
+/** Original navigator.language descriptor, restored after each test. */
+let originalLanguage: PropertyDescriptor | undefined;
 
 function installSpeechRecognition() {
   handlers = {};
   startSpy = vi.fn();
   stopSpy = vi.fn();
+  recognitionLang = undefined;
   // A class (not an arrow fn) so `new Ctor()` is constructable — the component
   // does `new Ctor()` in its mount effect.
   class FakeRecognition {
+    private language = "en-US";
+    get lang() {
+      return this.language;
+    }
+    set lang(value: string) {
+      this.language = value;
+      recognitionLang = value;
+    }
     continuous = false;
     interimResults = false;
-    lang = "en-US";
     start = startSpy;
     stop = stopSpy;
     addEventListener(type: string, handler: (event: unknown) => void) {
@@ -97,6 +113,7 @@ beforeEach(() => {
   // (unavailable in jsdom) is ever constructed. Capture the original descriptor
   // first so afterEach can restore it — otherwise this navigator stub leaks.
   originalMediaDevices = Object.getOwnPropertyDescriptor(navigator, "mediaDevices");
+  originalLanguage = Object.getOwnPropertyDescriptor(navigator, "language");
   Object.defineProperty(navigator, "mediaDevices", {
     configurable: true,
     value: { getUserMedia: vi.fn().mockRejectedValue(new Error("no mic")) },
@@ -113,6 +130,11 @@ afterEach(() => {
   } else {
     delete (navigator as { mediaDevices?: unknown }).mediaDevices;
   }
+  if (originalLanguage) {
+    Object.defineProperty(navigator, "language", originalLanguage);
+  } else {
+    delete (navigator as { language?: unknown }).language;
+  }
 });
 
 describe("ComposerMicButton", () => {
@@ -127,6 +149,45 @@ describe("ComposerMicButton", () => {
     render(<ComposerMicButton onTranscript={vi.fn()} />);
     const button = screen.getByRole("button", { name: "Voice dictation" });
     expect(button).toHaveAttribute("aria-pressed", "false");
+  });
+
+  it("allows a caller to override sizing without changing dictation state classes", () => {
+    render(<ComposerMicButton className="size-8 md:size-7" onTranscript={vi.fn()} />);
+    const button = screen.getByRole("button", { name: "Voice dictation" });
+
+    expect(button).toHaveClass("size-8", "md:size-7");
+    expect(button).not.toHaveClass("size-9", "md:size-8");
+    expect(button).toHaveAttribute("aria-pressed", "false");
+
+    fireEvent.click(button);
+    act(() => handlers.start?.({}));
+
+    expect(button).toHaveAttribute("aria-pressed", "true");
+    expect(button).toHaveClass("bg-muted/60", "focus-visible:text-destructive");
+  });
+
+  it("defaults Web Speech to the browser language", () => {
+    Object.defineProperty(navigator, "language", { configurable: true, value: "ja-JP" });
+
+    render(<ComposerMicButton onTranscript={vi.fn()} />);
+
+    expect(recognitionLang).toBe("ja-JP");
+  });
+
+  it("prefers an explicit language over the browser language", () => {
+    Object.defineProperty(navigator, "language", { configurable: true, value: "ja-JP" });
+
+    render(<ComposerMicButton onTranscript={vi.fn()} lang="en-GB" />);
+
+    expect(recognitionLang).toBe("en-GB");
+  });
+
+  it("falls back to en-US when the browser language is empty", () => {
+    Object.defineProperty(navigator, "language", { configurable: true, value: "" });
+
+    render(<ComposerMicButton onTranscript={vi.fn()} />);
+
+    expect(recognitionLang).toBe("en-US");
   });
 
   it("starts recognition on click and reflects the recording state", () => {
@@ -170,20 +231,28 @@ describe("ComposerMicButton", () => {
     expect(onTranscript).not.toHaveBeenCalled();
   });
 
-  it("surfaces a permission-denied error in the button tooltip", () => {
-    render(<ComposerMicButton onTranscript={vi.fn()} />);
+  it("surfaces a permission-denied error in the tooltip and a toast", () => {
+    render(
+      <CapabilitiesContext.Provider value={DICTATION_INFO}>
+        <ComposerMicButton onTranscript={vi.fn()} />
+      </CapabilitiesContext.Provider>,
+    );
     const button = screen.getByRole("button", { name: "Voice dictation" });
 
     act(() => handlers.error?.({ error: "not-allowed" }));
-    expect(button).toHaveAttribute("title", "Microphone permission denied");
+    const message = "Microphone access denied. Allow access and try again.";
+    expect(button).toHaveAttribute("title", message);
+    expect(showToastMock).toHaveBeenCalledWith(message);
+    expect(sessionStartMock).not.toHaveBeenCalled();
   });
 
-  it("ignores routine no-speech/aborted errors (no tooltip change)", () => {
+  it("ignores routine no-speech/aborted errors (no tooltip change, no toast)", () => {
     render(<ComposerMicButton onTranscript={vi.fn()} />);
     const button = screen.getByRole("button", { name: "Voice dictation" });
 
     act(() => handlers.error?.({ error: "no-speech" }));
     expect(button).toHaveAttribute("title", "Voice dictation");
+    expect(showToastMock).not.toHaveBeenCalled();
   });
 
   it("snapshots via onVoiceStart when dictation begins", () => {
@@ -269,11 +338,13 @@ const DICTATION_INFO: ServerInfo = {
   databricks_features: false,
   managed_sandboxes_enabled: false,
   sandbox_provider: null,
+  enabled_connections: [],
   sharing_mode: "on",
   public_sharing_enabled: true,
   server_version: "test",
   smart_routing_enabled: false,
   smart_routing_sources: { external: false, oss: false },
+  features: {},
   harness_install_enabled: false,
   installable_harnesses: [],
   dictation_available: true,
@@ -326,6 +397,35 @@ describe("ComposerMicButton (server dictation)", () => {
     );
   });
 
+  it("shows a connecting state during the handshake, then flips to listening", async () => {
+    // Hold the handshake open so the connecting window is observable (the real
+    // first take cold-loads the model for up to ~40s).
+    let resolveStart!: (s: SessionStub) => void;
+    sessionStartMock = vi.fn((events: DictationSessionEvents) => {
+      sessionEvents = events;
+      return new Promise<SessionStub>((resolve) => {
+        resolveStart = resolve;
+      });
+    });
+    renderServerMode();
+    const button = screen.getByRole("button", { name: "Voice dictation" });
+
+    await act(async () => {
+      fireEvent.click(button);
+    });
+    // Handshake in flight: busy, not yet pressed (no audio is flowing).
+    expect(button).toHaveAttribute("aria-busy", "true");
+    expect(button).toHaveAttribute("aria-pressed", "false");
+    expect(button).toHaveAttribute("title", "Starting voice input…");
+
+    await act(async () => {
+      resolveStart({ stop: sessionStopMock, cancel: sessionCancelMock });
+    });
+    // Ready: the take is live and the spinner is gone.
+    expect(button).toHaveAttribute("aria-busy", "false");
+    expect(button).toHaveAttribute("aria-pressed", "true");
+  });
+
   it("routes partials to onInterim and finals to onTranscript", async () => {
     const onTranscript = vi.fn();
     const onInterim = vi.fn();
@@ -366,19 +466,21 @@ describe("ComposerMicButton (server dictation)", () => {
     expect(onInterim).toHaveBeenCalledWith("");
   });
 
-  it("surfaces mic permission denial in the tooltip", async () => {
+  it("surfaces mic permission denial in the tooltip and a toast", async () => {
     sessionStartMock = vi.fn(async () => {
       throw new DOMException("denied", "NotAllowedError");
     });
     renderServerMode();
     await clickMic();
+    const message = "Microphone access denied. Allow access and try again.";
     expect(screen.getByRole("button", { name: "Voice dictation" })).toHaveAttribute(
       "title",
-      "Microphone permission denied",
+      message,
     );
+    expect(showToastMock).toHaveBeenCalledWith(message);
   });
 
-  it("a mid-take transport error resets state and reports unavailable", async () => {
+  it("a mid-take transport error resets state and surfaces the failure", async () => {
     const onInterim = vi.fn();
     renderServerMode({ onInterim });
     await clickMic();
@@ -386,15 +488,31 @@ describe("ComposerMicButton (server dictation)", () => {
     act(() => sessionEvents?.onError("dictation failed"));
     const button = screen.getByRole("button", { name: "Voice dictation" });
     expect(button).toHaveAttribute("aria-pressed", "false");
-    expect(button).toHaveAttribute("title", "Dictation unavailable");
+    expect(button).toHaveAttribute("title", "Voice input failed. Please try again.");
+    expect(showToastMock).toHaveBeenCalledWith("Voice input failed. Please try again.");
+    // No partial was in flight, so the interim region is just cleared.
     expect(onInterim).toHaveBeenCalledWith("");
   });
 
-  it("falls back to server dictation when Web Speech dies with a network error", async () => {
-    // Electron / plain Chromium: the SpeechRecognition constructor exists
-    // (so Web Speech is picked first) but its cloud backend rejects the
-    // build at runtime with "network". The take must fall back to server
-    // dictation so the user's click still lands.
+  it("preserves an in-flight partial when a take crashes", async () => {
+    const onTranscript = vi.fn();
+    const onInterim = vi.fn();
+    renderServerMode({ onTranscript, onInterim });
+    await clickMic();
+
+    // The user has spoken; a partial is showing but hasn't finalized.
+    act(() => sessionEvents?.onPartial("half a sentence"));
+    onInterim.mockClear();
+
+    act(() => sessionEvents?.onError("dictation failed"));
+    // The partial is pinned as a final rather than blanked, so the words survive.
+    expect(onTranscript).toHaveBeenCalledWith("half a sentence");
+    expect(onInterim).not.toHaveBeenCalledWith("");
+  });
+
+  it.each(["network", "service-not-allowed"])("falls back on %s", async (error) => {
+    // The browser exposes Web Speech but its service rejects the request.
+    // Server transcription can still use the client's microphone.
     const onInterim = vi.fn();
     render(
       <CapabilitiesContext.Provider value={DICTATION_INFO}>
@@ -405,7 +523,7 @@ describe("ComposerMicButton (server dictation)", () => {
 
     fireEvent.click(button);
     expect(startSpy).toHaveBeenCalledTimes(1);
-    await act(async () => handlers.error?.({ error: "network" }));
+    await act(async () => handlers.error?.({ error }));
 
     // The take restarted on the server path, with no error tooltip for
     // the silent switch, and partials flow.
@@ -438,11 +556,11 @@ describe("ComposerMicButton (server dictation)", () => {
     await clickMic();
     expect(screen.getByRole("button", { name: "Voice dictation" })).toHaveAttribute(
       "title",
-      "Dictation is busy — try again shortly",
+      "Voice input is busy. Please try again shortly.",
     );
   });
 
-  it("keeps the plain error path when the server offers no dictation", async () => {
+  it.each(["network", "service-not-allowed"])("reports %s without a server", async (error) => {
     render(
       <CapabilitiesContext.Provider value={NO_DICTATION_INFO}>
         <ComposerMicButton onTranscript={vi.fn()} />
@@ -450,9 +568,10 @@ describe("ComposerMicButton (server dictation)", () => {
     );
     const button = screen.getByRole("button", { name: "Voice dictation" });
     fireEvent.click(button);
-    await act(async () => handlers.error?.({ error: "network" }));
+    await act(async () => handlers.error?.({ error }));
     expect(sessionStartMock).not.toHaveBeenCalled();
-    expect(button).toHaveAttribute("title", "Dictation unavailable");
+    expect(button).toHaveAttribute("title", "Voice input isn't available on this device.");
+    expect(showToastMock).toHaveBeenCalledWith("Voice input isn't available on this device.");
   });
 
   it("cancels the session when the composer goes disabled mid-take", async () => {

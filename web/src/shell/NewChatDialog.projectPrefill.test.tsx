@@ -1,27 +1,69 @@
+import type * as SandboxModelOptionsModule from "@/hooks/useSandboxModelOptions";
+
+vi.mock("@/hooks/useSandboxModelOptions", async (importOriginal) => ({
+  ...(await importOriginal<typeof SandboxModelOptionsModule>()),
+  useSandboxModelOptions: vi.fn(() => ({
+    data: {
+      configured: false,
+      status: "unconfigured",
+      models: [],
+      configuration_revision: null,
+      provider_label: null,
+      default_model: null,
+    },
+    isLoading: false,
+    error: null,
+  })),
+}));
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  useConversations as useTestConversations,
+  useProjectConfig,
+  useProjects,
+} from "@/hooks/useConversations";
+
+vi.mock("@/hooks/useSidebarData", () => ({ useLoadedConversations: () => useTestConversations() }));
+
+vi.mock("@/hooks/useSkills", () => ({
+  useSkills: () => ({ skills: [], skillsStatus: "ready", refetch: vi.fn() }),
+}));
 import type * as UseConversationsModule from "@/hooks/useConversations";
+import type * as HostWorktreesModule from "@/hooks/useHostWorktrees";
 import type * as AgentLabelsModule from "@/lib/agentLabels";
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { authenticatedFetch } from "@/lib/identity";
+import type * as SandboxProfilesModule from "@/lib/sandboxProfilesApi";
+import { fetchSandboxProfiles } from "@/lib/sandboxProfilesApi";
 import type { Host } from "@/hooks/useHosts";
-import { useHosts } from "@/hooks/useHosts";
+import { useHostModelOptions, useHosts } from "@/hooks/useHosts";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
-import { useProjectConfig, useProjects } from "@/hooks/useConversations";
 import type { ProjectConfig } from "@/lib/projectsApi";
+import {
+  clearProjectLaunchDefaults,
+  writeProjectLaunchDefaults,
+} from "@/lib/projectLaunchPreferences";
 import { useHostWorktrees } from "@/hooks/useHostWorktrees";
 import type { HostWorktree } from "@/hooks/useHostWorktrees";
-import { NewChatLandingScreen } from "./NewChatDialog";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import type { ServerInfo } from "@/lib/capabilities";
+import { NewChatLandingScreen, resetLandingDraft } from "./NewChatDialog";
+import { TooltipProvider } from "@/components/ui/tooltip";
 
 // A `?project=` visit prefills the composer from the project's STORED config
 // (host / working directory / agent / worktree). A field the config leaves
 // unset falls through to the composer's generic defaults (last host, recent
 // workspace, last-used agent). These tests pin those seeding rules.
 const navigateMock = vi.fn();
+
+vi.mock("@/lib/sandboxProfilesApi", async (importOriginal) => ({
+  ...(await importOriginal<typeof SandboxProfilesModule>()),
+  fetchSandboxProfiles: vi.fn(),
+}));
 
 const RECENT_KEY = "omnigent:recent-workspaces";
 const RECENT_WORKSPACE = "/Users/corey/universe/src/foo";
@@ -31,6 +73,7 @@ const REPO = "/Users/corey/projects/alpha";
 // screen stays mounted; only the param changes).
 let searchParams = new URLSearchParams("project=Alpha");
 vi.mock("@/lib/routing", () => ({
+  useLocation: () => ({ hash: "", state: null }),
   useNavigate: () => navigateMock,
   useSearchParams: () => [searchParams, vi.fn()],
 }));
@@ -39,20 +82,33 @@ vi.mock("@/store/chatStore", () => ({
   setPendingInitialPrompt: vi.fn(),
 }));
 
-vi.mock("@/lib/identity", () => ({ authenticatedFetch: vi.fn() }));
+vi.mock("@/lib/identity", () => ({
+  authenticatedFetch: vi.fn(),
+  getCurrentUserId: vi.fn(() => null),
+  resolveIdentity: vi.fn(async () => null),
+}));
 vi.mock("@/hooks/useHosts", () => ({
   useHosts: vi.fn(),
   useHostModelOptions: vi.fn(() => ({ data: [] })),
   useInstallHarness: vi.fn(() => ({ mutate: vi.fn(), isPending: false })),
   useInstallingHarnesses: vi.fn(() => new Set<string>()),
 }));
-vi.mock("@/hooks/useAvailableAgents", () => ({ useAvailableAgents: vi.fn() }));
+vi.mock("@/hooks/useAvailableAgents", () => ({
+  useAvailableAgents: vi.fn(),
+  // Opening the agent picker prefetches details per row; no-op here.
+  prefetchAvailableAgentDetails: vi.fn(),
+}));
 vi.mock("@/hooks/useHostFilesystem", () => ({
   useHostFilesystem: () => ({ data: undefined }),
   useCreateHostDirectory: () => ({ mutateAsync: vi.fn(), isPending: false }),
 }));
-vi.mock("@/hooks/useHostWorktrees", () => ({
+vi.mock("@/hooks/useHostWorktrees", async (importOriginal) => ({
+  ...(await importOriginal<typeof HostWorktreesModule>()),
   useHostWorktrees: vi.fn(),
+  hostWorktreesQueryOptions: (hostId: string, repoPath: string) => ({
+    queryKey: ["host-worktrees", hostId, repoPath],
+    queryFn: async () => [],
+  }),
 }));
 vi.mock("@/hooks/useDirectorySessions", () => ({
   useDirectorySessions: () => ({ data: [] }),
@@ -66,6 +122,10 @@ vi.mock("@/hooks/useConversations", async (importOriginal) => ({
   ...(await importOriginal<typeof UseConversationsModule>()),
   useProjects: vi.fn(),
   useProjectConfig: vi.fn(),
+  // The landing reads useConversations to decide hasNoSessions (the empty-state
+  // import affordance); stub it so it doesn't fire an authenticatedFetch that
+  // lands at mock.calls[0] and skews these create-POST call assertions.
+  useConversations: () => ({ data: undefined }),
 }));
 vi.mock("@/lib/agentLabels", async (importOriginal) => ({
   ...(await importOriginal<typeof AgentLabelsModule>()),
@@ -91,7 +151,7 @@ function agent(overrides: Partial<AvailableAgent> = {}): AvailableAgent {
     name: "hello_world",
     display_name: "Hello World",
     description: null,
-    harness: null,
+    harness: "claude-sdk",
     skills: [],
     ...overrides,
   };
@@ -116,20 +176,137 @@ function setRepoIsGit(): void {
     const known = hostId === "host_1" && path === REPO;
     return {
       data: known
-        ? ([{ path: REPO, branch: "main", is_main: true, detached: false }] as HostWorktree[])
+        ? ([
+            {
+              path: REPO,
+              branch: "main",
+              is_main: true,
+              detached: false,
+            },
+          ] as HostWorktree[])
         : ([] as HostWorktree[]),
       isError: false,
     } as ReturnType<typeof useHostWorktrees>;
   });
 }
 
-function renderLanding(): (ui: ReactNode) => void {
+function renderLanding(): { rerender: (ui: ReactNode) => void; unmount: () => void } {
+  const info: ServerInfo = {
+    accounts_enabled: false,
+    single_user: false,
+    login_url: null,
+    needs_setup: false,
+    databricks_features: false,
+    enabled_connections: [],
+    managed_sandboxes_enabled: false,
+    sandbox_provider: null,
+    sharing_mode: "on",
+    public_sharing_enabled: true,
+    server_version: null,
+    smart_routing_enabled: false,
+    smart_routing_sources: { external: false, oss: false },
+    features: { harness_install: false },
+    harness_install_enabled: false,
+    installable_harnesses: [],
+    dictation_available: false,
+  };
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   function Wrapper({ children }: { children: ReactNode }) {
-    return <QueryClientProvider client={client}>{children}</QueryClientProvider>;
+    return (
+      <QueryClientProvider client={client}>
+        <CapabilitiesProvider info={info}>
+          <TooltipProvider>{children}</TooltipProvider>
+        </CapabilitiesProvider>
+      </QueryClientProvider>
+    );
+  }
+  const { rerender, unmount } = render(<NewChatLandingScreen />, { wrapper: Wrapper });
+  return { rerender, unmount };
+}
+
+/** Same as renderLanding, but with the managed-sandbox host option enabled. */
+function renderSandboxLanding(): { rerender: (ui: ReactNode) => void } {
+  const info: ServerInfo = {
+    accounts_enabled: false,
+    single_user: false,
+    login_url: null,
+    needs_setup: false,
+    databricks_features: false,
+    enabled_connections: [],
+    managed_sandboxes_enabled: true,
+    sandbox_provider: "modal",
+    sharing_mode: "on",
+    public_sharing_enabled: true,
+    server_version: null,
+    smart_routing_enabled: false,
+    smart_routing_sources: { external: false, oss: false },
+    features: { harness_install: false, sandbox_profiles: true },
+    harness_install_enabled: false,
+    installable_harnesses: [],
+    dictation_available: false,
+  };
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  function Wrapper({ children }: { children: ReactNode }) {
+    return (
+      <QueryClientProvider client={client}>
+        <CapabilitiesProvider info={info}>
+          <TooltipProvider>{children}</TooltipProvider>
+        </CapabilitiesProvider>
+      </QueryClientProvider>
+    );
   }
   const { rerender } = render(<NewChatLandingScreen />, { wrapper: Wrapper });
-  return rerender;
+  return { rerender };
+}
+
+/** Render with Smart Routing enabled so a routing-eligible native agent can turn it on. */
+function renderRoutingLanding(): { rerender: (ui: ReactNode) => void; unmount: () => void } {
+  const info: ServerInfo = {
+    accounts_enabled: false,
+    single_user: false,
+    login_url: null,
+    needs_setup: false,
+    databricks_features: false,
+    managed_sandboxes_enabled: false,
+    sandbox_provider: null,
+    enabled_connections: [],
+    sharing_mode: "on",
+    public_sharing_enabled: true,
+    server_version: null,
+    smart_routing_enabled: true,
+    smart_routing_sources: { external: true, oss: false },
+    features: { harness_install: false },
+    harness_install_enabled: false,
+    installable_harnesses: [],
+    dictation_available: false,
+  };
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  function Wrapper({ children }: { children: ReactNode }) {
+    return (
+      <QueryClientProvider client={client}>
+        <CapabilitiesProvider info={info}>
+          <TooltipProvider>{children}</TooltipProvider>
+        </CapabilitiesProvider>
+      </QueryClientProvider>
+    );
+  }
+  const { rerender, unmount } = render(<NewChatLandingScreen />, { wrapper: Wrapper });
+  return { rerender, unmount };
+}
+
+/**
+ * Open the picker and commit (select + close) an agent by clicking its row.
+ * The composed agents these tests use live under the custom-agent "Other..."
+ * submenu, so drill in when the row isn't already listed inline.
+ */
+function selectAgent(agentId: string): void {
+  fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+  if (screen.queryByTestId(`new-chat-landing-agent-${agentId}`) == null) {
+    fireEvent.click(screen.getByTestId("new-chat-landing-custom-agents"));
+  }
+  fireEvent.click(screen.getByTestId(`new-chat-landing-agent-${agentId}`));
+  const selectedRow = screen.queryByTestId(`new-chat-landing-agent-${agentId}`);
+  if (selectedRow) fireEvent.keyDown(selectedRow, { key: "Escape" });
 }
 
 async function submitAndReadBody(): Promise<Record<string, unknown>> {
@@ -149,7 +326,13 @@ async function submitAndReadBody(): Promise<Record<string, unknown>> {
 beforeEach(() => {
   navigateMock.mockReset();
   vi.mocked(authenticatedFetch).mockReset();
+  // The landing draft is module-scoped and survives unmount by design; clear it
+  // so a case that never submits can't leak its state into the next test.
+  resetLandingDraft();
   searchParams = new URLSearchParams("project=Alpha");
+  // The module-scoped landing draft survives unmounts by design; clear it so
+  // one test's parked draft can't seed the next one.
+  resetLandingDraft();
   localStorage.clear();
   // A recent on the host that the generic seeding would use when the config
   // sets no workspace.
@@ -177,6 +360,132 @@ afterEach(() => {
 });
 
 describe("NewChatLandingScreen project prefill", () => {
+  it("discards project A's parked draft slots so project B's remount seeds B's defaults", async () => {
+    const BETA_REPO = "/Users/corey/projects/beta";
+    // Distinct stored defaults per project: Alpha pins ag_other + its repo,
+    // Beta pins ag_hello + a different repo.
+    vi.mocked(useProjectConfig).mockImplementation((id) => {
+      const data =
+        id === "proj_beta"
+          ? { host_id: "host_1", workspace: BETA_REPO, agent_id: "ag_hello" }
+          : { host_id: "host_1", workspace: REPO, agent_id: "ag_other" };
+      return { data, isLoading: false } as ReturnType<typeof useProjectConfig>;
+    });
+
+    // Visit project Alpha: its defaults seed, and unmounting parks them in
+    // the module-scoped landing draft (deliberately NOT reset here).
+    searchParams = new URLSearchParams("project=Alpha");
+    const { unmount } = renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("alpha"),
+    );
+    unmount();
+
+    // Remount under project Beta: Alpha's drafted agent/workspace must yield
+    // to Beta's stored defaults (the prefill writes are fill-empty-only, so a
+    // restored draft would otherwise win every slot).
+    searchParams = new URLSearchParams("project=Beta");
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("beta"),
+    );
+    const body = await submitAndReadBody();
+    // Beta's seeded slots are still config-values, so the create omits them
+    // for server default-fill under Beta's project_id. Had Alpha's drafted
+    // agent survived, it would differ from Beta's config and be sent
+    // explicitly — the omission is the assertion.
+    expect(body.project_id).toBe("proj_beta");
+    expect("agent_id" in body).toBe(false);
+    expect("workspace" in body).toBe(false);
+  });
+
+  it("keeps the draft's picked agent on a same-project remount", async () => {
+    // Same project back and forth: the draft is the user's in-progress
+    // composition for THIS project, so an explicit agent pick must survive
+    // the unmount/remount — only a project switch discards it.
+    setProjectConfig({ host_id: "host_1", workspace: REPO, agent_id: "ag_hello" });
+    const { unmount } = renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("alpha"),
+    );
+    selectAgent("ag_other");
+    unmount();
+
+    renderLanding();
+    const body = await submitAndReadBody();
+    // The explicit pick differs from the config agent, so it rides
+    // explicitly; the untouched config workspace is omitted (default-fill).
+    expect(body.agent_id).toBe("ag_other");
+    expect("workspace" in body).toBe(false);
+    expect(body.project_id).toBe("proj_alpha");
+  });
+
+  it("carries a pinned session-scoped config agent into the create body over last-agent-id", async () => {
+    // The configured agent is only resolvable through discovery's pinning
+    // (a session-derived row, absent from the plain catalog); a stored
+    // last-agent-id must not displace it.
+    localStorage.setItem("omnigent:last-agent-id", "ag_hello");
+    vi.mocked(useAvailableAgents).mockReturnValue({
+      data: [
+        agent(),
+        agent({
+          id: "ag_pinned",
+          name: "deploy-bot",
+          display_name: "Deploy-bot",
+          sessionId: "conv_anchor",
+        }),
+      ],
+    } as ReturnType<typeof useAvailableAgents>);
+    setProjectConfig({ host_id: "host_1", workspace: REPO, agent_id: "ag_pinned" });
+    renderLanding();
+
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("alpha"),
+    );
+    const body = await submitAndReadBody();
+    // The configured agent held (untouched → omitted for default-fill). Had
+    // last-agent-id displaced it, the differing agent would be sent explicitly.
+    expect(body.project_id).toBe("proj_alpha");
+    expect("agent_id" in body).toBe(false);
+    expect("workspace" in body).toBe(false);
+    // The composer must thread the configured agent into discovery's pins —
+    // that's what makes the session-scoped row above resolvable at all.
+    expect(
+      vi
+        .mocked(useAvailableAgents)
+        .mock.calls.some(([opts]) => opts?.pinnedAgentIds?.includes("ag_pinned") ?? false),
+    ).toBe(true);
+  });
+
+  it("surfaces an explicit unavailable state instead of substituting an agent the config pinned", async () => {
+    // The configured agent resolves nowhere (catalog, scan, and pinned lookup
+    // all missed it). The composer must say so and block submit — not fall
+    // back to last-agent-id or the picker's first row.
+    localStorage.setItem("omnigent:last-agent-id", "ag_hello");
+    setProjectConfig({ host_id: "host_1", workspace: REPO, agent_id: "ag_gone" });
+    renderLanding();
+
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain(
+        "Agent unavailable",
+      ),
+    );
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "hello" },
+    });
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    expect(vi.mocked(authenticatedFetch)).not.toHaveBeenCalled();
+
+    // Recovery: an explicit pick clears the state and submit goes through
+    // with the agent the user actually chose.
+    selectAgent("ag_other");
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain("Other"),
+    );
+    const body = await submitAndReadBody();
+    expect(body.agent_id).toBe("ag_other");
+  });
+
   it("seeds host / workspace / agent from the stored config", async () => {
     setProjectConfig({ host_id: "host_1", workspace: REPO, agent_id: "ag_other" });
     renderLanding();
@@ -186,8 +495,10 @@ describe("NewChatLandingScreen project prefill", () => {
     );
     const body = await submitAndReadBody();
     expect(body.host_id).toBe("host_1");
-    expect(body.workspace).toBe(REPO);
-    expect(body.agent_id).toBe("ag_other");
+    // Untouched config-seeded slots are omitted for server default-fill.
+    expect(body.project_id).toBe("proj_alpha");
+    expect("workspace" in body).toBe(false);
+    expect("agent_id" in body).toBe(false);
     // No opt-in worktree → no git block.
     expect(body.git).toBeUndefined();
   });
@@ -198,7 +509,8 @@ describe("NewChatLandingScreen project prefill", () => {
 
     const body = await submitAndReadBody();
     expect(body.host_id).toBe("host_1");
-    expect(body.workspace).toBe(REPO);
+    expect("workspace" in body).toBe(false);
+    // The branch name is generated client-side, so `git` is always explicit.
     expect((body.git as { branch_name: string }).branch_name).toMatch(/^worktree-[0-9a-f]{8}$/);
   });
 
@@ -207,8 +519,42 @@ describe("NewChatLandingScreen project prefill", () => {
     renderLanding();
 
     const body = await submitAndReadBody();
-    expect(body.workspace).toBe(REPO);
+    expect("workspace" in body).toBe(false);
     expect(body.git).toBeUndefined();
+  });
+
+  it("suppresses stored project git defaults after switching to a non-git workspace", async () => {
+    const config = {
+      host_id: "host_1",
+      workspace: REPO,
+      git: { branch_name: "feature/project-default" },
+    };
+    setProjectConfig(config);
+    renderLanding();
+
+    const worktree = screen.getByTestId("new-chat-landing-branch-chip");
+    await waitFor(() => expect(worktree).toBeEnabled());
+    fireEvent.click(worktree);
+    fireEvent.change(screen.getByTestId("new-chat-landing-branch-input"), {
+      target: { value: "feature/explicit-worktree" },
+    });
+    expect(worktree).toHaveTextContent("feature/explicit-worktree");
+
+    fireEvent.click(screen.getByTestId("new-chat-landing-workspace-chip"));
+    fireEvent.click(screen.getByRole("button", { name: RECENT_WORKSPACE }));
+    expect(screen.getByTestId("new-chat-landing-workspace-chip")).toHaveAttribute(
+      "title",
+      RECENT_WORKSPACE,
+    );
+    await waitFor(() =>
+      expect(screen.queryByTestId("new-chat-landing-branch-chip")).not.toBeInTheDocument(),
+    );
+
+    const body = await submitAndReadBody();
+    expect(body.project_id).toBe("proj_alpha");
+    expect(body.workspace).toBe(RECENT_WORKSPACE);
+    // Explicit null prevents the server from restoring the project's git default.
+    expect(body.git).toBeNull();
   });
 
   it("falls back to the generic defaults when the project has no config", async () => {
@@ -219,7 +565,7 @@ describe("NewChatLandingScreen project prefill", () => {
     expect(body.host_id).toBe("host_1");
     expect(body.workspace).toBe(RECENT_WORKSPACE);
     expect(body.agent_id).toBe("ag_hello");
-    expect(body.git).toBeUndefined();
+    expect(body.git).toBeNull();
   });
 
   it("seeds only the host from config, leaving the workspace to the generic default", async () => {
@@ -237,14 +583,18 @@ describe("NewChatLandingScreen project prefill", () => {
     // or the stored default agent would never apply.
     setProjects(undefined, true); // still loading
     setProjectConfig({ host_id: "host_1", agent_id: "ag_other" });
-    const rerender = renderLanding();
+    const { rerender } = renderLanding();
 
     // Projects finish loading → config resolves and the agent seeds.
     setProjects([{ id: "proj_alpha", name: "Alpha" }]);
     rerender(<NewChatLandingScreen />);
 
     const body = await submitAndReadBody();
-    expect(body.agent_id).toBe("ag_other");
+    // The config agent seeded (and stayed) → omitted for default-fill. A
+    // premature settle would have picked the generic default, which differs
+    // from the config and would ride explicitly.
+    expect(body.project_id).toBe("proj_alpha");
+    expect("agent_id" in body).toBe(false);
   });
 
   it("reseeds from the new project when another pencil is clicked while mounted", async () => {
@@ -256,7 +606,7 @@ describe("NewChatLandingScreen project prefill", () => {
           : { host_id: "host_1", workspace: REPO };
       return { data, isLoading: false } as ReturnType<typeof useProjectConfig>;
     });
-    const rerender = renderLanding();
+    const { rerender } = renderLanding();
     await waitFor(() =>
       expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("alpha"),
     );
@@ -267,15 +617,77 @@ describe("NewChatLandingScreen project prefill", () => {
       expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("beta"),
     );
     const body = await submitAndReadBody();
-    expect(body.workspace).toBe(BETA_REPO);
-    expect(body.agent_id).toBe("ag_other");
+    // Reseeded to Beta's config (the chip check above proves the UI): both
+    // slots stayed config-values, omitted under Beta's project_id.
+    expect(body.project_id).toBe("proj_beta");
+    expect("workspace" in body).toBe(false);
+    expect("agent_id" in body).toBe(false);
+  });
+
+  it("clears the sandbox repository and profile on an in-place project switch", async () => {
+    // Mounted mirror of the unmount/remount sandbox-leak case: clicking
+    // another project's pencil only changes `?project=` — the screen never
+    // unmounts, so the draft-restore strip can't help. The reset effect must
+    // clear the staged repo/branch or project Beta's sandbox silently clones
+    // project Alpha's repository.
+    vi.mocked(fetchSandboxProfiles).mockResolvedValue({
+      profiles: [
+        {
+          id: "large",
+          name: "Large workspace",
+          provider: "modal",
+          revision: "revision-1",
+          description: "",
+        },
+      ],
+      managed_providers: ["modal"],
+      next_cursor: null,
+    });
+    const { rerender } = renderSandboxLanding();
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-sandbox-option"));
+    fireEvent.click(await screen.findByRole("button", { name: "Sandbox profile: Choose profile" }));
+    fireEvent.click(screen.getByRole("option", { name: "Large workspace" }));
+    fireEvent.click(screen.getByTestId("new-chat-landing-repo-chip"));
+    fireEvent.change(screen.getByTestId("new-chat-landing-repo-input"), {
+      target: { value: "https://github.com/org/alpha-repo" },
+    });
+    fireEvent.click(screen.getByTestId("new-chat-landing-repo-add"));
+    await screen.findByTestId("new-chat-landing-repo-row");
+    expect(screen.getByTestId("new-chat-landing-repo-chip").textContent).toContain("alpha-repo");
+
+    // Click project Beta's pencil: the param changes in place.
+    searchParams = new URLSearchParams("project=Beta");
+    rerender(<NewChatLandingScreen />);
+
+    // The sticky host pick re-selects the sandbox, but Alpha's staged repo
+    // is gone.
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-repo-chip").textContent).toContain("Repository"),
+    );
+    const picker = screen.getByRole("button", { name: "Sandbox profile: Choose profile" });
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), { target: { value: "hello" } });
+    expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
+    fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+    expect(authenticatedFetch).not.toHaveBeenCalled();
+    fireEvent.click(picker);
+    fireEvent.click(screen.getByRole("option", { name: "Large workspace" }));
+    const body = await submitAndReadBody();
+    expect(body.host_type).toBe("managed");
+    // No repos carried over → an empty workspaces list; workspace stays pinned
+    // to explicit null under Beta's project_id (a managed create rejects a
+    // default-filled path) — not Alpha's repo.
+    expect(body.workspaces).toEqual([]);
+    expect(body.workspace).toBeNull();
+    expect(body.project_id).toBe("proj_beta");
+    expect(body.sandbox_profile_id).toBe("large");
   });
 
   it("reseeds the SAME project after its stored defaults change (edited then re-opened)", async () => {
     const EDITED_REPO = "/Users/corey/projects/alpha-edited";
     // First open reads the original config.
     setProjectConfig({ host_id: "host_1", workspace: REPO });
-    const rerender = renderLanding();
+    const { rerender } = renderLanding();
     await waitFor(() =>
       expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("alpha"),
     );
@@ -292,10 +704,13 @@ describe("NewChatLandingScreen project prefill", () => {
       ),
     );
     const body = await submitAndReadBody();
-    expect(body.workspace).toBe(EDITED_REPO);
+    // The chip check above proves the edited workspace reseeded; being a
+    // config-value again, the create omits it for default-fill.
+    expect(body.project_id).toBe("proj_alpha");
+    expect("workspace" in body).toBe(false);
   });
 
-  it("does not seed an offline config host (falls back to the generic default)", async () => {
+  it("keeps the configured workspace when the config host is offline (host falls back)", async () => {
     vi.mocked(useHosts).mockReturnValue({
       data: [host(), host({ host_id: "host_off", name: "sleepy", status: "offline" })],
     } as ReturnType<typeof useHosts>);
@@ -303,8 +718,13 @@ describe("NewChatLandingScreen project prefill", () => {
     renderLanding();
 
     const body = await submitAndReadBody();
+    // The offline host falls back to the generic default, but the project's
+    // workspace hint must not be displaced by the host's recent path (which
+    // can belong to another project).
     expect(body.host_id).toBe("host_1");
-    expect(body.workspace).toBe(RECENT_WORKSPACE);
+    // The workspace hint held (still the config value) → omitted; the server
+    // default-fills it. A displaced hint would ride as an explicit recent path.
+    expect("workspace" in body).toBe(false);
   });
 
   // A repo with a main work tree plus one linked worktree. `git worktree list`
@@ -313,8 +733,18 @@ describe("NewChatLandingScreen project prefill", () => {
   const MAIN_REPO = "/Users/corey/projects/gamma";
   const LINKED_WORKTREE = "/Users/corey/projects/gamma-worktrees/feature-x";
   const WORKTREE_LIST: HostWorktree[] = [
-    { path: MAIN_REPO, branch: "main", is_main: true, detached: false },
-    { path: LINKED_WORKTREE, branch: "feature/x", is_main: false, detached: false },
+    {
+      path: MAIN_REPO,
+      branch: "main",
+      is_main: true,
+      detached: false,
+    },
+    {
+      path: LINKED_WORKTREE,
+      branch: "feature/x",
+      is_main: false,
+      detached: false,
+    },
   ];
 
   function setWorktreeRepo(): void {
@@ -359,11 +789,12 @@ describe("NewChatLandingScreen project prefill", () => {
     setProjectConfig({ host_id: "host_1" });
     renderLanding();
 
-    await waitFor(() =>
-      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain(
-        "feature-x",
-      ),
-    );
+    const workspaceTrigger = screen.getByTestId("new-chat-landing-workspace-chip");
+    const worktreeTrigger = screen.getByTestId("new-chat-landing-branch-chip");
+    await waitFor(() => expect(workspaceTrigger).toHaveAttribute("title", LINKED_WORKTREE));
+    expect(workspaceTrigger).toHaveTextContent("gamma");
+    expect(worktreeTrigger).toHaveTextContent("feature-x");
+    expect(worktreeTrigger).toHaveAttribute("title", "Existing worktree branch: feature/x");
     const body = await submitAndReadBody();
     // Bound straight to the worktree dir; the worktree's branch rides along and
     // no base branch is set (it's a bind, not a fork).
@@ -389,9 +820,698 @@ describe("NewChatLandingScreen project prefill", () => {
       expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("gamma"),
     );
     const body = await submitAndReadBody();
-    expect(body.workspace).toBe(MAIN_REPO);
+    // Config workspace held (chip check above) → omitted for default-fill.
+    expect("workspace" in body).toBe(false);
     // Plain launch — no worktree fork was manufactured from the config workspace.
     expect(body.git).toBeUndefined();
+  });
+
+  it("retracts a config-opted-in worktree branch when the project config drops it (re-opened after edit)", async () => {
+    // The composer stays mounted across a pencil re-open; a stored config that
+    // opts in seeds a `worktree-xxxx` branch. If the user edits the project to
+    // turn the worktree default off and re-opens, the previously-seeded branch
+    // must be retracted rather than lingering (the seed effect only fills an
+    // empty branch and never clears on its own).
+    setProjectConfig({ host_id: "host_1", workspace: REPO, use_worktree: true });
+    const { rerender } = renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("alpha"),
+    );
+
+    // Config now explicitly opts out; re-open the same project. The reseed clears
+    // the composer, so the seed effect re-evaluates against the new (off) config
+    // and the previously-seeded worktree branch must not come back.
+    setProjectConfig({ host_id: "host_1", workspace: REPO, use_worktree: false });
+    rerender(<NewChatLandingScreen />);
+
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("alpha"),
+    );
+    const body = await submitAndReadBody();
+    // Config workspace held → omitted under Alpha's project_id for
+    // default-fill; the retracted branch stays retracted.
+    expect(body.project_id).toBe("proj_alpha");
+    expect("workspace" in body).toBe(false);
+    expect(body.git).toBeUndefined();
+  });
+
+  // ── Project default model ── the stored `model` seeds the composer's model
+  // pick (→ create-body model_override) while the composer sits on the
+  // project's configured agent. These pin the seed itself plus the two races
+  // around it: an invalid stored id must behave as "no default", and an
+  // async-arriving config must not clobber a pick the user already committed.
+  const CLAUDE_AGENT_ID = "ag_claude";
+  const HARNESS_OPTIONS_KEY = "omnigent:last-mode-by-harness";
+
+  function setClaudeAgentAndModels(): void {
+    vi.mocked(useAvailableAgents).mockReturnValue({
+      data: [
+        agent(),
+        agent({
+          id: CLAUDE_AGENT_ID,
+          name: "claude-native-ui",
+          display_name: "Claude Code",
+          harness: "claude-native",
+        }),
+      ],
+    } as ReturnType<typeof useAvailableAgents>);
+    vi.mocked(useHostModelOptions).mockReturnValue({
+      data: [
+        { id: "opus", displayName: "Opus" },
+        { id: "sonnet", displayName: "Sonnet" },
+      ],
+    } as ReturnType<typeof useHostModelOptions>);
+  }
+
+  it("seeds the create body's model_override from the project's stored default model", async () => {
+    setClaudeAgentAndModels();
+    setProjectConfig({ host_id: "host_1", agent_id: CLAUDE_AGENT_ID, model: "opus" });
+    renderLanding();
+
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAccessibleName(
+        /Claude Code/,
+      ),
+    );
+    const body = await submitAndReadBody();
+    // The waitFor above proves the configured agent is selected (an unchanged
+    // config agent is omitted from the body for default-fill, so assert the
+    // model_override contract that is the point of this test).
+    expect(body.model_override).toBe("opus");
+  });
+
+  it("outranks the remembered per-harness pick with the project default", async () => {
+    setClaudeAgentAndModels();
+    localStorage.setItem(
+      HARNESS_OPTIONS_KEY,
+      JSON.stringify({ "claude-native": { model: "sonnet" } }),
+    );
+    setProjectConfig({ host_id: "host_1", agent_id: CLAUDE_AGENT_ID, model: "opus" });
+    renderLanding();
+
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAccessibleName(
+        /Claude Code/,
+      ),
+    );
+    const body = await submitAndReadBody();
+    expect(body.model_override).toBe("opus");
+  });
+
+  it("treats an invalid stored project model as no default (remembered pick still seeds)", async () => {
+    // A retired/unknown id must not seed — and must not displace the user's
+    // remembered pick, which stays the effective model.
+    setClaudeAgentAndModels();
+    localStorage.setItem(
+      HARNESS_OPTIONS_KEY,
+      JSON.stringify({ "claude-native": { model: "sonnet" } }),
+    );
+    setProjectConfig({ host_id: "host_1", agent_id: CLAUDE_AGENT_ID, model: "retired-model" });
+    renderLanding();
+
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAccessibleName(
+        /Claude Code/,
+      ),
+    );
+    const body = await submitAndReadBody();
+    expect(body.model_override).toBe("sonnet");
+  });
+
+  it("does not clobber a user's committed model pick when the project config arrives late", async () => {
+    // The config's model can resolve (or refresh) after the composer is
+    // interactive; a pick the user already committed via the config modal
+    // must survive that async arrival.
+    setClaudeAgentAndModels();
+    setProjectConfig({ host_id: "host_1", agent_id: CLAUDE_AGENT_ID });
+    const { rerender } = renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAccessibleName(
+        /Claude Code/,
+      ),
+    );
+
+    // Commit "Sonnet" through the agent-config modal (the user's explicit pick).
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-select"));
+    fireEvent.click(screen.getByTestId(`new-chat-landing-agent-config-${CLAUDE_AGENT_ID}`));
+    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Sonnet" }));
+    fireEvent.keyDown(screen.getByTestId("new-chat-landing-agent-models"), { key: "Escape" });
+
+    // The project default (Opus) lands afterwards — it must not reseed.
+    setProjectConfig({ host_id: "host_1", agent_id: CLAUDE_AGENT_ID, model: "opus" });
+    rerender(<NewChatLandingScreen />);
+
+    const body = await submitAndReadBody();
+    expect(body.model_override).toBe("sonnet");
+  });
+
+  it("lets the project default win over a landing draft that restored Smart Routing on", async () => {
+    // Cross-review edge (OMNI-5841 Polly note #1): a parked landing draft can
+    // restore costControlMode="on". On the remount, the project default must
+    // still win — the model-seed clears the restored routing before the
+    // routing-seed effect early-returns for the valid pin — so the create pins
+    // the model and does NOT also send routing (which would silently drop it).
+    setClaudeAgentAndModels();
+    setProjectConfig({ host_id: "host_1", agent_id: CLAUDE_AGENT_ID });
+    const { unmount } = renderRoutingLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAccessibleName(
+        /Claude Code/,
+      ),
+    );
+
+    // Turn Smart Routing on via the config modal, then park the draft by
+    // unmounting (submittedRef stays false → landingDraft keeps routing "on").
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-select"));
+    fireEvent.click(screen.getByTestId(`new-chat-landing-agent-config-${CLAUDE_AGENT_ID}`));
+    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Smart Routing" }));
+    fireEvent.keyDown(screen.getByTestId("new-chat-landing-agent-models"), { key: "Escape" });
+    unmount();
+
+    // Remount for the SAME project, now with a stored model default. The
+    // restored routing draft must not shadow the pin.
+    setProjectConfig({ host_id: "host_1", agent_id: CLAUDE_AGENT_ID, model: "opus" });
+    renderRoutingLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAccessibleName(
+        /Claude Code/,
+      ),
+    );
+
+    const body = await submitAndReadBody();
+    expect(body.model_override).toBe("opus");
+    expect(body.cost_control_mode_override).not.toBe("on");
+  });
+
+  // ── Project default effort ── the stored `effort` seeds the composer's effort
+  // pick (→ create-body reasoning_effort) on the project's configured agent,
+  // validated against that harness's ladder like the model.
+  function openAgentConfig(agentId: string): void {
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-select"));
+    fireEvent.click(screen.getByTestId(`new-chat-landing-agent-config-${agentId}`));
+  }
+
+  function closeAgentConfig(): void {
+    fireEvent.keyDown(screen.getByTestId("new-chat-landing-agent-models"), { key: "Escape" });
+  }
+
+  const CODEX_AGENT_ID = "ag_codex";
+  const ladder = (...efforts: string[]) => efforts.map((reasoningEffort) => ({ reasoningEffort }));
+
+  // Codex with a default model offering `defaultLadder` and a `gpt-mini` offering only low.
+  function setCodexAgentAndModels(defaultLadder: string[]): void {
+    vi.mocked(useAvailableAgents).mockReturnValue({
+      data: [
+        agent(),
+        agent({
+          id: CODEX_AGENT_ID,
+          name: "codex-native-ui",
+          display_name: "Codex",
+          harness: "codex-native",
+        }),
+      ],
+    } as ReturnType<typeof useAvailableAgents>);
+    vi.mocked(useHostModelOptions).mockReturnValue({
+      data: [
+        {
+          id: "gpt-5.5",
+          displayName: "GPT-5.5",
+          isDefault: true,
+          supportedReasoningEfforts: ladder(...defaultLadder),
+        },
+        { id: "gpt-mini", displayName: "GPT mini", supportedReasoningEfforts: ladder("low") },
+      ],
+    } as ReturnType<typeof useHostModelOptions>);
+  }
+
+  async function waitForCodexAgent(): Promise<void> {
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAccessibleName(/Codex/),
+    );
+  }
+
+  async function waitForClaudeAgent(): Promise<void> {
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAccessibleName(
+        /Claude Code/,
+      ),
+    );
+  }
+
+  it("seeds reasoning_effort from the project default, outranking the remembered effort", async () => {
+    setClaudeAgentAndModels();
+    localStorage.setItem(
+      HARNESS_OPTIONS_KEY,
+      JSON.stringify({ "claude-native": { effort: "low" } }),
+    );
+    setProjectConfig({ host_id: "host_1", agent_id: CLAUDE_AGENT_ID, effort: "high" });
+    renderLanding();
+
+    await waitForClaudeAgent();
+    const body = await submitAndReadBody();
+    expect(body.reasoning_effort).toBe("high");
+  });
+
+  it("treats a project effort outside the harness ladder as no default", async () => {
+    setClaudeAgentAndModels();
+    localStorage.setItem(
+      HARNESS_OPTIONS_KEY,
+      JSON.stringify({ "claude-native": { effort: "low" } }),
+    );
+    setProjectConfig({ host_id: "host_1", agent_id: CLAUDE_AGENT_ID, effort: "minimal" });
+    renderLanding();
+
+    await waitForClaudeAgent();
+    const body = await submitAndReadBody();
+    expect(body.reasoning_effort).toBe("low");
+  });
+
+  it("keeps a user's committed effort pick when the project config changes afterwards", async () => {
+    setClaudeAgentAndModels();
+    setProjectConfig({ host_id: "host_1", agent_id: CLAUDE_AGENT_ID });
+    const { rerender } = renderLanding();
+    await waitForClaudeAgent();
+
+    openAgentConfig(CLAUDE_AGENT_ID);
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-effort-medium"));
+    closeAgentConfig();
+
+    setProjectConfig({ host_id: "host_1", agent_id: CLAUDE_AGENT_ID, effort: "max" });
+    rerender(<NewChatLandingScreen />);
+
+    const body = await submitAndReadBody();
+    expect(body.reasoning_effort).toBe("medium");
+  });
+
+  it("lets a project effort without a model outrank remembered Smart Routing", async () => {
+    setClaudeAgentAndModels();
+    localStorage.setItem(
+      HARNESS_OPTIONS_KEY,
+      JSON.stringify({ "claude-native": { routing: "on", effort: "low" } }),
+    );
+    setProjectConfig({ host_id: "host_1", agent_id: CLAUDE_AGENT_ID, effort: "high" });
+    renderRoutingLanding();
+
+    await waitForClaudeAgent();
+    const body = await submitAndReadBody();
+    expect(body.reasoning_effort).toBe("high");
+    expect(body.cost_control_mode_override).not.toBe("on");
+  });
+
+  it("keeps remembered Smart Routing off after an explicit effort pick over the project effort", async () => {
+    setClaudeAgentAndModels();
+    localStorage.setItem(
+      HARNESS_OPTIONS_KEY,
+      JSON.stringify({ "claude-native": { routing: "on", effort: "low" } }),
+    );
+    setProjectConfig({ host_id: "host_1", agent_id: CLAUDE_AGENT_ID, effort: "high" });
+    renderRoutingLanding();
+    await waitForClaudeAgent();
+
+    openAgentConfig(CLAUDE_AGENT_ID);
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-effort-medium"));
+    closeAgentConfig();
+
+    const body = await submitAndReadBody();
+    expect(body.reasoning_effort).toBe("medium");
+    expect(body.cost_control_mode_override).not.toBe("on");
+  });
+
+  it("lets a project effort win over a landing draft that restored Smart Routing on", async () => {
+    setClaudeAgentAndModels();
+    setProjectConfig({ host_id: "host_1", agent_id: CLAUDE_AGENT_ID });
+    const { unmount } = renderRoutingLanding();
+    await waitForClaudeAgent();
+    openAgentConfig(CLAUDE_AGENT_ID);
+    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Smart Routing" }));
+    closeAgentConfig();
+    unmount();
+
+    setProjectConfig({ host_id: "host_1", agent_id: CLAUDE_AGENT_ID, effort: "high" });
+    renderRoutingLanding();
+    await waitForClaudeAgent();
+    const body = await submitAndReadBody();
+    expect(body.reasoning_effort).toBe("high");
+    expect(body.cost_control_mode_override).not.toBe("on");
+  });
+
+  it.each([
+    { pick: "Smart Routing", sent: { cost_control_mode_override: "on" } },
+    { pick: "Sonnet", sent: { model_override: "sonnet" } },
+  ])(
+    "keeps an explicit $pick pick when a project effort arrives afterwards",
+    async ({ pick, sent }) => {
+      setClaudeAgentAndModels();
+      setProjectConfig({ host_id: "host_1", agent_id: CLAUDE_AGENT_ID });
+      const { rerender } = renderRoutingLanding();
+      await waitForClaudeAgent();
+      openAgentConfig(CLAUDE_AGENT_ID);
+      fireEvent.click(screen.getByRole("menuitemcheckbox", { name: pick }));
+      closeAgentConfig();
+
+      setProjectConfig({ host_id: "host_1", agent_id: CLAUDE_AGENT_ID, effort: "high" });
+      rerender(<NewChatLandingScreen />);
+
+      const body = await submitAndReadBody();
+      expect(body).toMatchObject(sent);
+      expect(body.reasoning_effort).toBeUndefined();
+    },
+  );
+
+  it("leaves the project effort off when the user switches to another agent", async () => {
+    setClaudeAgentAndModels();
+    setProjectConfig({ host_id: "host_1", agent_id: CLAUDE_AGENT_ID, effort: "high" });
+    renderLanding();
+    await waitForClaudeAgent();
+    selectAgent("ag_hello");
+
+    const body = await submitAndReadBody();
+    expect(body.reasoning_effort).toBeUndefined();
+  });
+
+  it.each([
+    { label: "the catalog default", model: undefined, sentModel: undefined, sentEffort: "xhigh" },
+    { label: "a pinned model", model: "gpt-mini", sentModel: "gpt-mini", sentEffort: undefined },
+  ])(
+    "checks a Codex project effort against $label's ladder",
+    async ({ model, sentModel, sentEffort }) => {
+      setCodexAgentAndModels(["low", "medium", "high", "xhigh"]);
+      setProjectConfig({
+        host_id: "host_1",
+        agent_id: CODEX_AGENT_ID,
+        effort: "xhigh",
+        ...(model ? { model } : {}),
+      });
+      renderLanding();
+      await waitForCodexAgent();
+      const body = await submitAndReadBody();
+      expect(body.model_override).toBe(sentModel);
+      expect(body.reasoning_effort).toBe(sentEffort);
+    },
+  );
+
+  it.each([
+    { routing: "off", sentModel: "gpt-mini", sentEffort: "low" },
+    // Remembered routing drops the remembered model, so the default model's ladder applies.
+    { routing: "on", sentModel: undefined, sentEffort: "xhigh" },
+  ])(
+    "checks a modelless Codex project effort against the seeded model (remembered routing $routing)",
+    async ({ routing, sentModel, sentEffort }) => {
+      setCodexAgentAndModels(["low", "high", "xhigh"]);
+      localStorage.setItem(
+        HARNESS_OPTIONS_KEY,
+        JSON.stringify({ "codex-native": { routing, model: "gpt-mini", effort: "low" } }),
+      );
+      setProjectConfig({ host_id: "host_1", agent_id: CODEX_AGENT_ID, effort: "xhigh" });
+      renderRoutingLanding();
+      await waitForCodexAgent();
+      const body = await submitAndReadBody();
+      expect(body.cost_control_mode_override).not.toBe("on");
+      expect(body.model_override).toBe(sentModel);
+      expect(body.reasoning_effort).toBe(sentEffort);
+    },
+  );
+
+  it("turns off a Smart Routing draft when the remembered Codex model runs instead", async () => {
+    setCodexAgentAndModels(["low", "high", "xhigh"]);
+    setProjectConfig({ host_id: "host_1", agent_id: CODEX_AGENT_ID });
+    const { unmount } = renderRoutingLanding();
+    await waitForCodexAgent();
+    openAgentConfig(CODEX_AGENT_ID);
+    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Smart Routing" }));
+    closeAgentConfig();
+    unmount();
+
+    // A later pick elsewhere remembered a model with routing off; the parked draft still says on.
+    // That model can't run the project effort, so the seed pins the model, not the effort.
+    localStorage.setItem(
+      HARNESS_OPTIONS_KEY,
+      JSON.stringify({ "codex-native": { routing: "off", model: "gpt-mini", effort: "low" } }),
+    );
+    setProjectConfig({ host_id: "host_1", agent_id: CODEX_AGENT_ID, effort: "xhigh" });
+    renderRoutingLanding();
+    await waitForCodexAgent();
+    const body = await submitAndReadBody();
+    expect(body.cost_control_mode_override).not.toBe("on");
+    expect(body.model_override).toBe("gpt-mini");
+    expect(body.reasoning_effort).toBe("low");
+  });
+
+  // ── Last start ── a project's composer reopens on how its last session
+  // started, even after a later start elsewhere moved the app-global picks
+  // (last agent, per-harness model + effort, most recent workspace).
+  async function startAndLeave(): Promise<Record<string, unknown>> {
+    const body = await submitAndReadBody();
+    // Navigation is the create flow's last step.
+    await waitFor(() => expect(navigateMock).toHaveBeenCalled());
+    cleanup();
+    navigateMock.mockReset();
+    vi.mocked(authenticatedFetch).mockReset();
+    return body;
+  }
+
+  function pickCodexModelAndEffort(model: string, effort: string): void {
+    openAgentConfig(CODEX_AGENT_ID);
+    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: model }));
+    fireEvent.click(screen.getByTestId(`new-chat-landing-agent-effort-${effort}`));
+    closeAgentConfig();
+  }
+
+  it("reopens a project on its last start after a later start in another project", async () => {
+    const BETA_REPO = "/Users/corey/projects/beta";
+    setCodexAgentAndModels(["low", "medium", "high"]);
+    vi.mocked(useProjectConfig).mockImplementation(
+      (id) =>
+        ({
+          data: id === "proj_beta" ? { host_id: "host_1", workspace: BETA_REPO } : {},
+          isLoading: false,
+        }) as ReturnType<typeof useProjectConfig>,
+    );
+    // Codex's catalog default model runs unpinned (no model_override), so
+    // remembering it means sending no model again.
+    const expectAlphaStart = (body: Record<string, unknown>) => {
+      expect(body).toMatchObject({
+        agent_id: CODEX_AGENT_ID,
+        reasoning_effort: "high",
+        workspace: RECENT_WORKSPACE,
+      });
+      expect("model_override" in body).toBe(false);
+    };
+
+    renderLanding();
+    selectAgent(CODEX_AGENT_ID);
+    await waitForCodexAgent();
+    pickCodexModelAndEffort("GPT-5.5", "high");
+    expectAlphaStart(await startAndLeave());
+
+    // Beta starts Codex on another model and effort, in Beta's own workspace.
+    searchParams = new URLSearchParams("project=Beta");
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("beta"),
+    );
+    await waitForCodexAgent();
+    pickCodexModelAndEffort("GPT mini", "low");
+    expect(await startAndLeave()).toMatchObject({
+      model_override: "gpt-mini",
+      reasoning_effort: "low",
+    });
+
+    // Alpha stores no config, so its last start rides explicitly.
+    searchParams = new URLSearchParams("project=Alpha");
+    renderLanding();
+    await waitForCodexAgent();
+    expectAlphaStart(await submitAndReadBody());
+  });
+
+  function setClaudeAndCodexAgents(): void {
+    setClaudeAgentAndModels();
+    vi.mocked(useAvailableAgents).mockReturnValue({
+      data: [
+        agent(),
+        agent({
+          id: CLAUDE_AGENT_ID,
+          name: "claude-native-ui",
+          display_name: "Claude Code",
+          harness: "claude-native",
+        }),
+        agent({ id: CODEX_AGENT_ID, name: "codex-native-ui", harness: "codex-native" }),
+      ],
+    } as ReturnType<typeof useAvailableAgents>);
+  }
+
+  // Smart Routing binds the Claude Code wrapper as its placeholder, so only the
+  // saved harness pick tells it apart from a direct Claude Code start.
+  it.each([
+    { alpha: "Claude Code", beta: "Smart Routing" },
+    { alpha: "Smart Routing", beta: "Claude Code" },
+  ])("reopens Alpha on $alpha after Beta starts $beta", async ({ alpha, beta }) => {
+    setClaudeAndCodexAgents();
+    const pick = (choice: string) => {
+      if (choice === "Smart Routing") {
+        fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+        fireEvent.click(screen.getByTestId("new-chat-landing-harness-smart-routing"));
+        return;
+      }
+      selectAgent(CLAUDE_AGENT_ID);
+      openAgentConfig(CLAUDE_AGENT_ID);
+      fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Sonnet" }));
+      closeAgentConfig();
+    };
+    const expectStart = (body: Record<string, unknown>, choice: string) => {
+      const routed = choice === "Smart Routing";
+      expect(body.agent_id).toBe(CLAUDE_AGENT_ID);
+      expect(body.harness_override).toBe(routed ? "auto" : undefined);
+      expect(body.model_override).toBe(routed ? undefined : "sonnet");
+    };
+
+    renderRoutingLanding();
+    pick(alpha);
+    expectStart(await startAndLeave(), alpha);
+    searchParams = new URLSearchParams("project=Beta");
+    renderRoutingLanding();
+    pick(beta);
+    expectStart(await startAndLeave(), beta);
+
+    searchParams = new URLSearchParams("project=Alpha");
+    renderRoutingLanding();
+    const trigger = screen.getByTestId("new-chat-landing-agent-select");
+    await waitFor(() =>
+      alpha === "Smart Routing"
+        ? expect(trigger.textContent).toContain("Smart Routing")
+        : expect(trigger).toHaveAccessibleName(/Claude Code/),
+    );
+    expectStart(await submitAndReadBody(), alpha);
+  });
+
+  it("reopens Alpha on its own permission mode after Beta starts with another", async () => {
+    setClaudeAgentAndModels();
+    const pickPermission = (value: string) => {
+      fireEvent.pointerDown(screen.getByTestId("new-chat-landing-permission-chip"), { button: 0 });
+      fireEvent.click(screen.getByTestId(`new-chat-landing-permission-option-${value}`));
+    };
+    renderLanding();
+    selectAgent(CLAUDE_AGENT_ID);
+    await waitForClaudeAgent();
+    pickPermission("plan");
+    await startAndLeave();
+    searchParams = new URLSearchParams("project=Beta");
+    renderLanding();
+    await waitForClaudeAgent();
+    pickPermission("acceptEdits");
+    await startAndLeave();
+
+    searchParams = new URLSearchParams("project=Alpha");
+    renderLanding();
+    await waitForClaudeAgent();
+    expect((await submitAndReadBody()).terminal_launch_args).toEqual(["--permission-mode", "plan"]);
+  });
+
+  it("keeps a model picked during the visit over the last start's after switching agents", async () => {
+    setClaudeAndCodexAgents();
+    writeProjectLaunchDefaults(
+      "proj_alpha",
+      {
+        agentId: CLAUDE_AGENT_ID,
+        pickedHarness: null,
+        harness: "claude-native",
+        harnessOptions: { model: "opus" },
+      },
+      {},
+    );
+    renderLanding();
+    await waitForClaudeAgent();
+    openAgentConfig(CLAUDE_AGENT_ID);
+    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Sonnet" }));
+    closeAgentConfig();
+    selectAgent(CODEX_AGENT_ID);
+    selectAgent(CLAUDE_AGENT_ID);
+
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAccessibleName(/Sonnet/),
+    );
+    expect((await submitAndReadBody()).model_override).toBe("sonnet");
+  });
+
+  it.each([
+    { config: {}, name: "Other", sentAgentId: "ag_other" },
+    // The configured agent is left to the server's default-fill.
+    { config: { agent_id: "ag_hello" }, name: "Hello World", sentAgentId: undefined },
+  ])(
+    "falls back to $name when the last start's agent no longer exists",
+    async ({ config, name, sentAgentId }) => {
+      localStorage.setItem("omnigent:last-agent-id", "ag_other");
+      writeProjectLaunchDefaults("proj_alpha", { agentId: "ag_gone", pickedHarness: null }, config);
+      setProjectConfig(config);
+      renderLanding();
+
+      await waitFor(() =>
+        expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAccessibleName(
+          new RegExp(name),
+        ),
+      );
+      expect((await submitAndReadBody()).agent_id).toBe(sentAgentId);
+    },
+  );
+
+  it("drops a last start that a Project settings save clears while the composer is open", async () => {
+    const config = { host_id: "host_1", workspace: REPO, agent_id: "ag_hello" };
+    setProjectConfig(config);
+    writeProjectLaunchDefaults(
+      "proj_alpha",
+      { agentId: "ag_other", pickedHarness: null, hostId: "host_1", workspace: RECENT_WORKSPACE },
+      config,
+    );
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("foo"),
+    );
+
+    act(() => clearProjectLaunchDefaults("proj_alpha"));
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("alpha"),
+    );
+    // Back on the stored settings, which the create leaves to the server.
+    const body = await submitAndReadBody();
+    expect("agent_id" in body).toBe(false);
+    expect("workspace" in body).toBe(false);
+  });
+
+  it("lets project settings edited after the last start win", async () => {
+    writeProjectLaunchDefaults(
+      "proj_alpha",
+      { agentId: "ag_other", hostId: "host_1", workspace: RECENT_WORKSPACE },
+      {},
+    );
+    setProjectConfig({ host_id: "host_1", workspace: REPO, agent_id: "ag_hello" });
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("alpha"),
+    );
+
+    // Both slots hold the edited config's values, so the create leaves them
+    // to the server's default-fill.
+    const body = await submitAndReadBody();
+    expect("agent_id" in body).toBe(false);
+    expect("workspace" in body).toBe(false);
+  });
+
+  it("seeds a Pi-only project effort for a Pi agent", async () => {
+    vi.mocked(useAvailableAgents).mockReturnValue({
+      data: [
+        agent(),
+        agent({ id: "ag_pi", name: "pi-native-ui", display_name: "Pi", harness: "pi-native" }),
+      ],
+    } as ReturnType<typeof useAvailableAgents>);
+    setProjectConfig({ host_id: "host_1", agent_id: "ag_pi", effort: "minimal" });
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAccessibleName(/Pi/),
+    );
+    expect((await submitAndReadBody()).reasoning_effort).toBe("minimal");
   });
 
   it("still seeds the recent workspace when the worktree probe errors", async () => {
@@ -416,6 +1536,139 @@ describe("NewChatLandingScreen project prefill", () => {
     const body = await submitAndReadBody();
     // Seeded the recent path as-is; no redirect, no fabricated fork.
     expect(body.workspace).toBe(LINKED_WORKTREE);
+    expect(body.git).toBeUndefined();
+  });
+});
+
+// The user-global "always use a worktree" default (Settings › Git, stored in
+// localStorage) makes new sessions in any git workspace start in a fresh
+// worktree. Precedence: a project's explicit `use_worktree` (true OR false)
+// wins; an unset project falls through to this global default. These cases pin
+// the full global × project matrix.
+const ALWAYS_WORKTREE_KEY = "omnigent:always-use-worktree";
+
+describe("NewChatLandingScreen global always-use-worktree default", () => {
+  // The compact header exposes the visible branch/request label separately
+  // from its state-specific accessible description.
+  function branchLabel(): string {
+    return screen.getByTestId("new-chat-landing-branch-chip").textContent ?? "";
+  }
+
+  it("seeds a worktree in a plain (non-project) git workspace when the global default is on", async () => {
+    // A plain visit with no project. The recent workspace is a git repo, so the
+    // global default alone drives the worktree seed.
+    searchParams = new URLSearchParams("");
+    localStorage.setItem(RECENT_KEY, JSON.stringify({ host_1: [REPO] }));
+    localStorage.setItem(ALWAYS_WORKTREE_KEY, "true");
+    renderLanding();
+
+    await waitFor(() => expect(branchLabel()).toMatch(/^worktree-[0-9a-f]{8}$/));
+    const body = await submitAndReadBody();
+    expect(body.workspace).toBe(REPO);
+    expect((body.git as { branch_name: string }).branch_name).toMatch(/^worktree-[0-9a-f]{8}$/);
+  });
+
+  it("does NOT seed a worktree in a plain git workspace when the global default is off", async () => {
+    searchParams = new URLSearchParams("");
+    localStorage.setItem(RECENT_KEY, JSON.stringify({ host_1: [REPO] }));
+    // Global default unset (off).
+    renderLanding();
+
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("alpha"),
+    );
+    const body = await submitAndReadBody();
+    expect(body.workspace).toBe(REPO);
+    expect(body.git).toBeUndefined();
+  });
+
+  it("applies the global default to a project whose config leaves use_worktree unset", async () => {
+    // Project config sets host/workspace but no worktree preference → falls
+    // through to the global default (on).
+    localStorage.setItem(ALWAYS_WORKTREE_KEY, "true");
+    setProjectConfig({ host_id: "host_1", workspace: REPO });
+    renderLanding();
+
+    await waitFor(() => expect(branchLabel()).toMatch(/^worktree-[0-9a-f]{8}$/));
+    const body = await submitAndReadBody();
+    // Untouched config workspace → omitted under the project_id create; the
+    // client-generated branch is always explicit.
+    expect(body.project_id).toBe("proj_alpha");
+    expect("workspace" in body).toBe(false);
+    expect((body.git as { branch_name: string }).branch_name).toMatch(/^worktree-[0-9a-f]{8}$/);
+  });
+
+  it("lets a project's explicit opt-out win over the global default (global on, project false)", async () => {
+    // A project that stored `use_worktree: false` overrides the global on — no
+    // worktree despite the global default.
+    localStorage.setItem(ALWAYS_WORKTREE_KEY, "true");
+    setProjectConfig({ host_id: "host_1", workspace: REPO, use_worktree: false });
+    renderLanding();
+
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("alpha"),
+    );
+    const body = await submitAndReadBody();
+    // Untouched config workspace → omitted under the project_id create.
+    expect(body.project_id).toBe("proj_alpha");
+    expect("workspace" in body).toBe(false);
+    expect(body.git).toBeUndefined();
+  });
+
+  it("lets a project's explicit opt-in win over the global default (global off, project true)", async () => {
+    // Global default off, but a project that stored `use_worktree: true` still
+    // gets a worktree.
+    // Global default unset (off).
+    setProjectConfig({ host_id: "host_1", workspace: REPO, use_worktree: true });
+    renderLanding();
+
+    await waitFor(() => expect(branchLabel()).toMatch(/^worktree-[0-9a-f]{8}$/));
+    const body = await submitAndReadBody();
+    // Untouched config workspace → omitted under the project_id create; the
+    // client-generated branch is always explicit.
+    expect(body.project_id).toBe("proj_alpha");
+    expect("workspace" in body).toBe(false);
+    expect((body.git as { branch_name: string }).branch_name).toMatch(/^worktree-[0-9a-f]{8}$/);
+  });
+
+  it("does not seed a worktree for a non-git workspace even when the global default is on", async () => {
+    // The global default only applies to git repos — RECENT_WORKSPACE is not a
+    // git repo (no is_main worktree), so nothing is seeded.
+    searchParams = new URLSearchParams("");
+    localStorage.setItem(ALWAYS_WORKTREE_KEY, "true");
+    // RECENT_WORKSPACE (the default recent) is not the git REPO.
+    renderLanding();
+
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).not.toBe(""),
+    );
+    const body = await submitAndReadBody();
+    expect(body.workspace).toBe(RECENT_WORKSPACE);
+    expect(body.git).toBeUndefined();
+  });
+
+  it("retracts a globally-seeded worktree branch after the default is turned off and the composer remounts", async () => {
+    // The reported bug: the composer preserves its state across unmount (module-
+    // scoped draft) — e.g. a trip to Settings to flip the toggle — and remounts
+    // from it. A branch the global default auto-seeded must not survive once the
+    // default is off; it should retract to a plain launch on the next mount.
+    searchParams = new URLSearchParams("");
+    localStorage.setItem(RECENT_KEY, JSON.stringify({ host_1: [REPO] }));
+    localStorage.setItem(ALWAYS_WORKTREE_KEY, "true");
+
+    const first = renderLanding();
+    await waitFor(() => expect(branchLabel()).toMatch(/^worktree-[0-9a-f]{8}$/));
+
+    // Leave the composer (draft preserved), turn the global default off, come
+    // back. The remount reads the preserved `worktree-xxxx` branch, and the
+    // retraction effect must clear it now that the default is off.
+    first.unmount();
+    localStorage.removeItem(ALWAYS_WORKTREE_KEY);
+    renderLanding();
+
+    await waitFor(() => expect(branchLabel()).toBe("None"));
+    const body = await submitAndReadBody();
+    expect(body.workspace).toBe(REPO);
     expect(body.git).toBeUndefined();
   });
 });

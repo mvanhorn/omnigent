@@ -17,6 +17,7 @@ from omnigent.harness_capabilities import (
     Elicitation,
     ForkHistory,
     HarnessCapabilities,
+    InstructionDelivery,
     IntegrationMode,
     ModelFamily,
     Resume,
@@ -29,7 +30,7 @@ from omnigent.harness_plugins import (
     native_agents,
     valid_harnesses,
 )
-from omnigent.model_override import (
+from omnigent.models.model_override import (
     _ANTIGRAVITY_FAMILY_HARNESSES,
     _CLAUDE_FAMILY_HARNESSES,
 )
@@ -71,9 +72,20 @@ def test_model_family_matches_model_override_sets() -> None:
             assert family is ModelFamily.MULTI, harness
 
 
-def test_subagents_matches_native_wrapper_label() -> None:
-    # subagents is derivable: only native agents with a subagent_wrapper_label
-    # can spawn Omnigent native sub-agents.
+def test_subagents_matches_its_implementing_mechanism() -> None:
+    """``subagents`` is derivable — from the two mechanisms that implement it.
+
+    1. A **native** agent with a ``subagent_wrapper_label``: Omnigent intercepts
+       the vendor's own spawn and mints the child session.
+    2. An **ACP vendor extension** carrying a sub-agent dialect: the agent
+       reports its sub-agent lifecycle in its own ``_meta`` and the runner mints
+       the child from that. No built-in row uses this today — the mechanism
+       stays for a community ACP plugin — so nothing is added below.
+
+    Keeping the derivation here means a harness cannot publish a ``subagents``
+    capability on ``/v1/harnesses`` that nothing implements, or implement one it
+    does not publish.
+    """
     subagent_capable = {agent.harness for agent in native_agents() if agent.subagent_wrapper_label}
     for harness, capability in harness_capabilities().items():
         expected = harness in subagent_capable
@@ -97,6 +109,17 @@ def test_p0_bench_harnesses_declare_interrupt_and_streaming() -> None:
         assert caps[harness].streaming is True, harness
 
 
+def test_pi_harnesses_declare_the_pi_effort_family() -> None:
+    """Both pi harnesses advertise pi's 7-level ladder, not "no effort knob"."""
+    from omnigent.util.reasoning_effort import EFFORT_VALUES, PI_EFFORTS
+
+    caps = harness_capabilities()
+    for harness in ("pi", "pi-native"):
+        assert caps[harness].effort is EffortFamily.PI, harness
+        assert caps[harness].as_dict()["effort"] == "pi", harness
+    assert PI_EFFORTS == EFFORT_VALUES
+
+
 def test_optional_bench_capabilities_default_to_unknown() -> None:
     capability = HarnessCapabilities(
         IntegrationMode.SDK_IN_PROCESS,
@@ -118,6 +141,7 @@ def test_optional_bench_capabilities_default_to_unknown() -> None:
     assert capability.fork_history is ForkHistory.NONE
     assert capability.shell_tool_name is None
     assert capability.shell_tool_prompt is None
+    assert capability.instruction_delivery is InstructionDelivery.UNKNOWN
     assert capability.as_dict() == {
         "integration_mode": "sdk-in-process",
         "elicitation": "none",
@@ -135,6 +159,7 @@ def test_optional_bench_capabilities_default_to_unknown() -> None:
         "fork_history": "none",
         "shell_tool_name": None,
         "shell_tool_prompt": None,
+        "instruction_delivery": "unknown",
     }
 
 
@@ -174,6 +199,32 @@ def test_catalog_rows_include_capabilities() -> None:
             # JSON-serializable: values are primitives, not enums.
             for value in row["capabilities"].values():
                 assert value is None or isinstance(value, (str, bool))
+
+
+def test_catalog_includes_hermes() -> None:
+    """Hermes must appear in the web picker catalog (regression: it was a
+    valid harness with capabilities but had no ``harness_labels`` entry, so
+    ``harness_catalog`` — which iterates labels — dropped it)."""
+    rows = harness_catalog()
+    hermes = next((row for row in rows if row["id"] == "hermes"), None)
+    assert hermes is not None, "hermes missing from harness_catalog()"
+    assert hermes["label"] == "Hermes"
+    # The catalog only lists valid harnesses and hermes declares capabilities,
+    # so the row must carry the feature matrix like its subprocess peers.
+    assert "capabilities" in hermes
+
+
+def test_hermes_picker_row_has_spawn_env_plumbing() -> None:
+    """A picker row is only honest if the session's choices reach the harness.
+
+    Hermes' model env key is what both threads ``/model`` into the spawn env and
+    (via ``_SDK_MODEL_OVERRIDE_HARNESSES``) makes the server accept the override
+    instead of rejecting it up front."""
+    from omnigent.harness_plugins import model_env_keys
+    from omnigent.models.model_override import harness_supports_model_override
+
+    assert model_env_keys()["hermes"] == "HARNESS_HERMES_MODEL"
+    assert harness_supports_model_override("hermes")
 
 
 def test_catalog_rows_carry_setup_steps() -> None:
@@ -302,3 +353,56 @@ def test_native_tui_harnesses_declare_shell_tool_provocation() -> None:
         assert capability.shell_tool_name, harness
         assert capability.shell_tool_prompt, harness
         assert "omnigent-bench-ok" in capability.shell_tool_prompt, harness
+
+
+def test_every_canonical_harness_declares_instruction_delivery() -> None:
+    caps = harness_capabilities()
+    for harness in valid_harnesses():
+        assert caps[harness].instruction_delivery is not InstructionDelivery.UNKNOWN, harness
+
+
+def test_hermes_and_hermes_native_deliver_differently() -> None:
+    caps = harness_capabilities()
+    assert caps["hermes"].instruction_delivery is InstructionDelivery.FIRST_USER_PREFIX
+    assert caps["hermes-native"].instruction_delivery is InstructionDelivery.NOT_DELIVERED
+
+
+def test_native_startup_additive_instruction_delivery() -> None:
+    for harness in ("claude-native", "codex-native", "pi-native"):
+        assert (
+            harness_capabilities()[harness].instruction_delivery
+            is InstructionDelivery.AGENT_STARTUP_ADDITIVE
+        )
+
+
+def test_kiro_native_is_not_delivered() -> None:
+    caps = harness_capabilities()
+    assert caps["kiro-native"].instruction_delivery is InstructionDelivery.NOT_DELIVERED
+
+
+def test_sdk_harnesses_only_advertise_effort_their_executor_applies() -> None:
+    """A declared effort family puts a dial in the composer; the executor must use the pick.
+
+    The adapter forwards a session's ``reasoning_effort`` through
+    ``ExecutorConfig.extra`` and each SDK executor that honors it reads that key.
+    ``antigravity``'s executor does not, so its capability must stay NONE: a
+    GEMINI declaration would show a control whose selection changes nothing.
+    """
+    import inspect
+
+    from omnigent.inner import (
+        antigravity_executor,
+        claude_sdk_executor,
+        openai_agents_sdk_executor,
+    )
+
+    caps = harness_capabilities()
+    assert caps["antigravity"].effort is EffortFamily.NONE
+    assert "reasoning_effort" not in inspect.getsource(antigravity_executor)
+    # The SDK harnesses that DO declare a family read the forwarded value.
+    for harness, module in (
+        ("claude-sdk", claude_sdk_executor),
+        ("openai-agents", openai_agents_sdk_executor),
+    ):
+        assert caps[harness].effort is not EffortFamily.NONE, harness
+        assert "reasoning_effort" in inspect.getsource(module), harness

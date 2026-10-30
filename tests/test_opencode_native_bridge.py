@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from pathlib import Path
 
 import pytest
 
-from omnigent import opencode_native_bridge as bridge
-from omnigent.opencode_native_bridge import (
+from omnigent.harnesses.opencode_native import bridge
+from omnigent.harnesses.opencode_native.bridge import (
     OpenCodeNativeBridgeState,
     auth_headers_for_secret,
     bridge_dir_for_bridge_id,
@@ -21,7 +22,7 @@ from omnigent.opencode_native_bridge import (
     update_active_message_id,
     update_last_event_id,
     update_model_override,
-    user_opencode_config_path,
+    user_opencode_config_paths,
     write_bridge_state,
     write_cost_popup_config,
     write_opencode_policy_plugin,
@@ -243,58 +244,36 @@ def test_seed_opencode_auth_noop_without_source(
     assert bridge.seed_opencode_auth(bridge_dir) is None
 
 
-def test_user_opencode_config_path_default_location(
+def test_user_opencode_config_paths_default_location(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """Without XDG_CONFIG_HOME, looks at ~/.config/opencode/opencode.jsonc."""
+    """Without XDG_CONFIG_HOME, looks under ~/.config/opencode."""
     monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
     fake_home = tmp_path / "fake_home"
     monkeypatch.setattr(Path, "home", lambda: fake_home)
-    # File does not exist → returns None.
-    assert user_opencode_config_path() is None
-    # Create the file and verify the path is as expected.
+    # No config files exist: empty list.
+    assert user_opencode_config_paths() == []
+    # Create a file and verify the path is as expected.
     (fake_home / ".config" / "opencode").mkdir(parents=True)
     (fake_home / ".config" / "opencode" / "opencode.jsonc").write_text("{}")
     expected = fake_home / ".config" / "opencode" / "opencode.jsonc"
-    assert user_opencode_config_path() == expected
+    assert user_opencode_config_paths() == [expected]
 
 
-def test_user_opencode_config_path_honors_xdg_config_home(
+def test_user_opencode_config_paths_ordered_by_merge_precedence(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """XDG_CONFIG_HOME env var redirects the lookup."""
-    cfg_dir = tmp_path / "my-config" / "opencode"
-    cfg_dir.mkdir(parents=True)
-    (cfg_dir / "opencode.jsonc").write_text("{}", encoding="utf-8")
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "my-config"))
-    path = user_opencode_config_path()
-    assert path is not None and path.exists()
-    assert path.name == "opencode.jsonc"
-
-
-def test_user_opencode_config_path_falls_back_to_json(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """When only opencode.json exists (no .jsonc), returns the .json path."""
-    cfg_dir = tmp_path / "cfg" / "opencode"
-    cfg_dir.mkdir(parents=True)
-    (cfg_dir / "opencode.json").write_text("{}", encoding="utf-8")
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
-    path = user_opencode_config_path()
-    assert path is not None and path.name == "opencode.json"
-
-
-def test_user_opencode_config_path_prefers_jsonc(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """When both .jsonc and .json exist, .jsonc is preferred."""
+    """XDG_CONFIG_HOME redirects the lookup; files come back in opencode's merge order."""
     cfg_dir = tmp_path / "pref" / "opencode"
     cfg_dir.mkdir(parents=True)
-    (cfg_dir / "opencode.jsonc").write_text("{}", encoding="utf-8")
-    (cfg_dir / "opencode.json").write_text("{}", encoding="utf-8")
+    for name in ("opencode.jsonc", "opencode.json", "config.json"):
+        (cfg_dir / name).write_text("{}", encoding="utf-8")
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "pref"))
-    path = user_opencode_config_path()
-    assert path is not None and path.name == "opencode.jsonc"
+    assert [p.name for p in user_opencode_config_paths()] == [
+        "config.json",
+        "opencode.json",
+        "opencode.jsonc",
+    ]
 
 
 def test_policy_plugin_merges_routing_headers(bridge_dir: Path) -> None:
@@ -311,3 +290,108 @@ def test_policy_plugin_merges_routing_headers(bridge_dir: Path) -> None:
     assert "...POLICY_HEADERS" in src
     # The old bearer-only env var is fully removed.
     assert "OMNIGENT_POLICY_AUTH" not in src
+
+
+# ── owner-pid marker + orphan prune (bridge-dir reaping) ────────────────────
+
+
+def test_prepare_bridge_dir_writes_owner_pid_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """prepare_bridge_dir records the creating pid so the periodic sweep can
+    prune the dir only when its owner is provably dead."""
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path / "opencode-native")
+
+    bridge_dir = prepare_bridge_dir("bridge_owner")
+
+    assert (bridge_dir / "owner.pid").read_text(encoding="utf-8").strip() == str(os.getpid())
+
+
+def test_prepare_bridge_dir_excludes_concurrent_orphan_prune(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A replacement keeps its bridge and session data while preparation is active."""
+    root = tmp_path / "opencode-native"
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", root)
+    bridge_dir = bridge_dir_for_bridge_id("same-session")
+    bridge_dir.mkdir(parents=True)
+    owner_marker = bridge_dir / "owner.pid"
+    owner_marker.write_text("999999", encoding="utf-8")
+    session_data = xdg_data_home_for_bridge_dir(bridge_dir) / "storage" / "session.json"
+    session_data.parent.mkdir(parents=True)
+    session_data.write_text("preserve me", encoding="utf-8")
+
+    marker_write_started = threading.Event()
+    release_marker_write = threading.Event()
+    real_write_owner_pid_marker = bridge.native_bridge_common.write_owner_pid_marker
+    errors: list[BaseException] = []
+    prepared_paths: list[Path] = []
+
+    def _pause_before_owner_write(path: Path) -> None:
+        marker_write_started.set()
+        if not release_marker_write.wait(timeout=5.0):
+            raise TimeoutError("test did not release owner-marker write")
+        real_write_owner_pid_marker(path)
+
+    def _prepare_replacement() -> None:
+        try:
+            prepared_paths.append(prepare_bridge_dir("same-session"))
+        except BaseException as exc:
+            errors.append(exc)
+
+    monkeypatch.setattr(
+        bridge.native_bridge_common,
+        "write_owner_pid_marker",
+        _pause_before_owner_write,
+    )
+    monkeypatch.setattr("omnigent.inner.terminal._process_alive", lambda _pid: False)
+    prepare_thread = threading.Thread(target=_prepare_replacement)
+    prepare_thread.start()
+    try:
+        assert marker_write_started.wait(timeout=5.0)
+        assert bridge.prune_orphaned_bridge_dirs() == 0
+    finally:
+        release_marker_write.set()
+        prepare_thread.join(timeout=5.0)
+
+    assert not prepare_thread.is_alive()
+    assert errors == []
+    assert prepared_paths == [bridge_dir]
+    assert bridge_dir.is_dir()
+    assert session_data.read_text(encoding="utf-8") == "preserve me"
+    assert owner_marker.read_text(encoding="utf-8").strip() == str(os.getpid())
+
+
+def test_prune_orphaned_bridge_dirs_only_removes_dead_owners(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Prune removes only provably-dead-owner dirs; live and unmarked survive."""
+    import subprocess
+    import sys
+
+    root = tmp_path / "opencode-native"
+    root.mkdir(parents=True)
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", root)
+
+    dead = subprocess.Popen([sys.executable, "-c", "pass"])
+    dead.wait()
+    dead_dir = root / "deadowner"
+    dead_dir.mkdir()
+    (dead_dir / "owner.pid").write_text(str(dead.pid), encoding="utf-8")
+
+    live_dir = root / "liveowner"
+    live_dir.mkdir()
+    (live_dir / "owner.pid").write_text(str(os.getpid()), encoding="utf-8")
+
+    unmarked_dir = root / "unmarked"
+    unmarked_dir.mkdir()
+
+    pruned = bridge.prune_orphaned_bridge_dirs()
+
+    assert pruned == 1
+    assert not dead_dir.exists()
+    assert live_dir.exists()
+    assert unmarked_dir.exists()

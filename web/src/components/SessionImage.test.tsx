@@ -2,22 +2,25 @@
 //
 // Two render paths branch on the host config's `fetcher`:
 //   - Standalone (no fetcher): a plain same-origin <img src={path}>.
-//   - Embedded (fetcher present): bytes are pulled via hostFetch, turned into
+//   - Embedded (fetcher present): bytes are pulled via authenticatedFetch, turned into
 //     an object URL, and rendered with explicit loading/loaded/error states.
 //
 // `@/lib/host` is mocked so each test controls whether a fetcher is installed
-// and what hostFetch resolves to; URL.createObjectURL/revokeObjectURL are
+// and what authenticatedFetch resolves to; URL.createObjectURL/revokeObjectURL are
 // stubbed because jsdom lacks them.
 
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const getOmnigentHostConfig = vi.fn();
-const hostFetch = vi.fn();
+const authenticatedFetch = vi.fn();
 
 vi.mock("@/lib/host", () => ({
   getOmnigentHostConfig: () => getOmnigentHostConfig(),
-  hostFetch: (path: string) => hostFetch(path),
+}));
+
+vi.mock("@/lib/identity", () => ({
+  authenticatedFetch: (path: string) => authenticatedFetch(path),
 }));
 
 // The Spinner is a brand glyph that renders nothing meaningful in jsdom; a
@@ -26,12 +29,16 @@ vi.mock("@/components/ui/spinner", () => ({
   Spinner: () => <span data-testid="spinner" />,
 }));
 
-import type { SessionImage as SessionImageComponent } from "./SessionImage";
+import type {
+  InlineImage as InlineImageComponent,
+  SessionImage as SessionImageComponent,
+} from "./SessionImage";
 
 // The component caches object URLs in module scope so they survive remounts,
 // so each test needs a fresh module instance — otherwise one test's cached
-// image satisfies the next test's render and its hostFetch mock never runs.
+// image satisfies the next test's render and its authenticatedFetch mock never runs.
 let SessionImage: typeof SessionImageComponent;
+let InlineImage: typeof InlineImageComponent;
 
 let createObjectURL: ReturnType<typeof vi.fn>;
 let revokeObjectURL: ReturnType<typeof vi.fn>;
@@ -40,7 +47,7 @@ beforeEach(async () => {
   // Import before stubbing: the stub replaces the whole URL global, and the
   // module graph needs the real constructor while it loads.
   vi.resetModules();
-  ({ SessionImage } = await import("./SessionImage"));
+  ({ SessionImage, InlineImage } = await import("./SessionImage"));
   createObjectURL = vi.fn(() => "blob:fake-url");
   revokeObjectURL = vi.fn();
   vi.stubGlobal("URL", { createObjectURL, revokeObjectURL });
@@ -59,21 +66,34 @@ describe("SessionImage (standalone, no host fetcher)", () => {
 
   it("renders a plain same-origin <img> pointing at the raw path", () => {
     // WHY: without a host fetcher the component must skip the byte-fetch path
-    // and emit a direct <img src={path}>, never calling hostFetch.
+    // and emit a direct <img src={path}>, never calling authenticatedFetch.
     render(<SessionImage path="/v1/sessions/a/files/x/content" alt="diagram" className="c" />);
     const img = screen.getByRole("img", { name: "diagram" });
     expect(img).toHaveAttribute("src", "/v1/sessions/a/files/x/content");
     expect(img).toHaveClass("c");
-    expect(hostFetch).not.toHaveBeenCalled();
+    expect(authenticatedFetch).not.toHaveBeenCalled();
   });
 
-  it("reserves the preview box height before the image loads", () => {
-    // WHY: the chat scroller runs with overflow-anchor:none, so an image that
-    // sized itself only on decode would push the transcript down under the
-    // reader. The enclosing box must carry a fixed height from first paint.
-    render(<SessionImage path="/v1/sessions/a/files/x/content" alt="diagram" />);
-    const box = screen.getByRole("img", { name: "diagram" }).closest("div");
-    expect(box).toHaveClass("h-64");
+  it("keeps the image source when the path's bytes fail to arrive", () => {
+    // A fetched path can fail transiently, so keep it available for retry.
+    render(<SessionImage path="/v1/sessions/a/files/gone/content" alt="diagram" />);
+    const img = screen.getByRole("img", { name: "diagram" });
+    fireEvent.error(img);
+
+    expect(screen.getByRole("img", { name: "diagram" })).toHaveAttribute(
+      "src",
+      "/v1/sessions/a/files/gone/content",
+    );
+  });
+
+  it("keeps the image while the path is unresolved", () => {
+    // WHY: no session loaded yet means nothing has failed — a stray error on
+    // the src-less <img> must not latch and strand the slot on a chip.
+    render(<SessionImage path={undefined} alt="pending" />);
+    const img = screen.getByRole("img", { name: "pending" });
+    fireEvent.error(img);
+
+    expect(screen.getByRole("img", { name: "pending" }).tagName).toBe("IMG");
   });
 });
 
@@ -85,7 +105,7 @@ describe("SessionImage (embedded, host fetcher present)", () => {
   it("shows the loading placeholder before the fetch resolves", () => {
     // WHY: while bytes are in flight the embedded path must render the
     // role="status" placeholder (with spinner), not an <img>.
-    hostFetch.mockReturnValue(new Promise(() => {}));
+    authenticatedFetch.mockReturnValue(new Promise(() => {}));
     render(<SessionImage path="/p" alt="pic" />);
     expect(screen.getByRole("status", { name: "Loading image" })).toBeInTheDocument();
     expect(screen.getByTestId("spinner")).toBeInTheDocument();
@@ -95,19 +115,19 @@ describe("SessionImage (embedded, host fetcher present)", () => {
     // WHY: a successful fetch must create an object URL from the blob and swap
     // the placeholder for an <img src> pointing at it.
     const blob = new Blob(["x"]);
-    hostFetch.mockResolvedValue({ ok: true, blob: () => Promise.resolve(blob) });
+    authenticatedFetch.mockResolvedValue({ ok: true, blob: () => Promise.resolve(blob) });
     render(<SessionImage path="/p" alt="pic" className="cls" />);
     const img = await screen.findByRole("img", { name: "pic" });
     expect(img).toHaveAttribute("src", "blob:fake-url");
     expect(img).toHaveClass("cls");
     expect(createObjectURL).toHaveBeenCalledWith(blob);
-    expect(hostFetch).toHaveBeenCalledWith("/p");
+    expect(authenticatedFetch).toHaveBeenCalledWith("/p");
   });
 
   it("renders the error fallback when the response is not ok", async () => {
     // WHY: a non-ok HTTP response must reject and drop into the error state —
     // a labelled role="img" fallback chip rather than a broken <img>.
-    hostFetch.mockResolvedValue({ ok: false, status: 404 });
+    authenticatedFetch.mockResolvedValue({ ok: false, status: 404 });
     render(<SessionImage path="/missing" alt="gone" />);
     await waitFor(() => {
       const fallback = screen.getByRole("img", { name: "gone" });
@@ -119,7 +139,7 @@ describe("SessionImage (embedded, host fetcher present)", () => {
   it("renders the error fallback when the fetch rejects", async () => {
     // WHY: a network rejection (vs. an HTTP error) must land in the same error
     // fallback rather than surfacing an unhandled rejection.
-    hostFetch.mockRejectedValue(new Error("boom"));
+    authenticatedFetch.mockRejectedValue(new Error("boom"));
     render(<SessionImage path="/p" alt="broken" />);
     await waitFor(() => {
       expect(screen.getByRole("img", { name: "broken" })).toHaveTextContent("broken");
@@ -128,12 +148,12 @@ describe("SessionImage (embedded, host fetcher present)", () => {
 
   it("renders the error fallback immediately when no path is given", async () => {
     // WHY: an undefined path can't be fetched, so the effect must short-circuit
-    // straight to the error state without ever calling hostFetch.
+    // straight to the error state without ever calling authenticatedFetch.
     render(<SessionImage path={undefined} alt="nopath" />);
     await waitFor(() => {
       expect(screen.getByRole("img", { name: "nopath" })).toBeInTheDocument();
     });
-    expect(hostFetch).not.toHaveBeenCalled();
+    expect(authenticatedFetch).not.toHaveBeenCalled();
   });
 
   it("reuses the cached object URL across remounts instead of refetching", async () => {
@@ -141,7 +161,7 @@ describe("SessionImage (embedded, host fetcher present)", () => {
     // repaint from the cached blob — refetching megabytes per remount is what
     // made transcripts slow. The URL therefore has to survive unmount.
     const blob = new Blob(["x"]);
-    hostFetch.mockResolvedValue({ ok: true, blob: () => Promise.resolve(blob) });
+    authenticatedFetch.mockResolvedValue({ ok: true, blob: () => Promise.resolve(blob) });
     const first = render(<SessionImage path="/cached" alt="pic" />);
     await screen.findByRole("img", { name: "pic" });
     first.unmount();
@@ -150,14 +170,14 @@ describe("SessionImage (embedded, host fetcher present)", () => {
     render(<SessionImage path="/cached" alt="pic" />);
     // Paints straight from cache — no placeholder frame, no second download.
     expect(screen.getByRole("img", { name: "pic" })).toHaveAttribute("src", "blob:fake-url");
-    expect(hostFetch).toHaveBeenCalledTimes(1);
+    expect(authenticatedFetch).toHaveBeenCalledTimes(1);
   });
 
   it("shares one download between concurrent mounts of the same path", async () => {
     // WHY: the same attachment can mount twice in a frame (a switch back while
     // the first fetch is still open); both must join the in-flight request.
     const blob = new Blob(["x"]);
-    hostFetch.mockResolvedValue({ ok: true, blob: () => Promise.resolve(blob) });
+    authenticatedFetch.mockResolvedValue({ ok: true, blob: () => Promise.resolve(blob) });
     render(
       <>
         <SessionImage path="/shared" alt="one" />
@@ -166,7 +186,7 @@ describe("SessionImage (embedded, host fetcher present)", () => {
     );
     await screen.findByRole("img", { name: "one" });
     await screen.findByRole("img", { name: "two" });
-    expect(hostFetch).toHaveBeenCalledTimes(1);
+    expect(authenticatedFetch).toHaveBeenCalledTimes(1);
     expect(createObjectURL).toHaveBeenCalledTimes(1);
   });
 
@@ -174,7 +194,7 @@ describe("SessionImage (embedded, host fetcher present)", () => {
     // WHY: cached URLs deliberately outlive their components, so without a
     // bound a long session would leak every image it ever rendered.
     const blob = new Blob(["x"]);
-    hostFetch.mockResolvedValue({ ok: true, blob: () => Promise.resolve(blob) });
+    authenticatedFetch.mockResolvedValue({ ok: true, blob: () => Promise.resolve(blob) });
     const created: string[] = [];
     createObjectURL.mockImplementation(() => {
       const url = `blob:evict-${created.length}`;
@@ -194,5 +214,53 @@ describe("SessionImage (embedded, host fetcher present)", () => {
     await waitFor(() => expect(screen.getAllByRole("img")).toHaveLength(33));
     expect(revokeObjectURL).toHaveBeenCalledWith(created[0]);
     expect(revokeObjectURL).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("InlineImage (data: URI carried by the transcript)", () => {
+  const GOOD_PNG =
+    "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+  const BAD_PNG = "data:image/png;base64,garbage";
+
+  it("renders the data URI as a zoomable image", () => {
+    render(<InlineImage src={GOOD_PNG} alt="shot.png" className="c" />);
+    const img = screen.getByRole("img", { name: "shot.png" });
+    expect(img).toHaveAttribute("src", GOOD_PNG);
+    expect(img).toHaveClass("c");
+    expect(screen.getByRole("button", { name: "Zoom image: shot.png" })).toContainElement(img);
+  });
+
+  it("swaps a corrupt data URI for the unavailable-image chip", () => {
+    // WHY: a truncated/corrupt data URI from an imported transcript used to
+    // leave the browser's broken-image glyph in the transcript. It must
+    // collapse to the same compact chip the embedded fetch failure shows.
+    render(<InlineImage src={BAD_PNG} alt="broken.png" />);
+    fireEvent.error(screen.getByRole("img", { name: "broken.png" }));
+
+    const chip = screen.getByRole("img", { name: "broken.png" });
+    expect(chip).not.toHaveAttribute("src");
+    expect(chip).toHaveTextContent("broken.png");
+  });
+
+  it("drops the lightbox affordance once the image has failed", () => {
+    // WHY: the failed preview stayed clickable, opening a full-screen viewer on
+    // an image that never decoded.
+    render(<InlineImage src={BAD_PNG} alt="broken.png" />);
+    expect(screen.getByRole("button", { name: "Zoom image: broken.png" })).toBeInTheDocument();
+
+    fireEvent.error(screen.getByRole("img", { name: "broken.png" }));
+
+    expect(screen.queryByRole("button", { name: "Zoom image: broken.png" })).toBeNull();
+  });
+
+  it("retries when a new src replaces the failed one", () => {
+    // WHY: the error state is keyed by source, so re-rendering the same slot
+    // with different bytes must attempt the new image rather than stay a chip.
+    const { rerender } = render(<InlineImage src={BAD_PNG} alt="shot.png" />);
+    fireEvent.error(screen.getByRole("img", { name: "shot.png" }));
+    expect(screen.getByRole("img", { name: "shot.png" })).not.toHaveAttribute("src");
+
+    rerender(<InlineImage src={GOOD_PNG} alt="shot.png" />);
+    expect(screen.getByRole("img", { name: "shot.png" })).toHaveAttribute("src", GOOD_PNG);
   });
 });

@@ -69,7 +69,7 @@ class SessionStreamCollector:
         """
         try:
             event = await asyncio.wait_for(self.queue.get(), within)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return
         raise AssertionError(f"unexpected broadcast: {event!r}")
 
@@ -192,6 +192,8 @@ class FakeSandboxLauncher(SandboxLauncher):
         self.template: str | None = None
         self.secrets: list[str] | None = None
         self.env: list[str] | None = None
+        self.region: str | None = None
+        self.ttl: str | None = None
         self.endpoint: str | None = None
         self.home_dir: str | None = None
         self.registry: dict[str, object] | None = None
@@ -205,6 +207,13 @@ class FakeSandboxLauncher(SandboxLauncher):
         self.disk_gb: int | None = None
         self.idle_pause_after_s: int | None = None
         self.cluster: str | None = None
+        # Microsandbox ctor wiring (captured by
+        # install_fake_microsandbox_launcher).
+        self.cpus: int | None = None
+        self.memory_mib: int | None = None
+        self.idle_timeout_s: int | None = None
+        self.network: str | None = None
+        self.host_ports: list[int] | None = None
         # Kubernetes ctor wiring (captured by install_fake_kubernetes_launcher).
         self.namespace: str | None = None
         self.secret_name: str | None = None
@@ -215,6 +224,10 @@ class FakeSandboxLauncher(SandboxLauncher):
         self.resources: dict[str, object] | None = None
         self.pvc_mounts: list[dict[str, object]] | None = None
         self.secret_mounts: list[dict[str, object]] | None = None
+        self.tolerations: list[dict[str, object]] | None = None
+        self.pod_ready_timeout_s: int | None = None
+        self.runtime_class: str | None = None
+        self.home_size_limit: str | None = None
         self.prepared = False
         self.provisioned_names: list[str] = []
         self.commands: list[str] = []
@@ -371,6 +384,31 @@ def install_fake_daytona_launcher(
     monkeypatch.setattr(daytona_mod, "DaytonaSandboxLauncher", _ctor)
 
 
+def install_fake_blaxel_launcher(
+    monkeypatch: Any,
+    fake: FakeSandboxLauncher,
+) -> None:
+    """Substitute the fake for ``BlaxelSandboxLauncher``."""
+    import omnigent.onboarding.sandboxes.blaxel as blaxel_mod
+
+    def _ctor(
+        *,
+        image: str | None = None,
+        env: list[str] | None = None,
+        region: str | None = None,
+        memory_mb: int | None = None,
+        ttl: str | None = None,
+    ) -> FakeSandboxLauncher:
+        fake.image = image
+        fake.env = env
+        fake.region = region
+        fake.memory_mb = memory_mb
+        fake.ttl = ttl
+        return fake
+
+    monkeypatch.setattr(blaxel_mod, "BlaxelSandboxLauncher", _ctor)
+
+
 def install_fake_boxlite_launcher(
     monkeypatch: Any,  # pytest.MonkeyPatch — Any avoids importing pytest in a helpers module
     fake: FakeSandboxLauncher,
@@ -455,6 +493,46 @@ def install_fake_islo_launcher(
     monkeypatch.setattr(islo_mod, "IsloSandboxLauncher", _ctor)
 
 
+def install_fake_microsandbox_launcher(
+    monkeypatch: Any,  # Avoid importing pytest in a helpers module.
+    fake: FakeSandboxLauncher,
+) -> None:
+    """
+    Substitute the fake for ``MicrosandboxSandboxLauncher`` at its public seam.
+
+    The managed flow constructs ``MicrosandboxSandboxLauncher(image=…,
+    env=…, cpus=…, memory_mib=…, idle_timeout_s=…, network=…)``; the shim
+    records those constructor args on the fake and hands it back, so
+    production code runs unmodified against it.
+
+    :param monkeypatch: The test's ``pytest.MonkeyPatch``.
+    :param fake: The fake launcher to substitute.
+    """
+    import omnigent.onboarding.sandboxes.microsandbox as microsandbox_mod
+
+    def _ctor(
+        *,
+        image: str | None = None,
+        env: list[str] | None = None,
+        cpus: int | None = None,
+        memory_mib: int | None = None,
+        idle_timeout_s: int | None = None,
+        network: str | None = None,
+        host_ports: list[int] | None = None,
+    ) -> FakeSandboxLauncher:
+        """Stand-in constructor recording the construction wiring."""
+        fake.image = image
+        fake.env = env
+        fake.cpus = cpus
+        fake.memory_mib = memory_mib
+        fake.idle_timeout_s = idle_timeout_s
+        fake.network = network
+        fake.host_ports = host_ports
+        return fake
+
+    monkeypatch.setattr(microsandbox_mod, "MicrosandboxSandboxLauncher", _ctor)
+
+
 def install_fake_e2b_launcher(
     monkeypatch: Any,  # pytest.MonkeyPatch — Any avoids importing pytest in a helpers module
     fake: FakeSandboxLauncher,
@@ -506,12 +584,18 @@ def install_fake_openshell_launcher(
         env: list[str] | None = None,
         cluster: str | None = None,
         workspace: str | None = None,
+        providers: list[str] | None = None,
+        node_selector: dict[str, str] | None = None,
+        runtime_class: str | None = None,
     ) -> FakeSandboxLauncher:
         """Stand-in constructor recording the construction wiring."""
         fake.image = image
         fake.env = env
         fake.cluster = cluster
         fake.workspace = workspace
+        fake.providers = providers
+        fake.node_selector = node_selector
+        fake.runtime_class = runtime_class
         return fake
 
     monkeypatch.setattr(openshell_mod, "OpenShellSandboxLauncher", _ctor)
@@ -526,9 +610,10 @@ def install_fake_kubernetes_launcher(
 
     The managed flow constructs ``KubernetesSandboxLauncher(image=…, env=…,
     namespace=…, secret_name=…, service_account=…, node_selector=…,
-    kubeconfig=…, in_cluster=…, resources=…, pvc_mounts=…)``; the shim records those
-    constructor args on the fake and hands it back, so production code runs
-    unmodified against it.
+    kubeconfig=…, in_cluster=…, resources=…, pvc_mounts=…, secret_mounts=…,
+    tolerations=…, pod_ready_timeout_s=…, runtime_class=…, home_size_limit=…)``;
+    the shim records those constructor args on the
+    fake and hands it back, so production code runs unmodified against it.
 
     :param monkeypatch: The test's ``pytest.MonkeyPatch``.
     :param fake: The fake launcher to substitute.
@@ -548,6 +633,10 @@ def install_fake_kubernetes_launcher(
         resources: dict[str, object] | None = None,
         pvc_mounts: list[dict[str, object]] | None = None,
         secret_mounts: list[dict[str, object]] | None = None,
+        tolerations: list[dict[str, object]] | None = None,
+        pod_ready_timeout_s: int | None = None,
+        runtime_class: str | None = None,
+        home_size_limit: str | None = None,
     ) -> FakeSandboxLauncher:
         """Stand-in constructor recording the construction wiring."""
         fake.image = image
@@ -561,6 +650,10 @@ def install_fake_kubernetes_launcher(
         fake.resources = resources
         fake.pvc_mounts = pvc_mounts
         fake.secret_mounts = secret_mounts
+        fake.tolerations = tolerations
+        fake.pod_ready_timeout_s = pod_ready_timeout_s
+        fake.runtime_class = runtime_class
+        fake.home_size_limit = home_size_limit
         return fake
 
     monkeypatch.setattr(kubernetes_mod, "KubernetesSandboxLauncher", _ctor)
@@ -615,6 +708,7 @@ def register_test_runner(
     *,
     harnesses: list[str] | None = None,
     owner: str | None = None,
+    capabilities: list[str] | None = None,
 ) -> None:
     """
     Register a runner in the app's live tunnel registry.
@@ -627,6 +721,7 @@ def register_test_runner(
         ``["default"]``.
     :param owner: Authenticated user who owns this runner, e.g.
         ``"alice@example.com"``. ``None`` for single-user mode.
+    :param capabilities: Optional capabilities advertised in the hello frame.
     :returns: None.
     """
     app.state.tunnel_registry.register(
@@ -637,6 +732,7 @@ def register_test_runner(
             frame_protocol_version=1,
             harnesses=harnesses or ["default"],
             envs=["os_sandbox"],
+            capabilities=capabilities or [],
         ),
         owner=owner,
     )
@@ -658,14 +754,16 @@ def build_agent_bundle(
 
     The bundle contains a single config.yaml with the given spec
     fields. When ``sub_agents`` is provided, each entry is added as
-    ``agents/<name>/config.yaml`` and the parent's
+    ``agents/<dir>/config.yaml`` and the parent's
     ``tools.agents`` list is populated.
 
     :param name: Agent name, e.g. ``"test-agent"``.
     :param description: Optional description.
     :param sub_agents: Optional list of sub-agent config dicts.
         Each must have at least a ``"name"`` key, e.g.
-        ``[{"name": "researcher", "description": "..."}]``.
+        ``[{"name": "researcher", "description": "..."}]``. An optional
+        ``"skills"`` list, shaped like ``skills``, is bundled under the
+        sub-agent's directory.
     :param max_iterations: Optional override for
         ``executor.max_iterations`` — useful for tests that want
         to force an ``incomplete`` terminal state after a known
@@ -677,7 +775,8 @@ def build_agent_bundle(
     :param skills: Optional bundled skills. Each dict must include
         ``"name"``, ``"description"``, and ``"content"``, e.g.
         ``{"name": "triage", "description": "Triage issues",
-        "content": "Ask one question."}``.
+        "content": "Ask one question."}``. An optional ``"dir"`` names
+        the skill directory when it differs from ``"name"``.
     :param guardrails: Optional ``guardrails:`` block written verbatim
         into the spec, e.g. ``{"policies": {"cost_guard": {"type":
         "function", "function": {"path": "...cost_budget",
@@ -761,7 +860,12 @@ def build_agent_bundle(
             )
             sa_info.size = len(sa_bytes)
             tf.addfile(sa_info, io.BytesIO(sa_bytes))
-        for skill in skills or []:
+        bundled_skills = [("", skill) for skill in skills or []] + [
+            (f"agents/{sa['name']}/", skill)
+            for sa in sub_agents or []
+            for skill in sa.get("skills", [])
+        ]
+        for prefix, skill in bundled_skills:
             skill_doc = (
                 "---\n"
                 + yaml.dump(
@@ -776,7 +880,7 @@ def build_agent_bundle(
             )
             skill_bytes = skill_doc.encode()
             skill_info = tarfile.TarInfo(
-                name=f"skills/{skill['name']}/SKILL.md",
+                name=f"{prefix}skills/{skill.get('dir', skill['name'])}/SKILL.md",
             )
             skill_info.size = len(skill_bytes)
             tf.addfile(skill_info, io.BytesIO(skill_bytes))
@@ -792,6 +896,7 @@ async def create_test_agent(
     skills: list[dict[str, str]] | None = None,
     user: str | None = None,
     guardrails: dict[str, Any] | None = None,
+    terminals: dict[str, Any] | None = None,
     include_llm: bool = True,
     sub_agents: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
@@ -819,6 +924,8 @@ async def create_test_agent(
     :param guardrails: Optional ``guardrails:`` block for the agent
         spec (e.g. a ``cost_budget`` policy). Passed verbatim to
         :func:`build_agent_bundle`. ``None`` omits guardrails.
+    :param terminals: Optional ``terminals:`` block written verbatim
+        into the agent spec.
     :param include_llm: Whether to include the default ``llm:`` block.
         Set ``False`` for model-less harness tests.
     :param sub_agents: Optional sub-agent config dicts declared in the
@@ -837,6 +944,7 @@ async def create_test_agent(
         executor=executor,
         skills=skills,
         guardrails=guardrails,
+        terminals=terminals,
         include_llm=include_llm,
         sub_agents=sub_agents,
     )
@@ -1029,3 +1137,56 @@ def echo_runner_client() -> httpx.AsyncClient:
         base_url="http://runner.test",
         transport=httpx.MockTransport(_handler),
     )
+
+
+def websocket_scope(path: str) -> dict[str, object]:
+    """Build a minimal ASGI WebSocket scope for the host tunnel."""
+    return {
+        "type": "websocket",
+        "asgi": {"version": "3.0"},
+        "scheme": "ws",
+        "path": path,
+        "raw_path": path.encode("ascii"),
+        "query_string": b"",
+        "headers": [],
+        "client": ("127.0.0.1", 50000),
+        "server": ("testserver", 80),
+        "subprotocols": [],
+    }
+
+
+async def create_session_for_agent(client: httpx.AsyncClient, agent_id: str) -> str:
+    """
+    Create a session bound to an agent.
+
+    :param client: Test HTTP client.
+    :param agent_id: Agent to bind.
+    :returns: New session id.
+    """
+    resp = await client.post("/v1/sessions", json={"agent_id": agent_id})
+    assert resp.status_code == 201, f"create failed: {resp.status_code} {resp.text}"
+    return resp.json()["id"]
+
+
+def policy_tool_call_request(
+    tool_name: str = "Bash",
+    arguments: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """
+    Build a ``PHASE_TOOL_CALL`` policy-evaluate request.
+
+    :param tool_name: Tool name, e.g. ``"Bash"``.
+    :param arguments: Tool arguments dict.
+    :returns: JSON body for ``POST /v1/sessions/{id}/policies/evaluate``.
+    """
+    return {
+        "event": {
+            "type": "PHASE_TOOL_CALL",
+            "target": "",
+            "data": {
+                "name": tool_name,
+                "arguments": arguments or {},
+            },
+            "context": {},
+        },
+    }

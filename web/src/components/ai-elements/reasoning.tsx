@@ -6,9 +6,13 @@ import { ChevronRightIcon, SparklesIcon } from "lucide-react";
 import type { ComponentProps, ReactNode } from "react";
 import { createContext, memo, useCallback, useContext, useEffect, useMemo, useState } from "react";
 import { Streamdown } from "streamdown";
+import { MERMAID_STREAMDOWN_PROPS } from "@/components/ai-elements/MermaidBlock";
+import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
 
 import { normalizeExplicitMathDelimiters } from "./mathMarkdown";
 import { Shimmer } from "./shimmer";
+import { MarkdownErrorBoundary } from "./MarkdownErrorBoundary";
+import { mermaidOptionsForTheme } from "./MermaidError";
 import {
   CHAT_LINK_SAFETY,
   SECURE_STREAMDOWN_REHYPE_PLUGINS,
@@ -180,7 +184,9 @@ export type ReasoningContentProps = ComponentProps<typeof CollapsibleContent> & 
 
 export const ReasoningContent = memo(({ className, children, ...props }: ReasoningContentProps) => {
   const { expandable } = useReasoning();
+  const themeMode = useResolvedThemeMode();
   const normalizedChildren = useMemo(() => normalizeExplicitMathDelimiters(children), [children]);
+  const mermaidOptions = useMemo(() => mermaidOptionsForTheme(themeMode), [themeMode]);
 
   // Non-expandable section has no content to reveal — render nothing so
   // there's no empty collapsible region under the flat header.
@@ -195,16 +201,23 @@ export const ReasoningContent = memo(({ className, children, ...props }: Reasoni
       )}
       {...props}
     >
-      <Streamdown
-        plugins={STREAMDOWN_PLUGINS}
-        // Let links open on a plain click (and cmd/ctrl-click in a new tab)
-        // instead of Streamdown's default "Open external link?" modal.
-        linkSafety={CHAT_LINK_SAFETY}
-        // Block remote image fetches that can exfiltrate data through URLs.
-        rehypePlugins={SECURE_STREAMDOWN_REHYPE_PLUGINS}
-      >
-        {normalizedChildren}
-      </Streamdown>
+      <MarkdownErrorBoundary source={normalizedChildren}>
+        {/* Streamdown is memoized and its comparator ignores the mermaid prop,
+            so remount on theme change to recolor already-rendered diagrams. */}
+        <Streamdown
+          {...MERMAID_STREAMDOWN_PROPS}
+          key={themeMode}
+          plugins={STREAMDOWN_PLUGINS}
+          mermaid={mermaidOptions}
+          // Let links open on a plain click (and cmd/ctrl-click in a new tab)
+          // instead of Streamdown's default "Open external link?" modal.
+          linkSafety={CHAT_LINK_SAFETY}
+          // Block remote image fetches that can exfiltrate data through URLs.
+          rehypePlugins={SECURE_STREAMDOWN_REHYPE_PLUGINS}
+        >
+          {normalizedChildren}
+        </Streamdown>
+      </MarkdownErrorBoundary>
     </CollapsibleContent>
   );
 });

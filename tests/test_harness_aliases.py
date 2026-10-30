@@ -6,6 +6,7 @@ import pytest
 
 from omnigent.harness_aliases import (
     canonicalize_harness,
+    harness_account_key,
     is_native_harness,
     native_terminal_name,
 )
@@ -30,6 +31,10 @@ from omnigent.spec._omnigent_compat import OMNIGENT_HARNESSES
         ("agy", "antigravity"),
         ("google-antigravity", "antigravity"),
         ("antigravity", "antigravity"),
+        # Antigravity native harness aliases.
+        ("agy-native", "antigravity-native"),
+        ("native-agy", "antigravity-native"),
+        ("native-antigravity", "antigravity-native"),
         # Unknown names return unchanged so callers keep their own errors.
         ("bogus", "bogus"),
         (None, None),
@@ -48,6 +53,22 @@ def test_canonicalize_harness(alias: str | None, canonical: str | None) -> None:
 @pytest.mark.parametrize(
     "harness,expected",
     [
+        ("claude", "claude"),
+        ("claude-native", "claude"),
+        ("codex-native", "codex"),
+        ("native-pi", "pi"),
+        ("opencode-native", "opencode"),
+        ("qwen", None),
+        (None, None),
+    ],
+)
+def test_harness_account_key(harness: str | None, expected: str | None) -> None:
+    assert harness_account_key(harness) == expected
+
+
+@pytest.mark.parametrize(
+    "harness,expected",
+    [
         # Canonical native spellings and their reversed forms.
         ("claude-native", True),
         ("codex-native", True),
@@ -57,6 +78,10 @@ def test_canonicalize_harness(alias: str | None, canonical: str | None) -> None:
         ("native-pi", True),
         ("kiro-native", True),
         ("native-kiro", True),
+        ("antigravity-native", True),
+        ("native-antigravity", True),
+        ("agy-native", True),
+        ("native-agy", True),
         # SDK harnesses are NOT native — they replay the Omnigent
         # transcript and don't own an on-disk runtime transcript. A
         # regression that classified these as native would wrongly route a
@@ -67,6 +92,8 @@ def test_canonicalize_harness(alias: str | None, canonical: str | None) -> None:
         ("agents_sdk", False),
         ("codex", False),
         ("kiro", False),
+        ("antigravity", False),
+        ("agy", False),
         # The "claude" shorthand canonicalizes to claude-sdk (not native).
         ("claude", False),
         # cursor is a headless ACP harness, not a native CLI bridge.
@@ -105,6 +132,9 @@ def test_kiro_native_is_valid_omnigent_harness_but_plain_kiro_is_not() -> None:
         ("kimi-native", "kimi"),
         ("pi-native", "pi"),
         ("antigravity-native", "antigravity"),
+        ("native-antigravity", "antigravity"),
+        ("agy-native", "antigravity"),
+        ("native-agy", "antigravity"),
         ("opencode-native", "opencode"),
         ("opencode", "opencode"),  # alias folds to opencode-native
         # Non-native harnesses (and the SDK shorthands) have no native pane.

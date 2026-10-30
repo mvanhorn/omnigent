@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 
 import httpx
+import pytest
 from playwright.sync_api import Page, expect
 
 
@@ -88,6 +89,7 @@ def _seed_long_transcript(base_url: str, session_id: str, latest_prompt: str) ->
         )
 
 
+@pytest.mark.compat_smoke
 def test_opening_a_session_fetches_history_once_and_then_stops(
     page: Page,
     seeded_session: tuple[str, str],
@@ -135,10 +137,15 @@ def test_scrolling_to_the_top_still_pages_older_history(
     page.wait_for_timeout(2_000)
     assert len(page.evaluate("window.__itemsUrls")) == 1
 
-    # Now the reader scrolls up to the top, which IS a request for older
-    # history. (A pane with no scroll range at all can't report that movement;
-    # that path arms on the wheel gesture itself and is unit-tested.)
-    page.evaluate("document.querySelector('[role=\"log\"]').firstElementChild.scrollTop = 0")
+    # Now the reader wheels up to the top, which IS a request for older
+    # history. Only reader input counts: a programmatic scroll to the top (a
+    # jump, a restore) loads nothing on its own.
+    box = conversation.bounding_box()
+    assert box is not None
+    page.mouse.move(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+    for _ in range(12):
+        page.mouse.wheel(0, -600)
+        page.wait_for_timeout(16)
     page.wait_for_function("window.__itemsUrls.length > 1", timeout=20_000)
 
     urls = page.evaluate("window.__itemsUrls")

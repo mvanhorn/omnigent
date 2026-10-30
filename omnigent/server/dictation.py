@@ -190,6 +190,7 @@ class _EngineEntry:
     available: AvailabilityProbe
 
 
+# custom-lint: disable-next=workspace-scoped-cache -- static engine-name registry
 _ENGINE_REGISTRY: dict[str, _EngineEntry] = {}
 
 
@@ -380,7 +381,7 @@ class SherpaDictationEngine:
                         )
                     )
                 )
-            except Exception:  # noqa: BLE001 - punctuation is best-effort
+            except Exception:  # punctuation is best-effort
                 _logger.warning(
                     "dictation punctuation model failed to load from %s; "
                     "emitting raw recognizer output",

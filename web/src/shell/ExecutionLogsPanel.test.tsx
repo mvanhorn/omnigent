@@ -56,6 +56,7 @@ function mkChild(overrides: Partial<ChildSessionInfo>): ChildSessionInfo {
   return {
     id: "conv_child1",
     title: "researcher:auth",
+    task_summary: null,
     tool: "researcher",
     session_name: "auth",
     current_task_status: "completed",
@@ -105,6 +106,8 @@ describe("ExecutionLogsPanel open/close gating", () => {
     renderPanel({ open: true });
     const panel = screen.getByTestId("execution-logs-panel");
     expect(panel).toHaveAttribute("data-state", "open");
+    expect(panel).toHaveClass("shadow-lg");
+    expect(panel).not.toHaveClass("shadow-none");
     expect(screen.getByText("main")).toBeInTheDocument();
   });
 
@@ -112,7 +115,10 @@ describe("ExecutionLogsPanel open/close gating", () => {
     // WHY: when closed the panel collapses (data-state=closed) and skips the
     // dropdown/items entirely — the `!open || !activeEntry` branch.
     renderPanel({ open: false, initialKey: null });
-    expect(screen.getByTestId("execution-logs-panel")).toHaveAttribute("data-state", "closed");
+    const panel = screen.getByTestId("execution-logs-panel");
+    expect(panel).toHaveAttribute("data-state", "closed");
+    expect(panel).toHaveClass("shadow-none");
+    expect(panel).not.toHaveClass("shadow-lg");
     expect(screen.queryByText("No items")).toBeNull();
   });
 

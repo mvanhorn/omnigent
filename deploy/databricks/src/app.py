@@ -12,9 +12,50 @@ import sys
 import threading
 import time
 import traceback
+from pathlib import Path as _Path
+
+from web_ui_archive import extract_web_ui_archive as _extract_web_ui_archive
 
 logging.basicConfig(level=logging.INFO, stream=sys.stderr, force=True)
 logger = logging.getLogger("omnigent-app")
+
+# ── Web UI location ────────────────────────────────────────
+#
+# The deploy ships the SPA outside the wheel as one archive beside this entry
+# point. Extract it before importing omnigent.server.app, which binds the
+# static-file directory at module import time. A loose directory is supported
+# for compatibility with deployments made by the earlier packaging scheme.
+
+
+def _prepare_web_ui() -> None:
+    import shutil as _shutil
+    import tarfile as _tarfile
+    import tempfile as _tempfile
+
+    here = _Path(__file__).resolve().parent
+    archive = here / "web-ui.tar.gz"
+    loose = here / "web-ui"
+    if loose.is_dir() and not archive.is_file():
+        os.environ.setdefault("OMNIGENT_WEB_UI_DIST", str(loose))
+        logger.info("Web UI: serving legacy loose assets from %s", loose)
+        return
+    if not archive.is_file():
+        logger.info("Web UI: no archive at %s; using packaged assets", archive)
+        return
+
+    extracted = _Path(_tempfile.mkdtemp(prefix="omnigent-web-ui-"))
+    try:
+        _extract_web_ui_archive(archive, extracted)
+    except (OSError, ValueError, _tarfile.TarError) as exc:
+        _shutil.rmtree(extracted, ignore_errors=True)
+        logger.warning("Web UI: failed to extract %s: %s; using packaged assets", archive, exc)
+        return
+
+    os.environ.setdefault("OMNIGENT_WEB_UI_DIST", str(extracted))
+    logger.info("Web UI: serving extracted assets from %s", extracted)
+
+
+_prepare_web_ui()
 
 # ── Lakebase token cache ──────────────────────────────────
 #
@@ -120,7 +161,6 @@ try:
     # ── Start omnigent ─────────────────────────────────────
 
     import tempfile
-    from pathlib import Path
 
     import uvicorn
 
@@ -130,6 +170,9 @@ try:
     from omnigent.runtime.caps import RuntimeCaps
     from omnigent.server.app import create_app
     from omnigent.server.auth import create_auth_provider, warn_if_single_user_exposed
+    from omnigent.server.managed_hosts import parse_sandbox_config
+    from omnigent.server.server_config import load_server_config
+    from omnigent.util.tunnel_limits import uvicorn_tunnel_kwargs
 
     # OTel: the Databricks Apps platform auto-injects
     # OTEL_EXPORTER_OTLP_ENDPOINT when `telemetry_export_destinations`
@@ -162,7 +205,7 @@ try:
 
     DB_URI = f"postgresql+psycopg://{PGUSER}@{PGHOST}:{PGPORT}/{PGDATABASE}"
     ARTIFACT_URI = f"dbfs:{VOLUME_PATH}"
-    CACHE_DIR = Path(tempfile.mkdtemp(prefix="ap_cache_"))
+    CACHE_DIR = _Path(tempfile.mkdtemp(prefix="ap_cache_"))
 
     logger.info("DB_URI: %s", DB_URI[:80])
     logger.info("ARTIFACT_URI: %s", ARTIFACT_URI)
@@ -170,13 +213,23 @@ try:
     # The app SP owns the tables — run any pending Alembic upgrades
     # before the stores boot, since the verify-schema check refuses
     # to start a stale DB. Idempotent: a no-op when the DB is at head.
-    from omnigent.db.utils import _run_migrations as _run_alembic_upgrade
+    #
+    # Lakebase endpoints suspend after an idle window (default 24h). A
+    # boot that lands while the endpoint is cold/resuming raises a
+    # transient OperationalError, which the module-level catch-all below
+    # would turn into a fatal exit — the container then crash-loops and
+    # the app "doesn't load" until a manual redeploy happens to hit a
+    # warm endpoint. run_migrations_with_retry retries the connect+migrate
+    # with linear backoff so a cold start self-heals; a genuinely broken
+    # DB still fails after the attempts are exhausted. Both knobs are
+    # env-overridable (defaults: 8 attempts, 3s×attempt, ~84s budget).
+    from omnigent.db.utils import run_migrations_with_retry
 
-    _migration_engine = sqlalchemy.create_engine(DB_URI)
-    try:
-        _run_alembic_upgrade(_migration_engine, DB_URI)
-    finally:
-        _migration_engine.dispose()
+    run_migrations_with_retry(
+        DB_URI,
+        max_attempts=int(os.environ.get("AP_MIGRATE_MAX_ATTEMPTS", "8")),
+        backoff_seconds=float(os.environ.get("AP_MIGRATE_BACKOFF_SECONDS", "3")),
+    )
 
     agent_store = SqlAlchemyAgentStore(DB_URI)
     file_store = SqlAlchemyFileStore(DB_URI)
@@ -216,6 +269,39 @@ try:
         logger.warning("%s", _exposure)
 
     auth_provider = create_auth_provider()
+
+    # Managed sandbox hosts (host_type="managed" sessions): parse the server
+    # config's ``sandbox:`` section like ``omnigent server`` does, so a typo
+    # stops startup here instead of 502-ing the first managed session.
+    try:
+        sandbox_config = parse_sandbox_config(load_server_config().get("sandbox"))
+    except ValueError as exc:
+        logger.error("Invalid 'sandbox' section in the server config: %s", exc)
+        raise
+    if sandbox_config is not None:
+        logger.info("Managed sandbox hosts configured from the server config")
+
+    # Databricks account connection: per-user OAuth tokens, which the
+    # `databricks` sandbox provider needs to run each sandbox as its owner.
+    from omnigent.server.databricks_app import DatabricksConfig
+
+    databricks_config = DatabricksConfig.from_env()
+    databricks_store = None
+    if databricks_config is not None:
+        from omnigent.stores.credential_store import build_secret_cipher
+
+        dbx_cipher = build_secret_cipher()
+        if dbx_cipher is None:
+            logger.error(
+                "Databricks account connection is configured but disabled: set the "
+                "credential store's key (OMNIGENT_CREDENTIAL_KMS_KEY_ID or "
+                "OMNIGENT_CREDENTIAL_VAULT_KEY) to enable it."
+            )
+        else:
+            from omnigent.connections.databricks import DatabricksConnectionStore
+
+            databricks_store = DatabricksConnectionStore(DB_URI, dbx_cipher)
+
     app = create_app(
         agent_store=agent_store,
         file_store=file_store,
@@ -229,11 +315,29 @@ try:
         host_store=host_store,
         scheduled_task_store=scheduled_task_store,
         auth_provider=auth_provider,
+        sandbox_config=sandbox_config,
+        databricks_config=databricks_config,
+        databricks_store=databricks_store,
     )
 
     if __name__ == "__main__":
+        from omnigent.server.graceful_shutdown import SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_S, serve
+
         logger.info("Starting omnigent on 0.0.0.0:%d", PORT)
-        uvicorn.run(app, host="0.0.0.0", port=PORT)
+        config = uvicorn.Config(
+            app,
+            host="0.0.0.0",
+            port=PORT,
+            # Tunnel frame cap + keepalive: without them uvicorn's 20 s default closes
+            # a busy-but-healthy runner or host tunnel with 1011 after a client-path
+            # stall, while both clients tolerate 90 s.
+            **uvicorn_tunnel_kwargs(),
+            # Bound the graceful wait and drain SSE streams so a held session
+            # stream can't keep the app alive until the platform SIGKILLs it.
+            # Matches `omnigent server`.
+            timeout_graceful_shutdown=SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_S,
+        )
+        serve(config)
 
 except Exception:  # noqa: BLE001 — startup catch-all; we want every failure logged
     logger.error("FATAL: omnigent failed to start:\n%s", traceback.format_exc())

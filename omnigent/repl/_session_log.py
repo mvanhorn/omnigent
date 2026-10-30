@@ -57,12 +57,14 @@ from __future__ import annotations
 import json
 import time
 import zipfile
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from omnigent_client import OmnigentClient
+from omnigent_client import StaleCursorError as ClientStaleCursorError
 from omnigent_ui_sdk import state_dir
 
+from omnigent.errors import restart_on_stale_cursor
 from omnigent.stores.conversation_store import (
     ConversationNotFoundError,
     ConversationStore,
@@ -79,11 +81,9 @@ _LOG_SCHEMA_VERSION = 1
 # this module while disambiguating their output via this field.
 _LOG_FORMAT = "omnigent-conversation"
 
-# Default log directory. Derives from the shared ``state_dir()``
-# (``~/.omnigent``) so the root is defined in one place. Mirrors
-# the legacy non-AP path's ``~/.omnigent/logs/`` (see
-# ``_default_session_log_path`` in ``omnigent/inner/cli.py``) so
-# users don't have to learn a new location when migrating. Created
+# Default log directory. Derives from the shared ``state_dir()`` so
+# ``OMNIGENT_DATA_DIR`` isolates it without replacing ``HOME``. The
+# fallback remains the legacy ``~/.omnigent/logs/`` location. Created
 # on first write.
 DEFAULT_LOG_DIR = state_dir() / "logs"
 DEFAULT_LOG_ZIP_DIR = DEFAULT_LOG_DIR
@@ -288,7 +288,7 @@ async def write_session_log(
 
     payload: dict[str, object] = {
         "version": _LOG_SCHEMA_VERSION,
-        "written_at": datetime.now(timezone.utc).isoformat(),
+        "written_at": datetime.now(UTC).isoformat(),
         "format": _LOG_FORMAT,
         "agent_name": agent_name,
         "conversation": root_node,
@@ -450,7 +450,7 @@ def write_session_log_from_store(
 
     payload: dict[str, object] = {
         "version": _LOG_SCHEMA_VERSION,
-        "written_at": datetime.now(timezone.utc).isoformat(),
+        "written_at": datetime.now(UTC).isoformat(),
         "format": _LOG_FORMAT,
         "agent_name": agent_name,
         "conversation": root_node,
@@ -501,6 +501,7 @@ def _build_node_sync(
     }
 
 
+@restart_on_stale_cursor
 def _fetch_all_items_sync(
     conv_store: ConversationStore,
     conversation_id: str,
@@ -510,6 +511,10 @@ def _fetch_all_items_sync(
     :class:`ConversationStore` directly. See that function's
     docstring for the pagination strategy and the empty-page
     end-of-data convention.
+
+    An item deleted mid-walk invalidates the page cursor, so the whole
+    enumeration restarts (:func:`restart_on_stale_cursor`) rather than
+    dumping a silently truncated log.
 
     Items are converted to plain dicts so the JSON dump is
     self-contained — a reader doesn't need any of Omnigent'
@@ -556,21 +561,53 @@ async def _fetch_all_items_via_sessions(
     Same pagination pattern as :func:`_fetch_all_items` but uses the
     sessions items endpoint instead of conversations.
 
+    An item deleted mid-walk makes the server reject the next page with
+    ``stale_cursor``; restart the whole enumeration so the log holds one
+    consistent view rather than a truncated one. The server-side sibling
+    uses :func:`restart_on_stale_cursor`; this path crosses HTTP, so it
+    catches the client SDK's own stale-cursor type instead.
+
     :param client: The connected :class:`OmnigentClient`.
     :param session_id: Session to page through.
     :returns: All items in chronological order.
+    """
+    for _ in range(_STALE_CURSOR_RESTARTS - 1):
+        try:
+            return await _fetch_all_items_via_sessions_once(client, session_id)
+        except ClientStaleCursorError:
+            continue
+    return await _fetch_all_items_via_sessions_once(client, session_id)
+
+
+# Full-enumeration attempts before a persistently stale cursor propagates.
+# Mirrors ``omnigent.errors._STALE_CURSOR_ATTEMPTS`` for the HTTP path.
+_STALE_CURSOR_RESTARTS = 3
+
+
+async def _fetch_all_items_via_sessions_once(
+    client: OmnigentClient,
+    session_id: str,
+) -> list[dict[str, object]]:
+    """
+    Run one complete page walk of ``GET /v1/sessions/{id}/items``.
+
+    :param client: The connected :class:`OmnigentClient`.
+    :param session_id: Session to page through.
+    :returns: All items in chronological order.
+    :raises StaleCursorError: If a page cursor's item was deleted mid-walk.
     """
     collected: list[dict[str, object]] = []
     cursor: str | None = None
     page_size = 100
     while True:
-        page = await client.sessions.list_items(
+        result = await client.sessions.list_items(
             session_id,
             limit=page_size,
             after=cursor,
             order="asc",
         )
-        if page is None or not page:
+        page = result.data
+        if not page:
             return collected
         collected.extend(page)
         last_id = page[-1].get("id")

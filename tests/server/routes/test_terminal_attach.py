@@ -19,6 +19,7 @@ import asyncio
 import contextlib
 from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -34,6 +35,7 @@ from omnigent.runtime import (
     set_runner_router,
     set_runner_ws_factory,
 )
+from omnigent.server._runner_ws_tunnel import WrongReplicaWSError
 from omnigent.server.auth import (
     LEVEL_EDIT,
     LEVEL_OWNER,
@@ -43,6 +45,7 @@ from omnigent.server.auth import (
 )
 from omnigent.server.routes.terminal_attach import create_terminal_attach_router
 from omnigent.terminals import TerminalRegistry
+from omnigent.terminals.ws_common import WS_CLOSE_WRONG_REPLICA
 from tests.runner.helpers import make_test_terminal_instance
 
 
@@ -89,6 +92,16 @@ class _StubPermissionStore:
         if public_grant is not None:
             return public_grant.level
         return None
+
+
+def _connected_attach_user_ids(rows: list[dict[str, Any]]) -> list[str | None]:
+    """User ids on the terminal-attach connected rows, in emit order."""
+    return [
+        row["user_id"]
+        for row in rows
+        if row["event_name"] == "attach_terminal_by_resource_id"
+        and row["attributes"].get("phase") == "connected"
+    ]
 
 
 class _StubConversationStore:
@@ -392,7 +405,9 @@ async def test_attach_terminal_rejects_missing_identity_before_runner_proxy() ->
     assert factory.calls == []
 
 
-async def test_attach_terminal_allows_owner_for_interactive_proxy() -> None:
+async def test_attach_terminal_allows_owner_for_interactive_proxy(
+    debug_log_rows: list[dict[str, Any]],
+) -> None:
     """The session owner may open an interactive (write) terminal attach."""
     conv_store = _StubConversationStore()
     conv_store.add("conv_alice")
@@ -423,6 +438,29 @@ async def test_attach_terminal_allows_owner_for_interactive_proxy() -> None:
         "/v1/sessions/conv_alice/resources/terminals/terminal_bash_s1/attach?read_only=false"
     ]
     assert b"whoami\n" in conn.received
+    assert _connected_attach_user_ids(debug_log_rows) == ["alice@example.com"]
+
+
+async def test_attach_terminal_attributes_logs_with_permissions_disabled(
+    debug_log_rows: list[dict[str, Any]], runner_client_reset: None
+) -> None:
+    """With no permission store, the attach still attributes its rows to the caller."""
+    app = FastAPI()
+    app.include_router(
+        create_terminal_attach_router(auth_provider=UnifiedAuthProvider(source="header")),
+        prefix="/v1",
+    )
+    set_runner_ws_factory(_FakeRunnerWSFactory(_FakeRunnerWSConn(wait_close_after=1)))
+
+    with TestClient(app).websocket_connect(
+        "/v1/sessions/conv_alice/resources/terminals/terminal_bash_s1/attach",
+        headers={"X-Forwarded-Email": "alice@example.com"},
+    ) as ws:
+        ws.send_bytes(b"ls\n")
+        with pytest.raises(WebSocketDisconnect):
+            ws.receive_bytes()
+
+    assert _connected_attach_user_ids(debug_log_rows) == ["alice@example.com"]
 
 
 async def test_attach_terminal_edit_grant_denied_write_allowed_read_only() -> None:
@@ -519,6 +557,30 @@ async def test_attach_terminal_read_grant_only_allows_read_only_proxy() -> None:
 
     assert exc_info.value.code == 1008
     assert interactive_factory.calls == []
+
+
+async def test_attach_terminal_wrong_replica_closes_with_retry_code(app: FastAPI) -> None:
+    """
+    A wrong-replica routing miss closes with the retryable code so the browser
+    re-dials without its slice key instead of reporting the runner offline.
+
+    :param app: The FastAPI app fixture.
+    """
+
+    def factory(path: str):
+        raise WrongReplicaWSError(f"tunnel for {path} lives on another replica")
+
+    set_runner_ws_factory(factory)
+
+    with (
+        TestClient(app).websocket_connect(
+            "/v1/sessions/conv_ws/resources/terminals/terminal_pi_main/attach"
+        ) as ws,
+        pytest.raises(WebSocketDisconnect) as exc_info,
+    ):
+        ws.receive_bytes()
+
+    assert exc_info.value.code == WS_CLOSE_WRONG_REPLICA
 
 
 async def test_attach_terminal_proxies_to_runner_ws_factory(app: FastAPI) -> None:
@@ -638,69 +700,39 @@ async def test_attach_terminal_local_fallback_missing_closes_4404(
     assert exc_info.value.code == 4404
 
 
-async def test_attach_terminal_local_fallback_spawns_tmux(
+async def test_attach_terminal_local_fallback_uses_control_mode(
     app: FastAPI,
     server_registry: TerminalRegistry,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """
-    With a seeded local entry and no WS factory, the route resolves
-    the terminal id back to the registry entry and spawns ``tmux
-    attach -t <target>`` against the local socket path. The fork is
-    intercepted so we can verify the argv without invoking tmux.
-
-    :param app: The FastAPI app fixture.
-    :param server_registry: The runtime registry fixture.
-    :param tmp_path: Pytest tmpdir.
-    :param monkeypatch: Pytest monkeypatch fixture.
-    """
+    """The local fallback always attaches through tmux control mode."""
     _seed_registry(
         server_registry,
         "conv_local_attach",
         [_make_running_instance("bash", "s1", tmp_path)],
     )
-    # argv (list) and the child env (dict) land under separate keys.
-    captured: dict[str, object] = {}
+    calls: list[tuple[str, str, bool]] = []
 
-    def fake_fork() -> tuple[int, int]:
-        return 0, 0
+    async def fake_control(
+        websocket: object,
+        *,
+        socket_path: str,
+        tmux_target: str,
+        read_only: bool,
+    ) -> None:
+        del websocket
+        calls.append((socket_path, tmux_target, read_only))
 
-    def fake_execve(path: str, argv: list[str], env: dict[str, str]) -> None:
-        captured["argv"] = argv
-        captured["env"] = env
-        raise OSError("stop child path")
-
-    exit_exc = RuntimeError("child exited")
-    monkeypatch.setattr("omnigent.terminals.ws_bridge.pty.fork", fake_fork)
-    # Production resolves the absolute tmux path and builds the child env
-    # in the parent; the child calls os.execve (no PATH search, explicit
-    # env) — patch execve, not execv/execvp.
-    monkeypatch.setattr("omnigent.terminals.ws_bridge.os.execve", fake_execve)
     monkeypatch.setattr(
-        "omnigent.terminals.ws_bridge.os._exit",
-        lambda code: (_ for _ in ()).throw(exit_exc),
+        "omnigent.server.routes.terminal_attach.bridge_tmux_control_to_websocket",
+        fake_control,
     )
 
-    with pytest.raises(RuntimeError, match="child exited"):
-        with TestClient(app).websocket_connect(
-            # ``?transport=pty`` pins this to the PTY bridge (which forks tmux
-            # attach) independent of the global control-mode default.
-            "/v1/sessions/conv_local_attach/resources/terminals/terminal_bash_s1/attach"
-            "?read_only=true&transport=pty"
-        ):
-            pass
+    with TestClient(app).websocket_connect(
+        "/v1/sessions/conv_local_attach/resources/terminals/terminal_bash_s1/attach"
+        "?read_only=true&transport=pty"
+    ):
+        pass
 
-    # tmux argv must include -r (read-only) and the local socket
-    # path the registry knew about. If the socket path is the wrong
-    # one, the resolver picked up the wrong registry entry.
-    assert captured["argv"][0] == "tmux"
-    assert "-r" in captured["argv"], (
-        f"Expected '-r' in argv for read_only=true, got {captured['argv']!r}"
-    )
-    assert str(tmp_path / "bash-s1.sock") in captured["argv"], (
-        f"Expected the registry's socket path in argv, got {captured['argv']!r}"
-    )
-    # The attach client always advertises the web terminal's real type;
-    # inheriting the ambient TERM broke headless (sandbox) hosts.
-    assert captured["env"]["TERM"] == "xterm-256color"
+    assert calls == [(str(tmp_path / "bash-s1.sock"), "main", True)]

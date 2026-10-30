@@ -315,6 +315,10 @@ class SubagentRouteRequest:
     :param harness: Requesting harness id, e.g. ``"claude-native"``.
     :param task_name: Subagent type / task name from the spawn payload,
         e.g. ``"code-reviewer"``.
+    :param task_description: The spawn's human task label (Claude's
+        ``Task`` ``description``, e.g. ``"Research auth flows"``) — what
+        distinguishes same-typed spawns in a fan-out. ``None`` when the
+        harness's spawn payload names none.
     :param prompt: Raw task text. ``None`` on codex, whose spawn message
         is encrypted in hook payloads.
     :param fork: ``True`` when the spawn is a fork of the parent session.
@@ -329,6 +333,7 @@ class SubagentRouteRequest:
 
     harness: str
     task_name: str = ""
+    task_description: str | None = None
     prompt: str | None = None
     fork: bool = False
     parent_model: str | None = None
@@ -346,12 +351,20 @@ class SubagentRouteRequest:
         if not isinstance(harness, str) or not harness.strip():
             raise ValueError("route-subagent body requires a non-empty 'harness' string")
         task_name = payload.get("task_name")
+        task_description = payload.get("task_description")
         prompt = payload.get("prompt")
         parent_model = payload.get("parent_model")
         requested_model = payload.get("requested_model")
         return cls(
             harness=harness.strip(),
             task_name=task_name[:_TASK_NAME_CAP] if isinstance(task_name, str) else "",
+            # Agent-authored like task_name, so bounded the same way before
+            # it is stored or rendered.
+            task_description=(
+                task_description.strip()[:_TASK_NAME_CAP].rstrip() or None
+                if isinstance(task_description, str)
+                else None
+            ),
             prompt=prompt if isinstance(prompt, str) and prompt else None,
             fork=bool(payload.get("fork")),
             parent_model=parent_model if isinstance(parent_model, str) and parent_model else None,
@@ -459,6 +472,7 @@ def decision_record(
         harness=decision.harness or req.harness,
         raw_model=decision.raw_model,
         agent=req.task_name or None,
+        task_description=req.task_description,
         scope=_SCOPE,
         attempted_override=attempted,
         router_source=decision.router_source,
@@ -531,7 +545,7 @@ def model_in_family(family: str | None, model: str) -> bool:
     """
     if family is None or family == "pi":
         return True
-    from omnigent.model_catalog import model_family_token
+    from omnigent.models.model_catalog import model_family_token
 
     token = model_family_token(model)
     return token == "claude" if family == "claude" else token == "openai"
@@ -561,9 +575,9 @@ def candidate_models(
         isn't treated as unservable; the static table fills any harness the
         catalog has no row for.
     :param allow_static_fallback: Whether the static :func:`infer_models` table
-        may fill a harness the catalog has no row for. Off the AI Gateway it may
-        not: every id in that table is a ``databricks-*`` endpoint the spawn
-        could not reach, so the catalog is the only provider-accurate source.
+        may fill a harness the catalog has no row for. Off the Unity Gateway it may
+        not: every id in that table is a Unity Catalog endpoint the spawn could
+        not reach, so the catalog is the only provider-accurate source.
     :returns: Harness → model ids, cheapest first, empty entries dropped.
     """
     from omnigent.server.smart_routing import (
@@ -618,7 +632,7 @@ def _with_unadvertised_arms(models: list[str], family: str | None) -> list[str]:
     """
     if not models or family != _UNADVERTISED_ARM_FAMILY:
         return models
-    from omnigent.codex_model_vocabulary import EXTENDED_CATALOG_MODELS
+    from omnigent.models.codex_model_vocabulary import EXTENDED_CATALOG_MODELS
 
     extra = [
         model
@@ -698,7 +712,7 @@ async def resolve_subagent_route(
         external router out of play and the built-in judge answers instead.
     :param allow_static_fallback: Whether the static :func:`infer_models` table
         may supply candidates. Callers pass ``gateway_backed``: off the gateway
-        its ``databricks-*`` ids are unreachable from the spawn.
+        its Unity Catalog ids are unreachable from the spawn.
     :param persist: Coroutine that records the decision in the
         transcript. ``None`` skips persistence (unit tests, dry runs).
     :returns: The verdict the hook script enforces.
@@ -787,7 +801,7 @@ async def _decide(
     result = None
     try:
         call = await route_with_fallback(backends, task, candidates, gateway_backed=gateway_backed)
-    except Exception as exc:  # noqa: BLE001 — router outages are a normal path here
+    except Exception as exc:  # router outages are a normal path here
         _logger.warning(
             "route-subagent: router call failed for session=%s", session_id, exc_info=True
         )
@@ -852,11 +866,25 @@ def _decision_from_result(
 ) -> SubagentRouteDecision:
     model = result.model
     rationale = getattr(result, "rationale", "") or ""
+    # The external router still returns the legacy ``databricks-*`` spelling,
+    # while Unity Catalog candidates use ``system.ai.*``. Resolve a same-arm
+    # pick onto the exact offered id before enforcing the offer boundary.
+    from omnigent.server.smart_routing import _bare_id
+
+    offered_model = next(
+        (
+            candidate
+            for models in candidates.values()
+            for candidate in models
+            if _bare_id(candidate) == _bare_id(model)
+        ),
+        None,
+    )
+    if offered_model is not None:
+        model = offered_model
     # Only report a raw pick that actually differs from the resolved model, so
     # the raw_model field means "the router asked for something else". A
     # prefix-only spelling difference is the same arm, not a substitution.
-    from omnigent.server.smart_routing import _bare_id
-
     raw = _opt_str(getattr(result, "raw_model", None))
     raw_model = raw if raw and _bare_id(raw) != _bare_id(model) else None
     offered = {m for models in candidates.values() for m in models}
@@ -881,7 +909,7 @@ def _decision_from_result(
     note = _ask_note(req, model)
 
     if target == req.harness:
-        if req.parent_model is not None and model == req.parent_model:
+        if req.parent_model is not None and _bare_id(model) == _bare_id(req.parent_model):
             return SubagentRouteDecision(
                 action="allow",
                 rationale=(rationale or "Router kept the parent model") + note,
@@ -1146,7 +1174,7 @@ def _handler_factory(
                     _awaited(resolver(session_id, req)), loop
                 )
                 decision = future.result(timeout=request_timeout_s)
-            except Exception:  # noqa: BLE001 — never wedge the spawn path
+            except Exception:  # never wedge the spawn path
                 _logger.warning(
                     "route-subagent: resolver failed for session=%s", session_id, exc_info=True
                 )
@@ -1176,7 +1204,7 @@ def _handler_factory(
             self.wfile.write(raw)
 
         def log_message(self, format: str, *args: Any) -> None:
-            _logger.debug("subagent-router: " + format, *args)
+            _logger.debug("subagent-router: " + format, *args, extra={"session_id": session_id})
 
     return _Handler
 
@@ -1198,6 +1226,7 @@ def make_server_relay_resolver(
         body = {
             "harness": req.harness,
             "task_name": req.task_name,
+            "task_description": req.task_description,
             "prompt": req.prompt,
             "fork": req.fork,
             "parent_model": req.parent_model,
@@ -1211,7 +1240,7 @@ def make_server_relay_resolver(
             )
             resp.raise_for_status()
             payload = resp.json()
-        except Exception:  # noqa: BLE001 — server hop failures are expected
+        except Exception:  # server hop failures are expected
             _logger.warning(
                 "route-subagent: server relay failed for session=%s", session_id, exc_info=True
             )
@@ -1356,7 +1385,7 @@ def ensure_session_router(
     # Nothing from the rendezvous is logged — neither the URL nor the paths
     # and ids that reach it — so a log file can never carry the bearer token
     # or the identifiers that address it. The advertisement on disk names both.
-    _logger.info("subagent router started")
+    _logger.info("subagent router started", extra={"session_id": session_id})
     return router
 
 
@@ -1478,7 +1507,7 @@ def _prune_router_dirs(router: SubagentRouter) -> None:
     Only dirs under the subagent-router root: the native harnesses' bridge
     dirs are advertised in too and belong to the bridge, not to this router.
     """
-    from omnigent.claude_native_bridge import subagent_router_bridge_root
+    from omnigent.harnesses.claude_native.bridge import subagent_router_bridge_root
 
     root = subagent_router_bridge_root()
     for bridge_dir in (*router.advertised_dirs, router.bridge_dir):
@@ -1502,7 +1531,10 @@ def router_dir_for_session(session_id: str) -> Path:
     :returns: Created directory, mode ``0o700``.
     :raises RuntimeError: If an ancestor fails the ownership check.
     """
-    from omnigent.claude_native_bridge import ensure_secure_dir, subagent_router_bridge_root
+    from omnigent.harnesses.claude_native.bridge import (
+        ensure_secure_dir,
+        subagent_router_bridge_root,
+    )
 
     digest = hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:32]
     path = subagent_router_bridge_root() / digest
